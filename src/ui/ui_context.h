@@ -60,6 +60,11 @@ public:
     uint64_t RegisterWindow(std::unique_ptr<UiWindowImpl> win);
     UiWindowImpl* GetWindow(uint64_t id) const;
     UiWindowImpl* FirstWindow() const;
+    // 给定子 widget, 找它所属的 window. 走 parent 链到 root, 在 windows_ 表里
+    // 反查哪个 window 的 root 是它. 找不到 (widget 不在树里 / root 还没 attach)
+    // 返 nullptr. 用于把"widget 级状态变化"投影到"window 级动作", 例如
+    // ui_custom_set_focused 需要调 owner window 的 SetFocus.
+    UiWindowImpl* FindWindowByWidget(class Widget* w);
     void RemoveWindow(uint64_t id);
     void InvalidateAllWindows();
     // Re-evaluates per-window animation timers (toggle/checkbox/etc.). Needed

@@ -321,6 +321,15 @@ public:
     std::function<void(const MouseEvent&)> onMouseUpHook;
     std::function<void(const MouseEvent&)> onMouseWheelHook;
     std::function<void(const MouseEvent&)> onMouseDblClickHook;
+    // Fires when cursor leaves this widget. Two trigger paths share this hook:
+    //   1) cursor moves to another widget in the same window (hover transition,
+    //      see UiWindowImpl::OnMouseMove) — leave fires on widgets in the old
+    //      hovered ancestor chain that are no longer in the new chain.
+    //   2) cursor leaves the window entirely (WM_MOUSELEAVE) — leave fires on
+    //      every widget in the current hovered ancestor chain.
+    // Mirrors CSS / web `mouseleave` event semantics. No args because mouseleave
+    // has no meaningful cursor position (cursor is either elsewhere or gone).
+    std::function<void()>                  onMouseLeaveHook;
     // Form-style submit. Fired when a TextInput/TextArea sees ENTER pressed
     // while focused. Other widgets ignore it; pages can listen on the form
     // wrapper element itself by hooking directly through @submit.

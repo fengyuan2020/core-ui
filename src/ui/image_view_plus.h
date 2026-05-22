@@ -63,6 +63,10 @@ public:
     // ---- 视口 ----
     float Zoom() const { return zoom_; }
     void  SetZoom(float z);
+    // 以 widget 像素坐标 (anchorX, anchorY) 为锚点缩放。anchor 处的图像
+    // 像素位置在 zoom 前后保持不变（鼠标 wheel 缩放就是这条路径）。下游
+    // reload 后想保持鼠标锚点用这个 API。
+    void  SetZoomAround(float z, float anchorX, float anchorY);
     void  SetPan(float x, float y) { panX_ = x; panY_ = y; }
     float PanX() const { return panX_; }
     float PanY() const { return panY_; }

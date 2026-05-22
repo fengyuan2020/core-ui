@@ -122,6 +122,10 @@ WindowHints WindowHintsFromAttrs(const std::vector<ui::uix::SfcAttr>& attrs) {
         if (v == "false" || v == "0" || v == "no") return 0;
         return -1;
     };
+    /* `width / height / min-width / min-height` 单位都是 DIP (1/96 inch),
+     * 跟 UiWindowConfig.width/height 同款语义. HiDPI 上 lib 会乘 dpi/96 转
+     * 物理 px (ui_window.cpp::Create 里 MulDiv). 例: 100% 缩放 width=400
+     * → 400 物理 px; 150% → 600 物理 px. 详见 ui_core.h UiWindowConfig 顶部. */
     for (const auto& a : attrs) {
         if      (a.name == "title")      hints.title = Utf8ToWide(a.value);
         else if (a.name == "width")      { try { hints.width     = std::stoi(a.value); } catch (...) {} }
@@ -272,6 +276,40 @@ bool CompileAndAttachPage(PageEntry& e, const std::string& rawText) {
     ui::css::Stylesheet sheet;
     bool anyScoped = false;
     std::string pageScopeId = "p" + std::to_string(g_nextScopeId++);
+
+    /* build 77 (L17 跟进): lib 内置 menu 默认 CSS — 给 compiler 合成的
+     * <div class="menuitem-row"> 包装 + 内部 svg / label 提供合理 baseline.
+     * 放在用户 <style> 块之前 parse, rules 先压入 sheet → 用户后写的同选择器
+     * 规则因为 source order 较后, cascade 自动覆盖 (e.g. 用户写
+     * .menuitem-row { max-width: 400px } 就放宽限制). */
+    {
+        constexpr const char* kLibMenuDefaultsCSS = R"(
+.menuitem-row {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px;
+  /* 控制单 item 内容最大宽度. 用户在 <style> 写 .menuitem-row { max-width: 400px }
+   * 覆盖. 默认 140 适合短中文 + 常见 shortcut 组合; build 80 收紧 gap+padding
+   * 配合 kMinWidth=235 目标 ~400 px on-screen (163% DPI). */
+  max-width: 140px;
+}
+.menuitem-row svg {
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+.menuitem-row label {
+  font-size: 13px;
+}
+)";
+        auto def = ui::css::ParseStylesheet(kLibMenuDefaultsCSS);
+        if (def.ok) {
+            for (auto& r : def.stylesheet.rules) {
+                sheet.rules.push_back(std::move(r));
+            }
+        }
+    }
 
     for (auto& blk : blocks) {
         if (blk.cssText.empty()) continue;
@@ -494,56 +532,67 @@ UI_API int ui_page_reload(UiPage p) {
     return ui::page::CompileAndAttachPage(*e, e->sourceText) ? 1 : 0;
 }
 
-UI_API UiWindow ui_page_open_window(UiPage p, const UiWindowConfig* override_defaults) {
+/* 共用 create-setup-attach 内部实现. show=true 走完整 open (跟 fade-in 动画),
+ * show=false 仅停在 prepare_rt, caller 自己 ui_window_show_immediate. */
+static UiWindow page_open_or_prepare_(UiPage p,
+                                         const UiWindowConfig* override_defaults,
+                                         bool show) {
     auto* e = ui::page::Registry().Get(p);
     if (!e || !e->state) return 0;
     const auto& hints = e->state->PageData().windowHints;
 
-    // Start from caller's defaults (if provided), else pick sensible built-ins.
     UiWindowConfig cfg = {0};
     if (override_defaults) cfg = *override_defaults;
     if (cfg.width  == 0) cfg.width  = 800;
     if (cfg.height == 0) cfg.height = 600;
     if (!cfg.title) cfg.title = L"Core UI";
-    // 默认窗口可调整尺寸（与 .ui markup 默认一致 + 符合现代桌面 UI 习惯）。
-    // <window resizable="false"> 会显式关掉。
     cfg.resizable = 1;
 
-    // Merge <window> hints
     if (!hints.title.empty())   cfg.title      = hints.title.c_str();
     if (hints.width > 0)        cfg.width      = hints.width;
     if (hints.height > 0)       cfg.height     = hints.height;
     if (hints.resizable == 0)   cfg.resizable  = 0;
     else if (hints.resizable == 1) cfg.resizable = 1;
-    if (hints.frameless == 0)   cfg.system_frame = 1;      // has system frame → not frameless
-    else if (hints.frameless == 1) cfg.system_frame = 0;   // frameless (custom chrome)
-    if (hints.centered == 1)    { cfg.x = 0; cfg.y = 0; }  // 0,0 = center per core-ui
+    if (hints.frameless == 0)   cfg.system_frame = 1;
+    else if (hints.frameless == 1) cfg.system_frame = 0;
+    if (hints.centered == 1)    { cfg.x = 0; cfg.y = 0; }
 
-    // Apply theme BEFORE creating window so it paints correctly on first frame
     if (hints.theme == 0)       ui_theme_set_mode(UI_THEME_DARK);
     else if (hints.theme == 1)  ui_theme_set_mode(UI_THEME_LIGHT);
 
     UiWindow win = ui_window_create(&cfg);
     if (!win) return 0;
 
-    // Apply minimum window size (honored via WM_GETMINMAXINFO in ui_window.cpp)
     if (hints.minWidth > 0 || hints.minHeight > 0) {
         ui_window_set_min_size(win,
                                hints.minWidth  > 0 ? hints.minWidth  : 0,
                                hints.minHeight > 0 ? hints.minHeight : 0);
     }
 
-    // Install page root as window content
     auto root = e->state->Root();
     if (root) {
         UiWidget h = ui::GetContext().handles.Insert(root);
         ui_window_set_root(win, h);
     }
-    /* Build 23: HWND 拿到了, 安装 <menu trigger=rclick> + <menuitem onclick>
-       自动派发. WireMenus 已经做了 click trigger 直接挂 onClick 的部分. */
     e->state->AttachWindow(win);
-    ui_window_show(win);
+
+    if (show) {
+        ui_window_show(win);
+    } else {
+        /* prepare-only 路径 (build 99+ L27): RT 提前创建好, 等 caller 同步预热
+         * (decode + 上 bitmap 等) 之后再 ui_window_show_immediate 一次性出图.
+         * 没 RT 时 first paint 慢, 提前 prepare 把这部分提到 show 之前. */
+        ui_window_prepare_rt(win);
+    }
     return win;
+}
+
+UI_API UiWindow ui_page_open_window(UiPage p, const UiWindowConfig* override_defaults) {
+    return page_open_or_prepare_(p, override_defaults, /*show=*/true);
+}
+
+UI_API UiWindow ui_page_prepare_window(UiPage p, const UiWindowConfig* override_defaults) {
+    return page_open_or_prepare_(p, override_defaults, /*show=*/false);
 }
 
 UI_API UiWidget ui_page_root(UiPage p) {

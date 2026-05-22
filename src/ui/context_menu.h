@@ -2,6 +2,7 @@
 #include <windows.h>
 #include "renderer.h"
 #include "theme.h"
+#include "widget.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -12,22 +13,20 @@ namespace ui {
 class ContextMenu;
 using ContextMenuPtr = std::shared_ptr<ContextMenu>;
 
+/* BREAKING (build 75 / L17 follow-up): MenuItem 重设计成 widget slot.
+ * 老的 text / icon / hasIcon / bitmap / hasColor / overrideColor / SvgIcon
+ * 字段全删, 由 customContent (一棵完整 widget tree) 接管渲染. shortcut /
+ * submenu / id / enabled / isSeparator 这些 menu 语义相关的留下. */
 struct MenuItem {
     int id = 0;
-    std::wstring text;
     std::wstring shortcut;
-    SvgIcon icon;
-    bool hasIcon = false;
     bool enabled = true;
     bool isSeparator = false;
     ContextMenuPtr submenu;
-    /* Phase C: 光栅 icon (PNG/JPG/...). 跟 SvgIcon 互斥 (同时给的话 bitmap
-       优先), 不跟随文字色. */
-    ComPtr<ID2D1Bitmap> bitmap;
-    /* Phase D: 单项颜色覆盖. hasColor=true 时 Draw 用 overrideColor 代替
-       默认 textColor; SvgIcon 也跟着变色 (DrawSvgIcon 接 color 参数). */
-    bool hasColor = false;
-    D2D1_COLOR_F overrideColor = {};
+    /* 整个 item row 的 content widget tree — 跟普通 widget 同款渲染路径
+     * (CSS cascade / reactive bindings / OnDraw / HitTest). separator
+     * 时为 null. PageState::PopulateMenuItem 实例化并装入. */
+    WidgetPtr customContent;
 };
 
 class ContextMenu : public std::enable_shared_from_this<ContextMenu> {
@@ -37,22 +36,22 @@ public:
     // 由 ui_debug_set_menu_autoclose(0) 打开。
     static bool g_debugSuppressAutoClose;
 
-    // Build
-    void AddItem(int id, const std::wstring& text);
-    void AddItemEx(int id, const std::wstring& text,
-                   const std::wstring& shortcut, const std::string& svg, Renderer* r);
-    /* Phase C: 光栅 icon 版本. bitmap 必须由调用方持有/创建 (Renderer::LoadImageFromBytes).
-       传 nullptr 等价于 AddItemEx(svg=""). */
-    void AddItemBitmap(int id, const std::wstring& text,
-                       const std::wstring& shortcut, ComPtr<ID2D1Bitmap> bitmap);
-    /* Phase D: 设置最近添加的 item 的颜色覆盖. 链式调用风格:
-         menu->AddItem(1, L"Quit");
-         menu->SetLastItemColor({1.0f, 0.2f, 0.2f, 1.0f}); */
-    void SetLastItemColor(const D2D1_COLOR_F& color);
+    /* BREAKING (build 75): 老的 AddItem / AddItemEx / AddItemBitmap /
+     * SetLastItemColor 全删. 唯一的 build 入口是 AddItemContent —
+     * 调用方负责给一棵 widget tree, lib 负责 layout + render + hit-test.
+     * shortcut 仍是 menu 框架渲染 (右对齐, 不跟 content widget tree 同色). */
+    void AddItemContent(int id, const std::wstring& shortcut, WidgetPtr content);
     void AddSeparator();
-    void AddSubmenu(const std::wstring& text, ContextMenuPtr submenu);
+    void AddSubmenu(WidgetPtr entryContent, ContextMenuPtr submenu);
     void SetEnabled(int id, bool enabled);
     void SetBgColor(D2D1_COLOR_F color) { bgColor_ = color; hasBgColor_ = true; }
+    /* Build 69+ (L19): 设单个菜单的圆角半径. <0 表示恢复 kCornerRadius 默认.
+     * 影响 shadow + card bg 的 FillRoundedRect, hover item highlight (6px)
+     * 不动 (那是 item 级视觉不属于容器圆角). */
+    void SetCornerRadius(float r) { cornerRadius_ = r; }
+    float CornerRadius() const {
+        return cornerRadius_ >= 0.0f ? cornerRadius_ : kCornerRadius;
+    }
 
     // Show / hide
     // parentHwnd: owner window; x,y: screen coordinates
@@ -60,6 +59,39 @@ public:
     void ShowPopup(HWND parentHwnd, int screenX, int screenY);
     void Close();
     bool IsVisible() const { return visible_; }
+
+    // Build 73 (L17): 反应式菜单支持. PageState::WireSubtreeMenus 给走
+    // 声明式 <menu> 路径的菜单挂这个 hook —— 每次 Show/ShowPopup 入口
+    // 先调它 (它内部 Clear() 再 Populate*), 把 items 按当前 JS state 重建.
+    // 老的 imperative ui_menu_add_item / SetLastItemColor 用法不设此 hook,
+    // items 保持调用方建好的样子. 设为 nullptr 等价禁用.
+    void SetBeforeShowHook(std::function<void()> hook) {
+        beforeShowHook_ = std::move(hook);
+    }
+    // 清空 items_ 用于 reactive rebuild. submenu shared_ptr 自然 release;
+    // 调用方应当在 PopulateMenu 内部立即重 build, 否则下次 Show 是空菜单.
+    void Clear();
+
+    /* Build 77+: 给 v-if 切换 items 集合的反应式菜单用 — caller (PageState)
+     * 扫所有 CompiledMenuItems 的 shortcut (含 v-if=false 隐藏的) 算 max,
+     * 喂这个字段后 MenuWidth 把它当 shortcut 列宽 floor, 隐藏 item 也预留
+     * shortcut 空间. 结果: 无图 / 有图 menu width 一致. <=0 = 不预留. */
+    void SetReservedShortcutWidth(float w) { reservedShortcutWidth_ = w; }
+    /* Build 80+: 同上, submenu arrow col 预留 — 任何 item 有 submenu (含
+     * v-if=false 的) 都让 arrow col 永远占位, 两态视觉宽度一致. */
+    void SetReservedHasSubmenu(bool has) { reservedHasSubmenu_ = has; }
+    /* Build 81+: 同上 — content (wrapper SizeHint) max 也按"全 items"预留,
+     * 两态彻底同款宽度. PageState 扫所有 items 的 wrapper natural width
+     * 算 max, 喂这里. */
+    void SetReservedContentWidth(float w) { reservedContentWidth_ = w; }
+    /* Build 85+: 跨菜单树共享同款宽度 — PageState 把整树 (parent + 所有
+     * submenu) 计算出的最大 MenuWidth 回写到每个 ContextMenu, submenu 至少
+     * 跟主菜单同宽. 用户视觉感受 "菜单系列宽度一致". */
+    void SetMinPropagatedWidth(float w) { minPropagatedWidth_ = w; }
+    /* build 85: expose MenuWidth — PageState 算完 reserved 后查 final 宽,
+     * 再 propagate 到 submenu. */
+    float MenuWidth() const;
+    float MenuHeight() const;
 
     // Rendering
     void Draw(Renderer& r);
@@ -95,6 +127,12 @@ public:
     // 成功返回 true，失败（index 越界、分隔符、禁用、无父窗口）返回 false。
     bool SimulateClickIndex(int index);
 
+    /* Build 85+ (测试用): 模拟 "鼠标 hover 到 submenu 入口" — 在指定 index
+     * 的 submenu 上调 ShowPopup, 跟 HandleMouseMove 实际 hover 触发同款效果.
+     * 调试 / 截图 submenu 视觉用. 返 sub ContextMenu* (失败时 nullptr).
+     * 链式: parent->OpenSubmenuAt(i)->OpenSubmenuAt(j) 走深层 submenu. */
+    ContextMenu* OpenSubmenuAt(int index);
+
     // 子菜单访问与路径点击 —— path=[2,1] 即"顶层第 2 项的 submenu 里第 1 项"。
     // 路径上所有中间节点必须是 enabled 的 submenu、leaf 是 enabled 的非分隔项。
     // 成功后把 leaf 的 id 回传给 ROOT 菜单的 parentHwnd（主窗口）并 Close 整条链。
@@ -113,6 +151,22 @@ private:
     int clickedId_ = -1;
     D2D1_COLOR_F bgColor_ = {};
     bool hasBgColor_ = false;
+    /* Build 69+ (L19): per-menu 圆角. -1 = 用 kCornerRadius 默认. 公共 API
+     * ui_menu_set_corner_radius 写这个字段. */
+    float cornerRadius_ = -1.0f;
+    /* Build 73 (L17): reactive menu — 反应式 .uix 走 PageState 注册的 hook
+     * 在 Show 入口先重 populate items. 详见 h::SetBeforeShowHook. */
+    std::function<void()> beforeShowHook_;
+    /* Build 77+: PageState 算的 "max shortcut across all items including
+     * v-if=false hidden" 宽度. MenuWidth 用它做 shortcut col floor. */
+    float reservedShortcutWidth_ = 0.0f;
+    /* Build 80+: 同上 — 任何 item 有 submenu (含 v-if=false 的) 时 true,
+     * MenuWidth 永远预留 arrow col. */
+    bool reservedHasSubmenu_ = false;
+    /* Build 81+: max wrapper natural width across all items (含 v-if 隐的). */
+    float reservedContentWidth_ = 0.0f;
+    /* Build 85+: tree-wide max MenuWidth, submenu 至少跟主菜单同宽. */
+    float minPropagatedWidth_ = 0.0f;
 
     // Layout constants — compact menu (13px body, small icons, tight rows).
     static constexpr float kItemHeight = 30.0f;
@@ -120,9 +174,16 @@ private:
     static constexpr float kIconColWidth = 36.0f;       // left-pad + icon + gap
     static constexpr float kPadding = 6.0f;             // container inset
     static constexpr float kCornerRadius = 10.0f;
-    static constexpr float kMinWidth = 180.0f;
+    /* Build 83+: kMinWidth 250 → 120 — kMinWidth 是"什么都没指定"时的兜底,
+     * 不该 override 用户 CSS 显式 width / max-width. 降到一个 sanity 下限,
+     * 让 caller 的 .menuitem-row { width: NNN } 真正生效, 不被 floor 挡住. */
+    static constexpr float kMinWidth = 120.0f;
     static constexpr float kShadowOffset = 4.0f;
     static constexpr float kSubmenuArrowWidth = 20.0f;
+    /* Build 86+: submenu 跟 parent menu 之间的 X 方向重叠 (DIP). 正值 =
+     * submenu 往左移, 跟 parent 右边重叠. macOS / Win11 风格 submenu 微
+     * 微叠在 parent 上. */
+    static constexpr float kSubmenuOverlap = 6.0f;
     static constexpr float kFontSize     = 13.0f;       // body text size
     static constexpr float kShortcutFont = 12.0f;
     // Soft drop shadow margin around the popup card. The popup HWND is
@@ -131,8 +192,7 @@ private:
     // halo to spread outward.
     static constexpr float kShadowMargin = 18.0f;
 
-    float MenuWidth() const;
-    float MenuHeight() const;
+    // (MenuWidth / MenuHeight 移到 public)
     bool HasAnyIcon() const;
     D2D1_RECT_F ItemRect(int index) const;
     int HitTest(float x, float y) const;

@@ -1228,10 +1228,12 @@ WidgetPtr BuildWidgetTree(
                     std::wstring itemText = txtIt != itemNode.attrs.end() ? ToWide(txtIt->second) : L"";
                     std::wstring shortcut = scIt != itemNode.attrs.end() ? ToWide(scIt->second) : L"";
 
-                    if (shortcut.empty())
-                        ctxMenu->AddItem(itemId, itemText);
-                    else
-                        ctxMenu->AddItemEx(itemId, itemText, shortcut, "", nullptr);
+                    /* BREAKING (build 75): menuitem 改成 widget content slot.
+                     * 这条老 markup 路径 (capitalized <MenuBar><Menu><MenuItem text="..">)
+                     * 简化: 给一个仅含文字的 label widget. 如想加 icon / 任意装饰,
+                     * 改用声明式 .uix 路径 (lowercase `<menuitem>` body 自由嵌套). */
+                    auto lbl = std::make_shared<LabelWidget>(itemText);
+                    ctxMenu->AddItemContent(itemId, shortcut, lbl);
 
                     // Wire onClick handler
                     auto onClickIt = itemNode.attrs.find("onClick");

@@ -64,9 +64,8 @@ export const apiGroups: ApiGroup[] = [
   {
     name: "Toast & Dialog",
     functions: [
-      { name: "ui_toast", signature: "void ui_toast(UiWindow win, const wchar_t* text, int duration_ms)", description: "Show a toast notification at bottom-center" },
-      { name: "ui_toast_at", signature: "void ui_toast_at(UiWindow win, const wchar_t* text, int duration_ms, int position)", description: "Show toast at position (0=top 1=center 2=bottom)" },
-      { name: "ui_toast_ex", signature: "void ui_toast_ex(UiWindow win, const wchar_t* text, int duration_ms, int position, int icon)", description: "Show toast with icon (0=none 1=success 2=error 3=warning)" },
+      { name: "ui_toast", signature: "void ui_toast(UiWindow win, const wchar_t* text, int duration_ms)", description: "Show a toast notification at top with slide animation" },
+      { name: "ui_toast_ex", signature: "void ui_toast_ex(UiWindow win, const wchar_t* text, int duration_ms, int position, int icon, int anim)", description: "Show toast with position (0=top 1=center 2=bottom), icon (0=none 1=success 2=error 3=warning), and anim (UI_TOAST_ANIM_SLIDE=0 | UI_TOAST_ANIM_FADE=1)" },
       { name: "ui_dialog_show", signature: "void ui_dialog_show(UiWidget dialog, UiWindow win, const wchar_t* title, const wchar_t* message, UiDialogCallback cb, void* userdata)", description: "Show a modal dialog with title and message" },
       { name: "ui_dialog_hide", signature: "void ui_dialog_hide(UiWidget dialog, UiWindow win)", description: "Hide the dialog" },
       { name: "ui_dialog_set_ok_text", signature: "void ui_dialog_set_ok_text(UiWidget dialog, const wchar_t* text)", description: "Customize the OK button text" },

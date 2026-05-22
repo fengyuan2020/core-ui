@@ -142,6 +142,18 @@ UiWindowImpl* Context::FirstWindow() const {
     return nullptr;
 }
 
+UiWindowImpl* Context::FindWindowByWidget(Widget* w) {
+    if (!w) return nullptr;
+    /* 走到 root — Parent() 链终点. */
+    Widget* root = w;
+    while (root->Parent()) root = root->Parent();
+    /* 在窗口表里反查哪个 window 持这个 root. */
+    for (auto& [id, win] : windows_) {
+        if (win && win->Root().get() == root) return win.get();
+    }
+    return nullptr;
+}
+
 void Context::RemoveWindow(uint64_t id) {
     windows_.erase(id);
 }

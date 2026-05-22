@@ -14,6 +14,7 @@
 
 #include <functional>
 #include <optional>
+#include <set>
 #include <sstream>
 
 namespace ui::page {
@@ -304,10 +305,16 @@ void CompileElement(CompilerCtx& ctx,
         compileMenu = [&](const ui::uix::Node& mNode, int /*startId*/, bool top) -> CompiledMenuPtr {
             auto cm = std::make_shared<CompiledMenu>();
             for (const auto& a : mNode.attrs) {
-                if (a.kind != ui::uix::AttrKind::Static) continue;
-                if (a.name == "id") cm->id = a.rawValue;
-                else if (a.name == "trigger") cm->triggerSelector = a.rawValue;
-                else if (a.name == "event")   cm->triggerEvent    = a.rawValue;
+                if (a.kind == ui::uix::AttrKind::Static) {
+                    if (a.name == "id") cm->id = a.rawValue;
+                    else if (a.name == "trigger") cm->triggerSelector = a.rawValue;
+                    else if (a.name == "event")   cm->triggerEvent    = a.rawValue;
+                } else if (a.kind == ui::uix::AttrKind::Directive) {
+                    /* <menu v-if / v-show>: 整体条件渲染, show 不出来时
+                     * PopulateMenu skip 不 build items. v-show 在 menu 语境
+                     * 等价 v-if (popup 模型没"占位但不显" 概念, 见 build 73 CHANGELOG). */
+                    if (a.name == "if" || a.name == "show") cm->vIfExpr = a.rawValue;
+                }
             }
             if (top && cm->triggerEvent.empty()) cm->triggerEvent = "click";
 
@@ -317,18 +324,57 @@ void CompileElement(CompilerCtx& ctx,
                 const auto& c = *cptr;
                 if (c.kind != ui::uix::NodeKind::Element) continue;
 
-                /* 嵌套 <menu text="Recent">: 当 submenu */
+                /* BREAKING (build 75): 嵌套 <menu title="..." v-if="..."> 当
+                 * submenu. submenu 的 "parent 入口" 视觉跟 menuitem 同款
+                 * widget-template 渲染: 取 title (静态或 :title 反应式) 包到
+                 * 自动 <label> 子节点, 跟 <menuitem><label>title</label></menuitem>
+                 * 等价. 没有 menuitem 那么自由 (用户暂不能写 <menu><svg/>title</menu>
+                 * 形式定 submenu 入口外观, 若需要可后续扩展). */
                 if (c.tag == "menu") {
                     CompiledMenuItem mi;
-                    /* submenu item 的文字: 优先 text 属性, 否则 child Text 节点 */
+                    std::string titleStatic;
+                    std::string titleBound;
                     for (const auto& a : c.attrs) {
-                        if (a.kind == ui::uix::AttrKind::Static && a.name == "text")
-                            mi.text = a.rawValue;
+                        if (a.kind == ui::uix::AttrKind::Static) {
+                            if (a.name == "title" || a.name == "text")
+                                titleStatic = a.rawValue;
+                        } else if (a.kind == ui::uix::AttrKind::Bind) {
+                            if (a.name == "title" || a.name == "text")
+                                titleBound = a.rawValue;
+                        } else if (a.kind == ui::uix::AttrKind::Directive) {
+                            if (a.name == "if" || a.name == "show")
+                                mi.vIfExpr = a.rawValue;
+                        }
                     }
-                    if (mi.text.empty()) {
-                        bool _hi = false;
-                        mi.text = ExtractStaticText(c, _hi);
+                    /* 合成 wrapper: <div class="menuitem-row"><label>{title}</label></div>
+                     * label 内放静态 text node 或 Interpolation node (反应式). */
+                    auto wrapper = std::make_unique<ui::uix::Node>();
+                    wrapper->kind = ui::uix::NodeKind::Element;
+                    wrapper->tag = "div";
+                    {
+                        ui::uix::Attr cls;
+                        cls.kind = ui::uix::AttrKind::Static;
+                        cls.name = "class";
+                        cls.rawValue = "menuitem-row";
+                        wrapper->attrs.push_back(cls);
                     }
+                    auto labelNode = std::make_unique<ui::uix::Node>();
+                    labelNode->kind = ui::uix::NodeKind::Element;
+                    labelNode->tag = "label";
+                    if (!titleBound.empty()) {
+                        auto interp = std::make_unique<ui::uix::Node>();
+                        interp->kind = ui::uix::NodeKind::Interpolation;
+                        interp->text = titleBound;
+                        labelNode->children.push_back(std::move(interp));
+                    } else {
+                        auto textNode = std::make_unique<ui::uix::Node>();
+                        textNode->kind = ui::uix::NodeKind::Text;
+                        textNode->text = titleStatic;
+                        labelNode->children.push_back(std::move(textNode));
+                    }
+                    wrapper->children.push_back(std::move(labelNode));
+                    mi.contentRoot = std::move(wrapper);
+
                     mi.submenu = compileMenu(c, 1, false /*not top*/);
                     if (mi.itemId == 0) mi.itemId = autoId++;
                     cm->items.push_back(std::move(mi));
@@ -338,6 +384,13 @@ void CompileElement(CompilerCtx& ctx,
                 CompiledMenuItem mi;
                 if (c.tag == "separator" || c.tag == "hr") {
                     mi.separator = true;
+                    /* separator 支持 v-if / v-show. */
+                    for (const auto& a : c.attrs) {
+                        if (a.kind == ui::uix::AttrKind::Directive &&
+                            (a.name == "if" || a.name == "show")) {
+                            mi.vIfExpr = a.rawValue;
+                        }
+                    }
                     cm->items.push_back(std::move(mi));
                     continue;
                 }
@@ -348,71 +401,115 @@ void CompileElement(CompilerCtx& ctx,
                     continue;
                 }
 
+                /* BREAKING (build 75): 老的 icon/style/text 静态属性 + :text/
+                 * :icon/:style 反应式属性 全 deprecated 砍掉. menuitem body
+                 * 直接当 widget content slot. 保留:
+                 *   id (静态 int) — 派发 callback
+                 *   shortcut (静态 / :shortcut 反应式) — 右对齐显示, 不可点
+                 *   onclick / @click — JS method 名 (跟 id callback 等价)
+                 *   :enabled — 反应式 disable
+                 *   v-if / v-show / v-for — 同 widget 标准 */
                 for (const auto& a : c.attrs) {
-                    if (a.kind != ui::uix::AttrKind::Static) continue;
-                    if (a.name == "id") {
-                        try { mi.itemId = std::stoi(a.rawValue); }
-                        catch (...) {
-                            ctx.out->errors.push_back(
-                                "<menuitem id='" + a.rawValue + "'>: id must be integer");
-                        }
-                    }
-                    else if (a.name == "shortcut") mi.shortcut = a.rawValue;
-                    else if (a.name == "onclick")  mi.onClick  = a.rawValue;
-                    /* Phase C: <menuitem icon="logo.png">. asset resolver key */
-                    else if (a.name == "icon")     mi.imgSrc   = a.rawValue;
-                    /* Phase D: <menuitem style="color: #d63a26"> */
-                    else if (a.name == "style") {
-                        /* 简单提取 color: 值 (没引入 CSS parser; menu 不接 CSS 选择器) */
-                        const std::string& s = a.rawValue;
-                        size_t k = s.find("color");
-                        while (k != std::string::npos) {
-                            /* skip 'color' 后第一个 ':' */
-                            size_t colon = s.find(':', k);
-                            if (colon == std::string::npos) break;
-                            size_t vstart = colon + 1;
-                            while (vstart < s.size() && (s[vstart] == ' ' || s[vstart] == '\t')) ++vstart;
-                            size_t vend = s.find(';', vstart);
-                            if (vend == std::string::npos) vend = s.size();
-                            std::string val = s.substr(vstart, vend - vstart);
-                            while (!val.empty() && (val.back() == ' ' || val.back() == '\t')) val.pop_back();
-                            ui::css::Color cc;
-                            if (!val.empty() && ui::css::ParseColor(val, cc)) {
-                                mi.hasColor = true;
-                                mi.color_r = cc.r; mi.color_g = cc.g;
-                                mi.color_b = cc.b; mi.color_a = cc.a;
+                    if (a.kind == ui::uix::AttrKind::Static) {
+                        if (a.name == "id") {
+                            try { mi.itemId = std::stoi(a.rawValue); }
+                            catch (...) {
+                                ctx.out->errors.push_back(
+                                    "<menuitem id='" + a.rawValue + "'>: id must be integer");
                             }
-                            break;  /* 只看第一个 color: */
+                        }
+                        else if (a.name == "shortcut") mi.shortcut = a.rawValue;
+                        else if (a.name == "onclick")  mi.onClick  = a.rawValue;
+                    }
+                    else if (a.kind == ui::uix::AttrKind::Bind) {
+                        if      (a.name == "shortcut") mi.boundShortcutExpr = a.rawValue;
+                        else if (a.name == "enabled")  mi.boundEnabledExpr  = a.rawValue;
+                        /* 注: :text / :icon / :style 不再支持, 改写 menuitem
+                         * body 内放 <svg :style="..."/> 或 <label>{{ x }}</label>
+                         * 等任意 widget. */
+                    }
+                    else if (a.kind == ui::uix::AttrKind::Directive) {
+                        if (a.name == "if" || a.name == "show") mi.vIfExpr = a.rawValue;
+                        else if (a.name == "for") {
+                            std::string lv, iv, ln;
+                            if (ParseVFor(a.rawValue, lv, iv, ln)) {
+                                mi.vForIterVar   = lv;
+                                mi.vForIndexVar  = iv;
+                                mi.vForArrayExpr = ln;
+                            } else {
+                                ctx.out->errors.push_back(
+                                    "<menuitem v-for='" + a.rawValue +
+                                    "'>: expected \"x in items\" or \"(x, i) in items\"");
+                            }
                         }
                     }
-                }
-                for (const auto& a : c.attrs) {
-                    if (a.kind == ui::uix::AttrKind::Event && a.name == "click" &&
-                        !a.rawValue.empty()) {
+                    else if (a.kind == ui::uix::AttrKind::Event && a.name == "click" &&
+                             !a.rawValue.empty()) {
                         mi.onClick = a.rawValue;
                     }
                 }
-                bool _hi = false;
-                mi.text = ExtractStaticText(c, _hi);
-                /* Phase B/C: 先看 <menuitem icon="..."> 已在 attrs 处理过.
-                   再扫子节点: <svg> 当 SVG icon, <img src> 当光栅 icon (覆盖 attr).
-                   imgSrc 优先, 同时给 svg 时 svg 让位. */
+
+                /* 把 menuitem 的 children **深拷贝** 到一个合成 <div class="menuitem-row">
+                 * wrapper, 让 widget_factory 当普通 hbox 编译. 用 deep-clone 而
+                 * 不是 move 因为外层 mNode 是 const 引用 (AST 不可变契约). Text /
+                 * Interpolation 子节点自动包到 <label> 里 (方便 <menuitem>文字</menuitem>
+                 * 这种简单写法直接 work). 元素节点 (svg / label / div / button / ...)
+                 * 原样 clone 进 wrapper. */
+                std::function<ui::uix::NodePtr(const ui::uix::Node&)> cloneNode;
+                cloneNode = [&cloneNode](const ui::uix::Node& src) -> ui::uix::NodePtr {
+                    auto n = std::make_unique<ui::uix::Node>();
+                    n->kind = src.kind;
+                    n->line = src.line;
+                    n->col  = src.col;
+                    n->tag  = src.tag;
+                    n->selfClosed = src.selfClosed;
+                    n->text = src.text;
+                    n->attrs = src.attrs;
+                    for (const auto& ch : src.children) {
+                        if (ch) n->children.push_back(cloneNode(*ch));
+                    }
+                    return n;
+                };
+                auto wrapper = std::make_unique<ui::uix::Node>();
+                wrapper->kind = ui::uix::NodeKind::Element;
+                wrapper->tag = "div";
+                {
+                    ui::uix::Attr cls;
+                    cls.kind = ui::uix::AttrKind::Static;
+                    cls.name = "class";
+                    cls.rawValue = "menuitem-row";
+                    wrapper->attrs.push_back(cls);
+                    /* 默认 layout (flex-row / gap / padding / max-width) 走 lib
+                     * 内置 .menuitem-row CSS (page_api.cpp 在 user CSS 前 inject),
+                     * 用户可在 <style> 写同选择器覆盖. */
+                }
                 for (const auto& cptr2 : c.children) {
                     if (!cptr2) continue;
-                    const auto& cc = *cptr2;
-                    if (cc.kind != ui::uix::NodeKind::Element) continue;
-                    if (cc.tag == "img") {
-                        for (const auto& a : cc.attrs) {
-                            if (a.kind == ui::uix::AttrKind::Static && a.name == "src") {
-                                mi.imgSrc = a.rawValue;
+                    if (cptr2->kind == ui::uix::NodeKind::Text) {
+                        bool nonWs = false;
+                        for (char ch : cptr2->text) {
+                            if (ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r') {
+                                nonWs = true; break;
                             }
                         }
-                    } else if (cc.tag == "svg" && mi.iconSvg.empty()) {
-                        std::string svgStr;
-                        serializeNode(cc, svgStr);
-                        mi.iconSvg = std::move(svgStr);
+                        if (!nonWs) continue;
+                        auto labelNode = std::make_unique<ui::uix::Node>();
+                        labelNode->kind = ui::uix::NodeKind::Element;
+                        labelNode->tag = "label";
+                        labelNode->children.push_back(cloneNode(*cptr2));
+                        wrapper->children.push_back(std::move(labelNode));
+                    } else if (cptr2->kind == ui::uix::NodeKind::Interpolation) {
+                        auto labelNode = std::make_unique<ui::uix::Node>();
+                        labelNode->kind = ui::uix::NodeKind::Element;
+                        labelNode->tag = "label";
+                        labelNode->children.push_back(cloneNode(*cptr2));
+                        wrapper->children.push_back(std::move(labelNode));
+                    } else {
+                        wrapper->children.push_back(cloneNode(*cptr2));
                     }
                 }
+                mi.contentRoot = std::move(wrapper);
+
                 if (mi.itemId == 0) mi.itemId = autoId++;
                 cm->items.push_back(std::move(mi));
             }
@@ -712,24 +809,68 @@ void CompileElement(CompilerCtx& ctx,
             // Track each shape's source HTML node so the runtime recompute
             // hook can re-run CSS without re-parsing markup.
             std::vector<const ui::uix::Node*> shapeSourceNodes;
+            // Per-shape snapshot of inherited presentation attrs (from <svg>
+            // root + ancestor <g> chain). Parallel to shapeSourceNodes —
+            // recompute closure re-applies these BEFORE the shape's own attrs
+            // so SVG inheritance (1.1 §6.4) survives state-driven recomputes.
+            using InheritedAttrs = std::vector<std::pair<std::string, std::string>>;
+            std::vector<InheritedAttrs> shapeInheritedAttrs;
+
+            // SVG presentation attrs that inherit by default (per SVG 1.1 §6.4).
+            // `opacity` is intentionally excluded — it's NOT inherited.
+            static const std::set<std::string> kInheritableSvgAttrs = {
+                "fill", "stroke",
+                "fill-opacity", "stroke-opacity",
+                "stroke-width", "stroke-dasharray",
+                "stroke-linecap", "stroke-linejoin",
+                "color",
+            };
+
+            // Merge an element's inheritable static attrs into a vec.
+            // Later entries with the same name overwrite earlier ones (child
+            // overrides ancestor when walking down).
+            auto mergeInherited = [&](const ui::uix::Node& el, InheritedAttrs& vec) {
+                for (const auto& a : el.attrs) {
+                    if (a.kind != ui::uix::AttrKind::Static) continue;
+                    if (!kInheritableSvgAttrs.count(a.name)) continue;
+                    bool replaced = false;
+                    for (auto& p : vec) {
+                        if (p.first == a.name) { p.second = a.rawValue; replaced = true; break; }
+                    }
+                    if (!replaced) vec.emplace_back(a.name, a.rawValue);
+                }
+            };
 
             // Walker: handles nested <defs> (where gradients usually live) but
             // also tolerates gradients declared directly under <svg>.
             // `parentMatch` is the css::MatchNode of the current container —
             // starts at the SvgWidget's own match node `m`, descends through
             // <g>/<defs> if we ever support them.
-            std::function<void(const ui::uix::Node&, const ui::css::MatchNode*)> walk =
-                [&](const ui::uix::Node& parent, const ui::css::MatchNode* parentMatch) {
+            // `inherited` carries the accumulated presentation attrs from
+            // <svg> + any ancestor <g> chain.
+            std::function<void(const ui::uix::Node&, const ui::css::MatchNode*, const InheritedAttrs&)> walk =
+                [&](const ui::uix::Node& parent, const ui::css::MatchNode* parentMatch,
+                    const InheritedAttrs& inherited) {
                 for (const auto& c : parent.children) {
                     if (c->kind != ui::uix::NodeKind::Element) continue;
-                    if (c->tag == "defs") { walk(*c, parentMatch); continue; }
+                    if (c->tag == "defs") { walk(*c, parentMatch, inherited); continue; }
+                    if (c->tag == "g") {
+                        // build 90: <g> presentation attrs 参与级联到 child.
+                        // 合并 <g> 自己的 inheritable attrs 到一份副本, 向下传.
+                        InheritedAttrs merged = inherited;
+                        mergeInherited(*c, merged);
+                        walk(*c, parentMatch, merged);
+                        continue;
+                    }
                     if (c->tag == "linearGradient") { parseGradient(*c, SvgGradient::Kind::Linear); continue; }
                     if (c->tag == "radialGradient") { parseGradient(*c, SvgGradient::Kind::Radial); continue; }
                     int k = kindOf(c->tag);
                     if (k < 0) continue;
                     SvgShape shape;
                     shape.kind = static_cast<SvgShapeKind>(k);
-                    // 1. Presentation attrs (lowest priority).
+                    // 1a. Inherited presentation attrs (lowest priority).
+                    for (const auto& [n, v] : inherited) ApplySvgShapeAttr(shape, n, v);
+                    // 1b. Shape's own presentation attrs (override inherited).
                     for (const auto& a : c->attrs) {
                         if (a.kind != ui::uix::AttrKind::Static) continue;
                         ApplySvgShapeAttr(shape, a.name, a.rawValue);
@@ -739,6 +880,7 @@ void CompileElement(CompilerCtx& ctx,
                     size_t shapeIdx = svg->Shapes().size();
                     svg->AddShape(std::move(shape));
                     shapeSourceNodes.push_back(c.get());
+                    shapeInheritedAttrs.push_back(inherited);
                     for (const auto& a : c->attrs) {
                         if (a.kind != ui::uix::AttrKind::Bind) continue;
                         if (a.rawValue.empty()) continue;
@@ -750,7 +892,10 @@ void CompileElement(CompilerCtx& ctx,
                     }
                 }
             };
-            walk(node, &m);
+            // Initial inherited set: <svg> root's own inheritable attrs.
+            InheritedAttrs svgInherited;
+            mergeInherited(node, svgInherited);
+            walk(node, &m, svgInherited);
 
             // Install the runtime recompute closure. Captures by value — sheet
             // ptr is stable (CompiledPage owns it), shape nodes are owned by
@@ -763,7 +908,8 @@ void CompileElement(CompilerCtx& ctx,
                 const ui::css::Stylesheet* sheetPtr = &ctx.sheet;
                 SvgWidget* rawSvg = svg;
                 auto nodesCopy = shapeSourceNodes;
-                rawSvg->recomputeShapes = [rawSvg, sheetPtr, varsRef, nodesCopy]() {
+                auto inheritedCopy = shapeInheritedAttrs;
+                rawSvg->recomputeShapes = [rawSvg, sheetPtr, varsRef, nodesCopy, inheritedCopy]() {
                     // Build live ancestor chain (mirrors recomputeStyle for
                     // regular widgets so descendant selectors stay correct
                     // through dynamic-class toggles + :hover/:focus).
@@ -805,6 +951,13 @@ void CompileElement(CompilerCtx& ctx,
                         fresh.kind = shapes[i].kind;
                         fresh.points = shapes[i].points;       // geometry preserved
                         fresh.pathData = shapes[i].pathData;
+                        // Inherited presentation attrs (lowest priority) first,
+                        // then shape's own — mirrors compile-time cascade order.
+                        if (i < inheritedCopy.size()) {
+                            for (const auto& [n, v] : inheritedCopy[i]) {
+                                ApplySvgShapeAttr(fresh, n, v);
+                            }
+                        }
                         for (const auto& a : shapeNode->attrs) {
                             if (a.kind != ui::uix::AttrKind::Static) continue;
                             ApplySvgShapeAttr(fresh, a.name, a.rawValue);
@@ -979,18 +1132,42 @@ void CompileElement(CompilerCtx& ctx,
 
     // ---- <ScrollView> post-process ----
     // Children were AddChild'd during recursion. ScrollViewWidget expects a
-    // single content widget via SetContent(). If >1 child, wrap in a VBox.
+    // single content widget via SetContent().
+    //
+    // Build 109 (L29): 不论 kids.size() **总是**包 wrapper VBox + patch
+    // v-if/v-for conditional 的 parentWidget = wrapper. 之前 size==1 时直接
+    // SetContent(only) + size==0 时啥都不做, 导致 caller 在 ScrollView 内
+    // 混用 v-if/v-for sibling 时 layout 错乱: conditional 注册时记的
+    // parentWidget 仍是 sv (compiler 阶段记的), mount 时 InsertChild 到
+    // sv.children 而不是 wrapper, ScrollView 同时持 wrapper + N 个 mounted
+    // panel, layout 算错 (实测 GuoheView settings 窗 4-panel ScrollView 显示
+    // shortcuts panel 抢 general panel 的 viewport).
+    //
+    // 现在 wrapper 总是收纳所有 sibling, sv.children 永远只有 wrapper, v-if
+    // /v-for mount 时 InsertChild 到 wrapper, 一致.
+    //
+    // 行为变化: 单 child ScrollView 现在多一层 VBox wrapper (之前 only widget
+    // 直接是 sv child). VBoxWidget 默认无 margin/padding/border/bg, 视觉无差;
+    // CPU 多一次 DoLayout 调用, 可忽略.
     if (auto* sv = dynamic_cast<ScrollViewWidget*>(w.get())) {
         auto& kids = w->Children();
-        if (kids.size() == 1) {
-            WidgetPtr only = kids[0];
-            sv->SetContent(only);  // SetContent clears children_ and re-AddChilds
-        } else if (kids.size() > 1) {
-            auto wrapper = std::make_shared<VBoxWidget>();
-            // Move kids into wrapper (copy pointers first, then re-parent)
-            std::vector<WidgetPtr> copy = kids;
-            for (auto& c : copy) wrapper->AddChild(c);
-            sv->SetContent(wrapper);
+        auto wrapper = std::make_shared<VBoxWidget>();
+        // Move kids into wrapper (copy pointers first, then re-parent — kids
+        // is a reference to sv.children_ which SetContent will mutate).
+        std::vector<WidgetPtr> copy = kids;
+        for (auto& c : copy) wrapper->AddChild(c);
+        sv->SetContent(wrapper);  // SetContent clears children_ and AddChild(wrapper)
+
+        // patch conditionals / loops parentWidget = sv → wrapper. v-if/v-for
+        // mount runtime 在 page_state.cpp:1380 处 InsertChild 到 parentWidget,
+        // 我们这里改成 wrapper 才能让 mounted panel 跟 sv 的 sibling 一起
+        // 落在 wrapper 内, ScrollView 永远只看到 wrapper 一个 child.
+        Widget* wrapper_raw = wrapper.get();
+        for (auto& cd : ctx.out->conditionals) {
+            if (cd.parentWidget == sv) cd.parentWidget = wrapper_raw;
+        }
+        for (auto& lp : ctx.out->loops) {
+            if (lp.parentWidget == sv) lp.parentWidget = wrapper_raw;
         }
     }
 }

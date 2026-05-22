@@ -1122,6 +1122,77 @@ export default {
 </div>
 ```
 
+### 反应式菜单（自 1.6.0 build 73-89）
+
+菜单内容可以跟 `data()` 状态联动——`v-for` 生成 menuitem 列表、`v-if` 条件显示、
+`:disabled` 双向绑定。右键弹出时永远读最新值，不需要手动 "先关菜单 → 改 menu → 再弹"：
+
+```vue
+<script>
+export default {
+  data() {
+    return {
+      commands: [
+        { id: 'copy',  label: '复制', enabled: true  },
+        { id: 'paste', label: '粘贴', enabled: false }
+      ],
+      isAdmin: true
+    };
+  },
+  methods: {
+    run(cmd) { /* ... */ },
+    del()    { /* ... */ }
+  }
+}
+</script>
+
+<template>
+  <div id="tree-item">tree</div>
+
+  <menu trigger="#tree-item" event="rclick">
+    <menuitem v-for="cmd in commands" :key="cmd.id"
+              :disabled="!cmd.enabled" @click="run(cmd)">
+      <label>{{ cmd.label }}</label>
+    </menuitem>
+    <separator/>
+    <menuitem v-if="isAdmin" @click="del">
+      <label style="color: #d63a26">删除</label>
+    </menuitem>
+  </menu>
+</template>
+```
+
+**重要的破坏性变动 (从 1.5.0 公开版本升级时注意):**
+
+- **`menuitem` 改成 widget 模板** (BREAKING, build 75)：必须包子 widget，不能
+  `<menuitem>文本</menuitem>` 直接收文本节点：
+
+  ```vue
+  <!-- 1.5.0 老写法 (已不支持) -->
+  <menuitem>复制</menuitem>
+
+  <!-- 1.6.0 新写法 -->
+  <menuitem><label>复制</label></menuitem>
+  ```
+
+- **`WireMenus` 静态简化路径已删** (BREAKING, build 73)：C 端不能再手挂菜单。
+  全部走 `<menu>` 声明式 + Vue 3 binding，包括动态修改 menuitem 列表也用 `v-for`，
+  不要走 `ui_menu_clear_items` + 手动重灌的旧路径
+- **rclick dispatch 改 deepest-match** (build 107-108)：嵌套 `<menu trigger>` 时
+  子 widget 的 menu 不再被祖先抢走 (跟 DOM event bubbling 语义一致)
+
+```vue
+<div id="canvas_body">
+  <div id="minimap">小地图</div>
+</div>
+
+<menu trigger="#canvas_body" event="rclick">…</menu>   <!-- 父 trigger -->
+<menu trigger="#minimap"     event="rclick">…</menu>   <!-- 子 trigger 现在能弹出 -->
+```
+
+之前父 `Contains(x, y)` 对子区域也返 true 抢先 ShowMenu，子 trigger 没机会；
+现在按 widget tree 深度选最深的 trigger。
+
 ### 属性参考
 
 #### `<menu>`

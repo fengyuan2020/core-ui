@@ -360,6 +360,14 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
         else if (auto* btn = dynamic_cast<ButtonWidget*>(w)) btn->SetText(ToWide(v.ToString()));
         return;
     }
+    if (prop == "id") {
+        /* :id="..." 动态 id (build 98+ L26). 主用例 v-for 给每个 iteration
+         * 唯一 id 让 ui_page_on_widget_mount 能挂回调. 调用时机: bindings 首次
+         * eval 时设 w->id, 紧接着 DispatchMountHooks 走 tree 命中 hook. id
+         * 之后变化只更新值, 不联动 unmount/mount lifecycle — caller 别依赖. */
+        w->id = v.ToString();
+        return;
+    }
     if (prop == "class") {
         std::vector<std::string> tokens;
         std::string s = v.ToString();
@@ -499,59 +507,25 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
 // ---- Menus -----------------------------------------------------------------
 
 void PageState::WireMenus() {
+    /* Build 73 (L17): 顶层菜单同走 WireSubtreeMenus 路径 — 反应式 hook +
+     * 完整 icon (SVG / bitmap) 支持都集中在那里, WireMenus 不再单独建静态
+     * items. 老 demo 用静态 <menuitem text="..." icon="..."> 也 OK,
+     * WireSubtreeMenus 内部 PopulateMenuItem 对 bound 字段为空时走静态
+     * fallback (向后兼容). */
     menus_.clear();
     menuById_.clear();
     triggers_.clear();
     menuItemHandlers_.clear();
+    compiledToMenu_.clear();
     if (page_.menus.empty()) return;
-
-    auto toWide = [](const std::string& s) -> std::wstring {
-        if (s.empty()) return {};
-        int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
-        if (len <= 0) return {};
-        std::wstring w(len, 0);
-        MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], len);
-        return w;
-    };
-    auto resolveTrigger = [this](const std::string& sel) -> Widget* {
-        if (sel.size() < 2 || sel[0] != '#') return nullptr;
-        if (!page_.root) return nullptr;
-        return page_.root->FindById(sel.substr(1));
-    };
-
-    for (const auto& cm : page_.menus) {
-        auto menu = std::make_shared<ContextMenu>();
-        for (const auto& mi : cm.items) {
-            if (mi.separator) { menu->AddSeparator(); continue; }
-            std::wstring text = toWide(mi.text);
-            if (mi.shortcut.empty())
-                menu->AddItem(mi.itemId, text);
-            else
-                menu->AddItemEx(mi.itemId, text, toWide(mi.shortcut), "", nullptr);
-            if (!mi.onClick.empty()) {
-                menuItemHandlers_[mi.itemId] = mi.onClick;
-            }
-        }
-        menus_.push_back(menu);
-        if (!cm.id.empty()) menuById_[cm.id] = menu.get();
-
-        Widget* trigger = resolveTrigger(cm.triggerSelector);
-        if (!trigger) continue;
-        triggers_.push_back({trigger, menu.get(), cm.triggerEvent == "rclick"});
-    }
+    WireSubtreeMenus(page_.menus, menus_);
 }
 
 void PageState::WireSubtreeMenus(const std::vector<CompiledMenu>& subMenus,
                                   std::vector<std::shared_ptr<ContextMenu>>& outMenus) {
     if (subMenus.empty()) return;
-    auto toWide = [](const std::string& s) -> std::wstring {
-        if (s.empty()) return {};
-        int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
-        if (len <= 0) return {};
-        std::wstring w(len, 0);
-        MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], len);
-        return w;
-    };
+    /* Build 73 (L17): toWide / renderer / item 构造细节都搬到 PopulateMenuItem
+     * 里, WireSubtreeMenus 只负责 shells + trigger + hook 注册. */
     auto resolveTrigger = [this](const std::string& sel) -> Widget* {
         if (sel.size() < 2 || sel[0] != '#') return nullptr;
         if (!page_.root) return nullptr;
@@ -559,53 +533,39 @@ void PageState::WireSubtreeMenus(const std::vector<CompiledMenu>& subMenus,
     };
 
     ui::UiWindowImpl* winImpl = nullptr;
-    ui::Renderer* renderer = ui::g_activeRenderer;
     if (winHandle_) {
         auto* w = ui::GetContext().GetWindow(winHandle_);
-        if (w) { winImpl = w; renderer = &w->GetRenderer(); }
+        if (w) winImpl = w;
     }
 
+    /* Build 73 (L17): 反应式菜单 — 先建 ContextMenu shells (不 populate items),
+     * 注册 beforeShowHook -> PopulateMenu. 每次 Show 入口走 hook, Clear + 重
+     * eval bound exprs + 重 add items. submenus 也建 shell, 递归注册 hook.
+     * compiledToMenu_ 映射 PopulateMenuItem 找 submenu ContextMenu* 用. */
     std::function<std::shared_ptr<ContextMenu>(const CompiledMenu&)> buildOne;
     buildOne = [&](const CompiledMenu& cm) -> std::shared_ptr<ContextMenu> {
         auto menu = std::make_shared<ContextMenu>();
+        compiledToMenu_[&cm] = menu.get();
+        /* 递归预建所有 submenu shells, 注册它们自己的 hook. submenu 本身的
+         * trigger 是 parent menu item, 不走 widget trigger; 但仍走同款 Show
+         * 路径所以 hook 会触发. */
         for (const auto& mi : cm.items) {
-            if (mi.separator) { menu->AddSeparator(); continue; }
             if (mi.submenu) {
                 auto sub = buildOne(*mi.submenu);
                 outMenus.push_back(sub);
-                menu->AddSubmenu(toWide(mi.text), sub);
-                continue;
-            }
-            std::wstring text = toWide(mi.text);
-            std::wstring shortcut = mi.shortcut.empty() ? L"" : toWide(mi.shortcut);
-
-            ComPtr<ID2D1Bitmap> bmp;
-            if (!mi.imgSrc.empty() && renderer) {
-                const void* bytes = nullptr; size_t size = 0;
-                ui::asset::DataOwnerPtr owner;
-                if (ui::asset::Resolve(mi.imgSrc, &bytes, &size, &owner) && bytes) {
-                    bmp = renderer->LoadImageFromBytes(bytes, size);
-                }
-            }
-
-            if (bmp) {
-                menu->AddItemBitmap(mi.itemId, text, shortcut, bmp);
-            } else if (!mi.iconSvg.empty() && renderer) {
-                menu->AddItemEx(mi.itemId, text, shortcut, mi.iconSvg, renderer);
-            } else if (shortcut.empty()) {
-                menu->AddItem(mi.itemId, text);
-            } else {
-                menu->AddItemEx(mi.itemId, text, shortcut, "", nullptr);
-            }
-
-            if (mi.hasColor) {
-                D2D1_COLOR_F c = { mi.color_r, mi.color_g, mi.color_b, mi.color_a };
-                menu->SetLastItemColor(c);
-            }
-            if (!mi.onClick.empty()) {
-                menuItemHandlers_[mi.itemId] = mi.onClick;
             }
         }
+        /* hook capture: this + 持久 cm 指针 (cm 在 page_.menus 里, 跟 page 生命同寿)
+         * + 裸 menu 指针 (shared_ptr 在 menus_ / outMenus 里持有). */
+        const CompiledMenu* cmPtr = &cm;
+        ContextMenu*        rawMenu = menu.get();
+        PageState*          self = this;
+        menu->SetBeforeShowHook([self, cmPtr, rawMenu] {
+            self->PopulateMenu(rawMenu, *cmPtr, {});
+        });
+        /* 初始 populate 一次, 让没经过 Show 路径的直接调用 (Bounds/MenuWidth)
+         * 也能拿到合理数据. 之后每次 Show 都会重 populate, 这里只是兜底. */
+        PopulateMenu(rawMenu, cm, {});
         return menu;
     };
 
@@ -638,18 +598,314 @@ void PageState::WireSubtreeMenus(const std::vector<CompiledMenu>& subMenus,
             for (const auto& t : triggers_) if (t.rclick) rclickList.push_back(t);
             auto* wp = winImpl;
             auto prev = wp->onRightClick;
+            /* Build 107 (L28): rclick dispatch first-match → deepest-match.
+             * 之前按 rclickList 声明顺序 (.uix `<menu>` 出现顺序) 取第一个
+             * Contains(x, y) 的 trigger, 但 child widget 上 rclick 也满足
+             * ancestor trigger 的 Contains, 父先声明的话子 widget 自己的
+             * trigger 永远被抢. 改成遍历找 Contains(x, y) 里 widget tree
+             * 深度最深的 trigger — 子 widget trigger 自然优先于祖先
+             * trigger 匹配, 跟 DOM event capturing 直觉一致. depth 用
+             * Widget::Parent() 链算, O(N×depth), N 通常 <10 无性能问题. */
             wp->onRightClick = [wp, rclickList, prev](float x, float y) {
+                ContextMenu* bestMenu = nullptr;
+                int bestDepth = -1;
                 for (const auto& t : rclickList) {
                     if (!t.triggerElement || !t.menu) continue;
-                    if (t.triggerElement->Contains(x, y)) {
-                        wp->ShowMenu(t.menu->shared_from_this(), x, y);
-                        return;
+                    if (!t.triggerElement->Contains(x, y)) continue;
+                    int depth = 0;
+                    for (Widget* p = t.triggerElement->Parent();
+                         p; p = p->Parent()) {
+                        ++depth;
                     }
+                    if (depth > bestDepth) {
+                        bestDepth = depth;
+                        bestMenu  = t.menu;
+                    }
+                }
+                if (bestMenu) {
+                    wp->ShowMenu(bestMenu->shared_from_this(), x, y);
+                    return;
                 }
                 if (prev) prev(x, y);
             };
         }
     }
+}
+
+// ============================================================================
+// Build 73 (L17): Reactive menu rebuild on Show
+// ============================================================================
+
+JSValue PageState::EvalBoundExpr(
+        const std::string& rawExpr,
+        const std::vector<std::pair<std::string, JSValue>>& locals) {
+    if (rawExpr.empty() || !jsRt_ || JS_IsUndefined(jsState_)) return JS_UNDEFINED;
+    JSContext* ctx = jsRt_->ctx();
+
+    std::set<std::string> localSet;
+    std::vector<std::string> paramNames;
+    std::vector<JSValueConst> args;
+    for (const auto& kv : locals) {
+        localSet.insert(kv.first);
+        paramNames.push_back(kv.first);
+        args.push_back(kv.second);
+    }
+    std::string rewritten = ui::uix::RewriteTemplateExpr(rawExpr, localSet);
+    JSValue fn = locals.empty()
+        ? jsRt_->CompileBindingClosure(rewritten, "<menu>")
+        : jsRt_->CompileLoopBindingClosure(rewritten, paramNames, "<menu>");
+    if (JS_IsException(fn)) { JS_FreeValue(ctx, fn); return JS_UNDEFINED; }
+    JSValue r = JS_Call(ctx, fn, jsState_, (int)args.size(),
+                        args.empty() ? nullptr : args.data());
+    JS_FreeValue(ctx, fn);
+    return r;  // caller frees
+}
+
+bool PageState::EvalBool(
+        const std::string& expr,
+        const std::vector<std::pair<std::string, JSValue>>& locals,
+        bool defaultVal) {
+    if (expr.empty() || !jsRt_) return defaultVal;
+    JSValue v = EvalBoundExpr(expr, locals);
+    if (JS_IsUndefined(v) || JS_IsException(v)) {
+        if (JS_IsException(v)) JS_FreeValue(jsRt_->ctx(), v);
+        return defaultVal;
+    }
+    int b = JS_ToBool(jsRt_->ctx(), v);
+    JS_FreeValue(jsRt_->ctx(), v);
+    return b > 0;
+}
+
+std::string PageState::EvalString(
+        const std::string& expr,
+        const std::vector<std::pair<std::string, JSValue>>& locals) {
+    if (expr.empty() || !jsRt_) return {};
+    JSValue v = EvalBoundExpr(expr, locals);
+    if (JS_IsUndefined(v) || JS_IsException(v)) {
+        if (JS_IsException(v)) JS_FreeValue(jsRt_->ctx(), v);
+        return {};
+    }
+    const char* c = JS_ToCString(jsRt_->ctx(), v);
+    std::string r = c ? c : "";
+    if (c) JS_FreeCString(jsRt_->ctx(), c);
+    JS_FreeValue(jsRt_->ctx(), v);
+    return r;
+}
+
+void PageState::PopulateMenu(
+        ContextMenu* menu, const CompiledMenu& cm,
+        const std::vector<std::pair<std::string, JSValue>>& locals) {
+    if (!menu) return;
+    menu->Clear();
+
+    /* menu-level v-if / v-show — false 时整个菜单为空, Show 出来也是没东西.
+     * 空字符串 = 没绑 = 默认 true (show). */
+    if (!cm.vIfExpr.empty() && !EvalBool(cm.vIfExpr, locals, true)) return;
+
+    ui::Renderer* renderer = ui::g_activeRenderer;
+    if (winHandle_) {
+        auto* w = ui::GetContext().GetWindow(winHandle_);
+        if (w) renderer = &w->GetRenderer();
+    }
+
+    /* Build 77+/80+/81+: 扫所有 items (含 v-if=false 隐藏的) 算 shortcut /
+     * submenu / content width 的 max 喂给 menu 当 MenuWidth floor — 两态
+     * 宽度严格一致. v-for items 用静态 shortcut, content 通过实际 build
+     * wrapper widget 走完整 CSS 级联拿 SizeHint (跟 PopulateMenuItem 真正
+     * add 进 menu 时用同一套, 估算值跟运行时严格相等). */
+    {
+        std::function<void(const CompiledMenu&, float&, bool&, float&)> scan;
+        scan = [&scan, this](const CompiledMenu& m, float& maxW, bool& hasSub, float& maxC) {
+            for (const auto& mi : m.items) {
+                if (mi.separator) continue;
+                float w = mi.shortcut.length() * 6.5f;
+                if (w > maxW) maxW = w;
+                if (mi.submenu) { hasSub = true; scan(*mi.submenu, maxW, hasSub, maxC); }
+                /* 真实 measurement, build 83 (正确 CSS spec): build wrapper widget tree,
+                 * SizeHint() 走 fixedW (CSS `width: NNN`) 或 children sum (fit-content
+                 * fallback). max-width 是严格上界 (cap), min-width 是严格下界. 跟
+                 * 浏览器 inline-block / block-with-explicit-width 行为一致.
+                 *
+                 * 调用方控制 menu content col 宽度的方式:
+                 *   .menuitem-row { width: NNN }     → SizeHint = NNN, 确定值
+                 *   .menuitem-row { max-width: NNN } → 上界, content < NNN 时菜单较窄
+                 *   两者都设 → width 赢 (CSS 一致)
+                 *
+                 * build 82 的 "if maxW > 0 use maxW" 是折中, 现在撤回. */
+                if (mi.contentRoot && page_.ownedStylesheet) {
+                    auto sub = ui::page::CompileIterationTemplate(
+                        *mi.contentRoot, *page_.ownedStylesheet, page_.cssVars);
+                    if (sub.root) {
+                        float w2 = sub.root->SizeHint().width;
+                        if (sub.root->maxW > 0 && w2 > sub.root->maxW) w2 = sub.root->maxW;
+                        if (sub.root->minW > 0 && w2 < sub.root->minW) w2 = sub.root->minW;
+                        if (w2 > maxC) maxC = w2;
+                    }
+                }
+            }
+        };
+        float maxShortcutAll = 0;
+        bool  anySubmenu     = false;
+        float maxContentAll  = 0;
+        scan(cm, maxShortcutAll, anySubmenu, maxContentAll);
+        menu->SetReservedShortcutWidth(maxShortcutAll);
+        menu->SetReservedHasSubmenu(anySubmenu);
+        menu->SetReservedContentWidth(maxContentAll);
+    }
+
+    for (const auto& mi : cm.items) {
+        if (!mi.vForArrayExpr.empty()) {
+            /* v-for: eval array expr → 遍历, 每次塞 iter / index 变量进 locals
+             * 后 PopulateMenuItem. 空数组 / 非数组 → skip 这条 declaration. */
+            JSValue arr = EvalBoundExpr(mi.vForArrayExpr, locals);
+            if (jsRt_ && JS_IsArray(arr)) {
+                JSContext* ctx = jsRt_->ctx();
+                int64_t len = 0;
+                JSValue lenV = JS_GetPropertyStr(ctx, arr, "length");
+                JS_ToInt64(ctx, &len, lenV);
+                JS_FreeValue(ctx, lenV);
+                for (int64_t i = 0; i < len; ++i) {
+                    JSValue elem = JS_GetPropertyUint32(ctx, arr, (uint32_t)i);
+                    auto extended = locals;
+                    extended.emplace_back(mi.vForIterVar, elem);
+                    JSValue idxV = JS_UNDEFINED;
+                    if (!mi.vForIndexVar.empty()) {
+                        idxV = JS_NewInt32(ctx, (int32_t)i);
+                        extended.emplace_back(mi.vForIndexVar, idxV);
+                    }
+                    PopulateMenuItem(menu, mi, extended, renderer);
+                    if (!JS_IsUndefined(idxV)) JS_FreeValue(ctx, idxV);
+                    JS_FreeValue(ctx, elem);
+                }
+            }
+            if (jsRt_ && !JS_IsUndefined(arr) && !JS_IsException(arr)) {
+                JS_FreeValue(jsRt_->ctx(), arr);
+            }
+        } else {
+            PopulateMenuItem(menu, mi, locals, renderer);
+        }
+    }
+
+    /* Build 85+: 跨菜单树传播 — 算完 parent 的最终 MenuWidth, 回写到所有
+     * submenu 当 minPropagatedWidth, 让 submenu 至少跟 parent 同宽. 整族
+     * 菜单视觉一致 (不再 submenu 缩到自身文字宽度). */
+    float parentWidth = menu->MenuWidth();
+    std::function<void(const CompiledMenu&)> propagate;
+    propagate = [&propagate, this, parentWidth](const CompiledMenu& m) {
+        for (const auto& mi : m.items) {
+            if (mi.submenu) {
+                auto it = compiledToMenu_.find(mi.submenu.get());
+                if (it != compiledToMenu_.end() && it->second) {
+                    it->second->SetMinPropagatedWidth(parentWidth);
+                }
+                propagate(*mi.submenu);
+            }
+        }
+    };
+    propagate(cm);
+}
+
+void PageState::PopulateMenuItem(
+        ContextMenu* menu, const CompiledMenuItem& mi,
+        const std::vector<std::pair<std::string, JSValue>>& locals,
+        ui::Renderer* renderer) {
+    /* item-level v-if / v-show: 求 false → skip, 也不占位 (separator 同款) */
+    if (!mi.vIfExpr.empty() && !EvalBool(mi.vIfExpr, locals, true)) return;
+
+    auto toWide = [](const std::string& s) -> std::wstring {
+        if (s.empty()) return {};
+        int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+        if (len <= 0) return {};
+        std::wstring w(len, 0);
+        MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], len);
+        return w;
+    };
+
+    if (mi.separator) { menu->AddSeparator(); return; }
+
+    /* shortcut: bound 优先, 静态后备. */
+    std::string scStr = !mi.boundShortcutExpr.empty()
+        ? EvalString(mi.boundShortcutExpr, locals) : mi.shortcut;
+    std::wstring shortcut = scStr.empty() ? L"" : toWide(scStr);
+    (void)renderer;  // 不再走 svg bitmap 路径, lib widget tree 自管
+
+    /* BREAKING (build 75): customContent widget tree — 通过 CompileIterationTemplate
+     * 把 mi.contentRoot AST (一个 <div class="menuitem-row"> 包了用户写的 svg /
+     * label / 任意 widget) 实例化成一棵新 widget tree, 装到 MenuItem.customContent.
+     * 反应式 binding (e.g. <svg :style="...">) 通过同款 watchEffect 接到 jsState_,
+     * 跟 widget 主路径完全一致. 没有 contentRoot (理论上不该发生, compiler 总给一个
+     * wrapper) → 空 widget, ContextMenu 仍能渲染 (只显示 shortcut + arrow). */
+    WidgetPtr content;
+    if (mi.contentRoot && page_.ownedStylesheet) {
+        auto sub = ui::page::CompileIterationTemplate(*mi.contentRoot,
+                                                      *page_.ownedStylesheet,
+                                                      page_.cssVars);
+        if (sub.root) {
+            content = sub.root;
+            /* Wire bindings + events (locals-scope 版本, 跟 v-for 同款).
+             * locals 来自当前 PopulateMenu 调用栈 (v-for menuitem 的 iter var). */
+            std::set<std::string> localSet;
+            std::vector<std::string> paramNames;
+            std::vector<JSValueConst> argVec;
+            for (const auto& kv : locals) {
+                localSet.insert(kv.first);
+                paramNames.push_back(kv.first);
+                argVec.push_back(kv.second);
+            }
+            JSContext* ctx = jsRt_ ? jsRt_->ctx() : nullptr;
+            for (auto& b : sub.bindings) {
+                if (!ctx) break;
+                std::string rew = ui::uix::RewriteTemplateExpr(b.sourceJs, localSet);
+                JSValue fn = paramNames.empty()
+                    ? jsRt_->CompileBindingClosure(rew, "<menuitem>")
+                    : jsRt_->CompileLoopBindingClosure(rew, paramNames, "<menuitem>");
+                if (JS_IsException(fn)) { JS_FreeValue(ctx, fn); continue; }
+                /* 一次性 eval: PopulateMenu 每次 Show 重建 widget tree, 所以
+                 * binding 跟着重 eval 一次足够 — 没必要挂 long-lived WatchEffect
+                 * (那会导致老 effect 持 dangling Widget* 当 deps 变化时崩溃,
+                 * 且 ContextMenu Show 期间 menu 关闭后 widget tree 也马上销毁,
+                 * 反应不到也无意义). */
+                JSValue r = JS_Call(ctx, fn, jsState_, (int)argVec.size(),
+                                    argVec.empty() ? nullptr
+                                                   : const_cast<JSValueConst*>(argVec.data()));
+                JS_FreeValue(ctx, fn);
+                if (JS_IsException(r)) {
+                    JSValue exc = JS_GetException(ctx); JS_FreeValue(ctx, exc);
+                    JS_FreeValue(ctx, r); continue;
+                }
+                ui::expr::Value ev = ui::uix::JSValueToExprValue(ctx, r);
+                ApplyBindingToWidget(b.target, b.property, ev);
+                JS_FreeValue(ctx, r);
+            }
+            /* events: @click 等. 跟 v-for 同款 handler closure wiring. */
+            for (auto& ev : sub.events) {
+                if (!ctx) break;
+                WireQuickJSEvent(ev.target, ev.event, ev.sourceJs);
+            }
+            /* 嵌套 v-if / v-for in menuitem content: 简化版 — 当前迭代不
+             * 支持 menuitem 内部 v-for / 嵌套 v-if reactive remount; 用户
+             * 在 menuitem body 里用 v-if 走 widget 标准 conditional 路径
+             * (sub.conditionals / sub.loops 也得 wire). 后续如要支持, 跟
+             * v-for iteration 的 BuildJsLoopRuntime 同款 wire 一遍. */
+        }
+    }
+
+    /* enabled: bound 优先, 默认 true. ContextMenu 端的 disabled state 走
+     * AddItemContent 之后 SetEnabled(id, false). */
+    bool enabled = mi.boundEnabledExpr.empty()
+        ? true : EvalBool(mi.boundEnabledExpr, locals, true);
+
+    if (mi.submenu) {
+        /* Submenu entry: 用 compiler 合成的 <label>title</label> 当 entry widget. */
+        auto it = compiledToMenu_.find(mi.submenu.get());
+        if (it != compiledToMenu_.end() && it->second) {
+            menu->AddSubmenu(content, it->second->shared_from_this());
+        }
+    } else {
+        menu->AddItemContent(mi.itemId, shortcut, content);
+    }
+    if (!enabled) menu->SetEnabled(mi.itemId, false);
+    if (!mi.onClick.empty()) menuItemHandlers_[mi.itemId] = mi.onClick;
 }
 
 void PageState::AttachWindow(uint64_t winHandle) {
@@ -676,13 +932,30 @@ void PageState::AttachWindow(uint64_t winHandle) {
         std::vector<TriggerSpec> rclickList;
         for (const auto& t : triggers_) if (t.rclick) rclickList.push_back(t);
         auto* wp = winImpl;
+        /* Build 107 (L28): deepest-match — 跟 WireSubtreeMenus 中 line 628 同款.
+         * AttachWindow 后于 WireSubtreeMenus 调用, 这里的 lambda 才是最终生效
+         * 的那个. 之前 WireSubtreeMenus 改成 deepest-match 但 AttachWindow
+         * 没改, 用户右键子 widget 时仍走 first-match 命中父 trigger. 两处
+         * 保持一致避免类似回归. */
         win->onRightClick = [wp, rclickList, prev](float x, float y) {
+            ContextMenu* bestMenu = nullptr;
+            int bestDepth = -1;
             for (const auto& t : rclickList) {
                 if (!t.triggerElement || !t.menu) continue;
-                if (t.triggerElement->Contains(x, y)) {
-                    wp->ShowMenu(t.menu->shared_from_this(), x, y);
-                    return;
+                if (!t.triggerElement->Contains(x, y)) continue;
+                int depth = 0;
+                for (Widget* p = t.triggerElement->Parent();
+                     p; p = p->Parent()) {
+                    ++depth;
                 }
+                if (depth > bestDepth) {
+                    bestDepth = depth;
+                    bestMenu  = t.menu;
+                }
+            }
+            if (bestMenu) {
+                wp->ShowMenu(bestMenu->shared_from_this(), x, y);
+                return;
             }
             if (prev) prev(x, y);
         };

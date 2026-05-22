@@ -1005,6 +1005,37 @@ ComPtr<ID2D1Bitmap> Renderer::CreateBitmapFromPixels(const void* pixels, int wid
     return bitmap;
 }
 
+ComPtr<ID2D1Bitmap> Renderer::CreateBitmapFromPixelsStraight(
+    const void* pixels, int width, int height, int stride) {
+    if (!ctx_ || !pixels || width <= 0 || height <= 0) return nullptr;
+    const int row = stride > 0 ? stride : width * 4;
+
+    /* 把 straight BGRA 转成 premul 写到临时 buffer, 再走 PREMULTIPLIED 路径
+       创建 D2D bitmap. round-to-nearest: (v*a + 127) / 255 ≈ round(v*a/255). */
+    std::vector<uint8_t> premul(static_cast<size_t>(row) * height);
+    const uint8_t* src = static_cast<const uint8_t*>(pixels);
+    uint8_t*       dst = premul.data();
+    for (int y = 0; y < height; ++y) {
+        const uint8_t* sr = src + static_cast<size_t>(y) * row;
+        uint8_t*       dr = dst + static_cast<size_t>(y) * row;
+        for (int x = 0; x < width; ++x) {
+            uint8_t a = sr[3];
+            if (a == 255) {
+                dr[0] = sr[0]; dr[1] = sr[1]; dr[2] = sr[2]; dr[3] = 255;
+            } else if (a == 0) {
+                dr[0] = 0; dr[1] = 0; dr[2] = 0; dr[3] = 0;
+            } else {
+                dr[0] = static_cast<uint8_t>((sr[0] * a + 127) / 255);
+                dr[1] = static_cast<uint8_t>((sr[1] * a + 127) / 255);
+                dr[2] = static_cast<uint8_t>((sr[2] * a + 127) / 255);
+                dr[3] = a;
+            }
+            sr += 4; dr += 4;
+        }
+    }
+    return CreateBitmapFromPixels(premul.data(), width, height, row);
+}
+
 ComPtr<ID2D1Bitmap> Renderer::CreateBitmapFromHICON(HICON hicon) {
     if (!ctx_ || !wicFactory_ || !hicon) return nullptr;
 
@@ -1155,11 +1186,18 @@ void Renderer::PushRoundedClip(const D2D1_RECT_F& rect, float rx, float ry) {
     ComPtr<ID2D1Layer> layer;
     ctx_->CreateLayer(nullptr, layer.GetAddressOf());
     if (geom && layer) {
+        /* D2D1_LAYER_OPTIONS_INITIALIZE_FOR_CLEARTYPE — 必须 (build 96+ L25):
+         * layer 默认 OPTIONS_NONE 会把 ClearType sub-pixel 渲染关掉, layer 内
+         * DrawText 在 CLEARTYPE 模式 (lib build 92+ 默认) 下文字几乎不可见.
+         * 典型表现: 浅色模式 ComboBox 弹出 popup 里的 item 文字白底白字看不见
+         * (popup 先 PushRoundedClip 再画 text). INITIALIZE_FOR_CLEARTYPE 告诉
+         * D2D layer backing 已经初始化为不透明色, sub-pixel blend 可以正确合成. */
         ctx_->PushLayer(
             D2D1::LayerParameters(D2D1::InfiniteRect(), geom.Get(),
                                   D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
                                   D2D1::Matrix3x2F::Identity(), 1.0f,
-                                  nullptr, D2D1_LAYER_OPTIONS_NONE),
+                                  nullptr,
+                                  D2D1_LAYER_OPTIONS_INITIALIZE_FOR_CLEARTYPE),
             layer.Get());
     }
 }

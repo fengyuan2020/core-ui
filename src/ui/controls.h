@@ -42,6 +42,15 @@ public:
     void SetWrap(bool w) { wrap_ = w; }
     void SetMaxLines(int n) { maxLines_ = n; }
 
+    /* CSS line-height (build 92+):
+     *   unitless 倍数 (推荐, 跟 font-size 联动): SetLineHeightRatio(1.3f)
+     *   显式像素值:                              SetLineHeightPx(17.0f)
+     * 都 0 时走默认 1.3 × font-size (跟现代浏览器 / Win11 Fluent UI 一致).
+     * 历史默认 fontSize_ + 10.0f 在密集列表 / 表格里偏松, 是 lib 早期为
+     * badge / pill / chip 留 breathing 的硬编码副作用. */
+    void SetLineHeightRatio(float r) { lineHeightRatio_ = r; }
+    void SetLineHeightPx(float px)   { lineHeightPx_ = px; }
+
     // Dynamic text color (for theme-aware colors)
     void SetTextColorFn(std::function<D2D1_COLOR_F()> fn) { textColorFn_ = std::move(fn); customColor_ = true; }
 
@@ -67,6 +76,8 @@ private:
     bool bold_ = false;
     bool wrap_ = false;
     int maxLines_ = 0;  /* 0 = 不限制 */
+    float lineHeightRatio_ = 0.0f;  /* CSS line-height unitless (1.3 = 1.3×fontSize) */
+    float lineHeightPx_    = 0.0f;  /* CSS line-height px ("17px") */
     bool customColor_ = false;
     D2D1_COLOR_F color_ = {};
     std::function<D2D1_COLOR_F()> textColorFn_;
@@ -970,6 +981,11 @@ public:
     void SetIconColor(const D2D1_COLOR_F& c) { iconColor_ = c; customColor_ = true; }
     void SetIconPadding(float p) { iconPad_ = p; }
     void SetCornerRadius(float r) { cornerRadius_ = r; }
+    /* ghost 模式 hover/press bg 视觉开关. 默认 true (标准按钮反馈).
+     * false: ghost 下永远只画 icon, 没 hover/press bg —— 用于 titlebar
+     * 装饰按钮 / 状态指示器等"不希望按钮凸出"的场景. */
+    void SetHoverVisual(bool on) { hoverVisual_ = on; }
+    bool HoverVisual() const     { return hoverVisual_; }
 
     void OnDraw(Renderer& r) override;
     bool OnMouseMove(const MouseEvent& e) override;
@@ -986,6 +1002,7 @@ private:
     float iconPad_ = 6.0f;
     float cornerRadius_ = 4.0f;
     bool iconParsed_ = false;
+    bool hoverVisual_ = true;
 };
 
 // ---- TitleBar (borderless window title bar with caption buttons) ----

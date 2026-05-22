@@ -29,10 +29,35 @@ cfg.icon_pixels = rgba;    // RGBA 像素数据（32bpp），NULL=默认图标
 cfg.icon_width  = 32;
 cfg.icon_height = 32;
 
+cfg.owner       = parent;  // 1.6.0: 子窗口附属主窗 (任务栏不独立 / 跟随 minimize)
+cfg.start_maximized = 1;   // 1.6.0: 首帧直接最大化 (无 normal→max 1 帧闪)
+
 UiWindow win = ui_window_create(&cfg);
 ui_window_set_root(win, root);
 ui_window_show(win);
 ```
+
+### 首帧零闪烁路径（自 1.6.0 build 99）
+
+`ui_page_prepare_window` 在 `ui_page_open_window` **之前**预创建隐藏窗口 + Direct2D
+RT，等内容准备好再一次性显示：
+
+```c
+UiPage page = ui_page_load_file(L"app.uix");
+
+/* 1) 准备隐藏窗口 (HWND 创建 + RT 预热, 不显示) */
+ui_page_prepare_window(page, NULL);
+
+/* 2) 后台加载耗时资源（解码大图、加载语言包等） */
+load_heavy_data();
+
+/* 3) 一次性显示 (走 ShowImmediate / Show, 首帧已是终态画面) */
+UiWindow win = ui_page_open_window(page, NULL);
+```
+
+配合 `cfg.start_maximized = 1`（自 1.6.0 build 105）实现持久化"最大化关 → 最大化
+开"零闪：之前要靠 caller 在 Show 后调 `ShowWindow(SW_MAXIMIZE)`，会跟 lib
+`SW_HIDE` + layered fade-in 时序撞出 1 帧 normal flash。
 
 | 函数 | 说明 |
 |------|------|
@@ -216,6 +241,33 @@ void on_select(UiWidget w, int index, void* ud) { }
 ui_combobox_on_changed(combo, on_select, data);
 ```
 
+### Widget 级事件回调（自 1.6.0 builds 57-66）
+
+任意 widget（含自绘 `<custom>`）都能挂的通用事件回调。之前只有 button / input
+这种预制控件有 onclick，其它 widget 拿不到鼠标 / 焦点事件——1.6.0 全面开放：
+
+```c
+/* 鼠标位置 / 滚轮 / 离开 (widget-local 坐标) */
+ui_widget_on_mouse_move (w, on_move,  ud);   // void cb(UiWidget, float x, float y, void*)
+ui_widget_on_mouse_leave(w, on_leave, ud);   // void cb(UiWidget, void*)
+ui_widget_on_mouse_wheel(w, on_wheel, ud);   // void cb(UiWidget, float delta, void*)
+
+/* 焦点 (配合 ui_custom_set_focusable 让自绘 widget 进键盘焦点系统) */
+ui_custom_set_focusable(custom, 1);
+ui_widget_on_focus(w, on_focus, ud);         // void cb(UiWidget, void*)
+ui_widget_on_blur (w, on_blur,  ud);
+
+/* 程序化光标 */
+ui_widget_set_cursor(w, "hand");             // hand / wait / size-ns / size-we / IDC_*
+```
+
+`ui_icon_button` 也加了 ghost hover 视觉开关（自 build 57）：
+
+```c
+UiWidget btn = ui_icon_button(svg_str, /*ghost*/ 1);
+ui_icon_button_set_hover_visual(btn, 0);     // 关闭 hover 高亮
+```
+
 ## 主题
 
 ```c
@@ -315,6 +367,33 @@ ui_window_invoke_sync(win, my_fn, userdata);
 
 共 60+ 个 `ui_debug_*` 函数。demo 还内置了 `\\.\pipe\ui_core_debug` 命名管道，
 用 PowerShell / Python 一行就能驱动，参考 `scripts/debug-smoke.ps1`。
+
+### 每窗口独立调试管道（自 1.6.0 build 63）
+
+`ui_debug_server_start` 现在支持每窗口独立 pipe，多 server 并存——主窗 + 设置窗
+可以同时跑各自的调试 server，互不抢占：
+
+```c
+ui_debug_server_start(main_win,     L"my_app_main_debug");
+ui_debug_server_start(settings_win, L"my_app_settings_debug");
+/* 传 NULL 用默认 \\.\pipe\ui_core_debug (多应用共用, 跨进程会撞, 不推荐) */
+```
+
+### Toast 动画风格（自 1.6.0 build 106）
+
+```c
+enum {
+    UI_TOAST_ANIM_SLIDE = 0,   /* 默认: top/bottom 滑入, center 直现, 退出淡出 */
+    UI_TOAST_ANIM_FADE  = 1,   /* 纯渐入渐出: alpha 0→1→1→0, y 全程钉在目标位置 */
+};
+
+ui_toast    (win, L"Saved", 2000);                                  /* 3 参不变 */
+ui_toast_ex (win, L"Done",  2000, /*pos*/1, /*icon*/0,
+             UI_TOAST_ANIM_FADE);                                   /* 适合 center toast */
+```
+
+**BREAKING (自 build 106)**：旧 `ui_toast_at` 删除，旧 `ui_toast_ex` 加 `anim` 参数。
+caller 旧调用末位补 `UI_TOAST_ANIM_SLIDE` 即可。
 
 ## .uix 页面 i18n（自 1.4.0 build 20）
 
@@ -486,6 +565,13 @@ void on_wheel(UiWindow win, float wheel_x, float wheel_y, float delta) {
 | `ui_window_set_min_size(win, w, h)` | 覆盖主题默认最小尺寸（480×360） |
 | `ui_window_set_background_mode(win, 1)` | 透明 Clear，避免扩窗口时背景闪 |
 | `ui_widget_set_drag_window(w, 1)` | 命中即拖窗 |
-| `ui_window_set_rect(win, x, y, w, h)` | 原子 SetWindowPos + 同步重绘 |
+| `ui_window_set_rect(win, x, y, w, h)` | 原子 SetWindowPos + 同步重绘（x/y = screen px, w/h = DIP） |
+| `ui_window_set_position(win, x, y)` | 只移动，不改尺寸（x/y = screen px） |
 | `ui_window_resize_with_anchor(...)` | 滚轮缩放时光标锚点不动 |
-| `ui_window_get_rect_screen(win, ...)` | 读窗口几何 |
+| `ui_window_get_rect_screen(win, ...)` | 读窗口几何（x/y = screen px, w/h = DIP）。build 94+ L23 跟 setter 统一 |
+| `ui_window_dpi(win)` | 当前窗口 DPI (96/120/144/...)。配合 `MulDiv` 做 screen px ↔ DIP 转换 |
+| `ui_window_dpi_scale(win)` | 1.6.0 build 101 加。返 `dpi / 96.0f`，DIP ↔ screen px 浮点转换更直观 |
+
+**BREAKING (1.6.0 build 94)**：窗口几何 API x/y 全统一成 screen px（之前 setter
+是 screen px, getter 返 DIP 不对称）。旧版本对一对 DIP/screen 没意识到的 caller
+升级 1.6.0 后位置会偏，按上面 dpi_scale 帮助函数转换一次即可。

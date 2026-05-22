@@ -83,30 +83,29 @@ struct CompiledMenu;
 using CompiledMenuPtr = std::shared_ptr<CompiledMenu>;
 
 struct CompiledMenuItem {
+    /* BREAKING (build 75 / L17 follow-up): menuitem 重设计成 widget slot —
+     * 老的 text / shortcut(文本字段) / iconSvg / imgSrc / hasColor / color_* /
+     * boundText / boundIcon / boundStyle 全删. <menuitem> body 内任何 widget
+     * 子节点 (svg / label / div / button / ...) 都按普通 widget 编译, 走
+     * 完整 reactive binding 路径. 给视觉自由度 + 反应式正交性 + 砍掉所有
+     * "static / bound 双路径" heuristic. */
     int          itemId = 0;            // 数字 id, ContextMenu callback 用来识别
-    std::string  text;                  // 显示文本（已 i18n desugar 之后的字面量）
-    std::string  shortcut;              // 快捷键文本, 例如 "Ctrl+S" (仅显示)
-    std::string  onClick;               // 触发时调用的 PageState method 名
-    bool         separator = false;     // true → 这是 <separator/>, 其他字段忽略
-    /* Phase A: 嵌套 <menu text="..."> 作为 submenu. submenu 非空时,
-       当前 item 渲染成 "Recent ▸" 样式, hover/click 弹出 submenu. */
-    CompiledMenuPtr submenu;
-    /* Phase B: <menuitem>...<svg>...</svg>Save</menuitem> — 内联 SVG 当 icon.
-       字符串形式（包含 `<svg ...>...</svg>` 整段），运行时 ParseSvgIcon. 已有
-       Renderer::DrawSvgIcon 路径会按 menu 文字色/per-item override 着色, 所以
-       SVG 内的 fill 通常用 currentColor. 跟 phase C 的 imgSrc 互斥（同时给的
-       话 imgSrc 优先, svg 忽略）. */
-    std::string  iconSvg;
-    /* Phase C: <menuitem icon="logo.png"> 或 <menuitem><img src="logo.png"/>...</menuitem>.
-       imgSrc 是 ui::asset 的 key (跟 <img src> 同一个解析器 chain). 运行时
-       Resolve → bytes → Renderer::LoadImageFromBytes → ID2D1Bitmap → menu item.
-       光栅图不跟随主题色 (跟 SVG 不同), 所以 dark mode 用 PNG 要自己换图源. */
-    std::string  imgSrc;
-    /* Phase D: <menuitem style="color: #d63a26"> per-item 颜色覆盖. ContextMenu
-       渲染会用它代替默认 textColor; SVG icon 也跟着变色 (DrawSvgIcon 接 color
-       参数). PNG icon 不变色. hasColor=false 时走默认主题色. */
-    bool         hasColor = false;
-    float        color_r = 0, color_g = 0, color_b = 0, color_a = 1;
+    std::string  shortcut;              // 静态 shortcut 显示文本 (例 "Ctrl+S")
+    std::string  onClick;               // 触发时调用的 JS method 名
+    bool         separator = false;     // true → <separator/>
+    CompiledMenuPtr submenu;            // 嵌套 submenu (parent item 旁边有 ▸ arrow)
+    /* Body 子节点 (AST) — 反应式 widget 模板. PopulateMenuItem 在每次 Show
+     * 时用 CompileIterationTemplate 实例化一棵新 widget tree, 装到 MenuItem.
+     * 多次 Show 之间 widget tree 全部重建 (跟 v-for 同款 pattern). 没有
+     * children → contentRoot 为空 (空 menuitem, 只占位 + ID 派发). */
+    ui::uix::NodePtr contentRoot;
+    /* 反应式 attrs — 跟 widget 系 :x / v-if / v-for 同套 expr 求值. */
+    std::string  boundShortcutExpr; // :shortcut="..." — 求 string
+    std::string  boundEnabledExpr;  // :enabled="..." — 求 bool, false → disabled
+    std::string  vIfExpr;           // v-if / v-show
+    std::string  vForArrayExpr;     // v-for="x in items"
+    std::string  vForIterVar;
+    std::string  vForIndexVar;
 };
 
 struct CompiledMenu {
@@ -114,6 +113,9 @@ struct CompiledMenu {
     std::string  triggerSelector;       // "#btnId" → 该元素 click/rclick 自动 show menu
     std::string  triggerEvent;          // "click" (默认) | "rclick"
     std::vector<CompiledMenuItem> items;
+    /* Phase E (L17 / build 73): 整个 menu / submenu 的 v-if / v-show. 求 false
+     * 时 PopulateMenu 整体 skip 不 build items, ShowMenu 触发也是空菜单. */
+    std::string  vIfExpr;
 };
 
 struct CompiledPage {

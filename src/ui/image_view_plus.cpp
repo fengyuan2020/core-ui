@@ -179,8 +179,10 @@ void ImageViewPlusWidget::DrawCheckerboard(Renderer& r, const D2D1_RECT_F& area)
 // ========= OnDraw 主流程 =========
 
 void ImageViewPlusWidget::OnDraw(Renderer& r) {
-    r.FillRect(rect, theme::kContentBg());
-
+    // L18: letterbox 完全透明 —— 应用层用父容器 CSS background 装饰
+    // (跟 button/label/svg 等其他 widget 设计哲学一致：只画自己的内容，
+    // 不画自己的"留白")。set_checkerboard 退化为"只在图区+图带 alpha 时
+    // 画棋盘"，给 PNG 透明像素位置一个对比背景。
     if (loading_) {
         float cx = (rect.left + rect.right) / 2;
         float cy = (rect.top + rect.bottom) / 2;
@@ -197,7 +199,7 @@ void ImageViewPlusWidget::OnDraw(Renderer& r) {
 
     D2D1_RECT_F dest = ComputeDestRect();
 
-    // 棋盘仅在内容含透明通道时画（矢量/GIF/PNG 常带透明）
+    // 棋盘只在图区 (dest) + 图带 alpha 时画 —— letterbox 区跳过，保持透明。
     auto caps = source_->Caps();
     if (checkerboard_ && caps.alpha) DrawCheckerboard(r, dest);
 
@@ -228,6 +230,15 @@ bool ImageViewPlusWidget::OnMouseDown(const MouseEvent& e) {
             cropDragOrigW_ = cropW_; cropDragOrigH_ = cropH_;
             return true;
         }
+    }
+
+    // L16: pan 只在图实际显示矩形内响应；letterbox 区按下不启动拖动 ——
+    // 跟标准看图软件 (Photos / IrfanView) 行为一致。crop mode 已经在
+    // 上面的 hit-test 处理过了，走到这里说明非 crop。
+    D2D1_RECT_F dest = ComputeDestRect();
+    if (e.x < dest.left || e.x >= dest.right ||
+        e.y < dest.top  || e.y >= dest.bottom) {
+        return false;
     }
 
     ConstrainPan();
@@ -281,26 +292,34 @@ bool ImageViewPlusWidget::OnMouseUp(const MouseEvent&) {
     return true;
 }
 
-bool ImageViewPlusWidget::OnMouseWheel(const MouseEvent& e) {
-    if (!Contains(e.x, e.y) || !source_) return false;
+void ImageViewPlusWidget::SetZoomAround(float z, float anchorX, float anchorY) {
+    if (!source_) return;
     float oldZoom = zoom_;
-    float factor = (e.delta > 0) ? 1.15f : (1.0f / 1.15f);
-    float newZoom = std::clamp(zoom_ * factor, minZoom_, maxZoom_);
-    if ((oldZoom < 1.0f && newZoom > 1.0f) || (oldZoom > 1.0f && newZoom < 1.0f))
-        newZoom = 1.0f;
+    float newZoom = std::clamp(z, minZoom_, maxZoom_);
+    if (newZoom == oldZoom) return;
     zoom_ = newZoom;
 
-    // 鼠标位置为中心缩放
+    // 锚点是 widget 像素坐标（rect 已减出去）。imgC 是该锚点在 image 空
+    // 间的像素位置，zoom 前后保持不变 → 反推新的 panX/panY 让锚点像素
+    // 落在原 widget 位置。
     float areaW = rect.right - rect.left;
     float areaH = rect.bottom - rect.top;
-    float mx = e.x - rect.left;
-    float my = e.y - rect.top;
-    float imgCx = (mx - areaW / 2.0f - panX_) / oldZoom;
-    float imgCy = (my - areaH / 2.0f - panY_) / oldZoom;
-    panX_ = mx - areaW / 2.0f - imgCx * zoom_;
-    panY_ = my - areaH / 2.0f - imgCy * zoom_;
+    float imgCx = (anchorX - areaW / 2.0f - panX_) / oldZoom;
+    float imgCy = (anchorY - areaH / 2.0f - panY_) / oldZoom;
+    panX_ = anchorX - areaW / 2.0f - imgCx * zoom_;
+    panY_ = anchorY - areaH / 2.0f - imgCy * zoom_;
 
     NotifyViewport();
+}
+
+bool ImageViewPlusWidget::OnMouseWheel(const MouseEvent& e) {
+    if (!Contains(e.x, e.y) || !source_) return false;
+    float factor = (e.delta > 0) ? 1.15f : (1.0f / 1.15f);
+    float newZoom = std::clamp(zoom_ * factor, minZoom_, maxZoom_);
+    // 跨过 1.0 时 snap 到 1.0，给"刚好原始尺寸"一个 tick stop
+    if ((zoom_ < 1.0f && newZoom > 1.0f) || (zoom_ > 1.0f && newZoom < 1.0f))
+        newZoom = 1.0f;
+    SetZoomAround(newZoom, e.x - rect.left, e.y - rect.top);
     return true;
 }
 

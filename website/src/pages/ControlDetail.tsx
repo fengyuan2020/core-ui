@@ -106,7 +106,7 @@ function getRelatedApiFunctions(controlName: string) {
     "IconButton": ["ui_icon_button", "ui_icon_button_set_svg", "ui_icon_button_set_ghost", "ui_icon_button_set_icon_color", "ui_icon_button_set_icon_padding"],
     "TitleBar": ["ui_titlebar", "ui_titlebar_set_title", "ui_titlebar_show_buttons", "ui_titlebar_show_icon", "ui_titlebar_set_bg_color", "ui_titlebar_add_widget"],
     "Dialog": ["ui_dialog", "ui_dialog_show", "ui_dialog_hide", "ui_dialog_set_ok_text", "ui_dialog_set_cancel_text", "ui_dialog_set_show_cancel"],
-    "Toast": ["ui_toast", "ui_toast_at", "ui_toast_ex"],
+    "Toast": ["ui_toast", "ui_toast_ex"],
     "ContextMenu": ["ui_menu_create", "ui_menu_destroy", "ui_menu_add_item", "ui_menu_add_item_ex", "ui_menu_add_separator", "ui_menu_add_submenu", "ui_menu_set_enabled", "ui_menu_show", "ui_menu_close"],
     "Separator": ["ui_separator", "ui_vseparator"],
   };
@@ -443,14 +443,17 @@ ui_dialog_show(dlg, win, L"Delete?",
     on_confirm, NULL);` },
     ],
     "Toast": [
-      { lang: "C", code: `// Bottom center, auto-fade
+      { lang: "C", code: `// Top + slide-in/out, auto-dismiss
 ui_toast(win, L"Saved!", 2000);
 
-// Position: 0=top 1=center 2=bottom
-ui_toast_at(win, L"Notice", 3000, 0);
+// Full form: position (0=top 1=center 2=bottom),
+// icon (0=none 1=success 2=error 3=warning),
+// anim (UI_TOAST_ANIM_SLIDE=0 | UI_TOAST_ANIM_FADE=1)
+ui_toast_ex(win, L"Notice", 3000, 0, 0, UI_TOAST_ANIM_SLIDE);
+ui_toast_ex(win, L"Error occurred", 3000, 0, 2, UI_TOAST_ANIM_SLIDE);
 
-// With icon: 0=none 1=success 2=error 3=warning
-ui_toast_ex(win, L"Error occurred", 3000, 0, 2);` },
+// Fade-only: pure alpha transition, position locked
+ui_toast_ex(win, L"Copied", 1500, 1, 0, UI_TOAST_ANIM_FADE);` },
     ],
     "ContextMenu": [
       { lang: ".uix", code: `<!-- Declarative menu — trigger="#elem" auto-attaches click/rclick. -->

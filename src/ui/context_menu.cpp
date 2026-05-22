@@ -31,45 +31,15 @@ namespace ui {
 bool ContextMenu::popupClassRegistered_ = false;
 bool ContextMenu::g_debugSuppressAutoClose = false;
 
-// ---- Build ----
+// ---- Build (build 75 BREAKING: widget-tree based items) ----
 
-void ContextMenu::AddItem(int id, const std::wstring& text) {
+void ContextMenu::AddItemContent(int id, const std::wstring& shortcut,
+                                  WidgetPtr content) {
     MenuItem item;
     item.id = id;
-    item.text = text;
-    items_.push_back(std::move(item));
-}
-
-void ContextMenu::AddItemEx(int id, const std::wstring& text,
-                             const std::wstring& shortcut, const std::string& svg,
-                             Renderer* r) {
-    MenuItem item;
-    item.id = id;
-    item.text = text;
     item.shortcut = shortcut;
-    if (!svg.empty() && r) {
-        item.icon = r->ParseSvgIcon(svg);
-        item.hasIcon = item.icon.valid;
-    }
+    item.customContent = std::move(content);
     items_.push_back(std::move(item));
-}
-
-void ContextMenu::AddItemBitmap(int id, const std::wstring& text,
-                                 const std::wstring& shortcut,
-                                 ComPtr<ID2D1Bitmap> bitmap) {
-    MenuItem item;
-    item.id = id;
-    item.text = text;
-    item.shortcut = shortcut;
-    item.bitmap = std::move(bitmap);
-    item.hasIcon = (item.bitmap != nullptr);
-    items_.push_back(std::move(item));
-}
-
-void ContextMenu::SetLastItemColor(const D2D1_COLOR_F& color) {
-    if (items_.empty()) return;
-    items_.back().hasColor = true;
-    items_.back().overrideColor = color;
 }
 
 void ContextMenu::AddSeparator() {
@@ -78,11 +48,11 @@ void ContextMenu::AddSeparator() {
     items_.push_back(std::move(item));
 }
 
-void ContextMenu::AddSubmenu(const std::wstring& text, ContextMenuPtr submenu) {
+void ContextMenu::AddSubmenu(WidgetPtr entryContent, ContextMenuPtr submenu) {
     MenuItem item;
-    item.text = text;
-    item.submenu = std::move(submenu);
     item.id = -1;
+    item.customContent = std::move(entryContent);
+    item.submenu = std::move(submenu);
     items_.push_back(std::move(item));
 }
 
@@ -92,9 +62,62 @@ void ContextMenu::SetEnabled(int id, bool enabled) {
     }
 }
 
+// ---- Reactive rebuild (build 73 / L17) ----
+
+ContextMenu* ContextMenu::OpenSubmenuAt(int index) {
+    /* Build 85: mimic HandleMouseMove submenu-open path. 调试 / 测试用,
+     * 没真鼠标 hover 时也能打开 submenu (拍截图验证). */
+    if (index < 0 || index >= (int)items_.size()) return nullptr;
+    auto& item = items_[index];
+    if (item.isSeparator || !item.submenu) return nullptr;
+
+    // Close previously open submenu (跟实际 hover 逻辑一致)
+    if (openSubmenuIndex_ >= 0 && openSubmenuIndex_ < (int)items_.size()) {
+        auto& prevSub = items_[openSubmenuIndex_].submenu;
+        if (prevSub) prevSub->Close();
+    }
+    openSubmenuIndex_ = index;
+    auto& sub = item.submenu;
+    sub->parentMenu_ = this;
+    if (popupHwnd_) {
+        RECT rc;
+        GetWindowRect(popupHwnd_, &rc);
+        D2D1_RECT_F ir = ItemRect(index);
+        UINT subDpi = GetDpiForWindow(popupHwnd_);
+        float subScale = (float)subDpi / 96.0f;
+        int marginPx = (int)(kShadowMargin * subScale);
+        /* Build 86+: 减 kSubmenuOverlap 让 submenu 往左挪, 跟 parent 右边重叠. */
+        int overlapPx = (int)(kSubmenuOverlap * subScale);
+        int subX = rc.right - marginPx - overlapPx;
+        int subY = rc.top + (int)(ir.top * subScale);
+        sub->ShowPopup(parentHwnd_ ? parentHwnd_ : popupHwnd_, subX, subY);
+    } else {
+        D2D1_RECT_F ir = ItemRect(index);
+        D2D1_RECT_F vp = Bounds();
+        vp.right += 400; vp.bottom += 400;
+        sub->Show(ir.right - 4, ir.top, vp);
+    }
+    return sub.get();
+}
+
+void ContextMenu::Clear() {
+    /* 反应式 rebuild 入口: 把 items_ 全清掉, 让 PopulateMenu 重新喂.
+     * submenu shared_ptr 在这一刻 release; 如果用户正打开 submenu, 那条
+     * pointer 会变 dangling — 但 reactive 重 build 只发生在 Show 入口,
+     * 那时 Close 已经把 openSubmenuIndex_ 重置. 安全. */
+    items_.clear();
+    hoveredIndex_ = -1;
+    openSubmenuIndex_ = -1;
+    clickedId_ = -1;
+}
+
 // ---- Show / Hide ----
 
 void ContextMenu::Show(float x, float y, const D2D1_RECT_F& viewport) {
+    /* Build 73 (L17): reactive .uix 菜单先 rebuild items 再算宽高. 老的
+     * imperative 路径没设 hook, items 早就建好, no-op. */
+    if (beforeShowHook_) beforeShowHook_();
+
     float w = MenuWidth();
     float h = MenuHeight();
     if (x + w > viewport.right) x = viewport.right - w;
@@ -109,6 +132,10 @@ void ContextMenu::Show(float x, float y, const D2D1_RECT_F& viewport) {
 }
 
 void ContextMenu::ShowPopup(HWND parentHwnd, int screenX, int screenY) {
+    /* 同 Show: 先 reactive rebuild, 再走原 popup 路径 (clamp/sizing 才能拿
+     * 到最新 items 的宽高). */
+    if (beforeShowHook_) beforeShowHook_();
+
     parentHwnd_ = parentHwnd;
 
     // Get DPI scale from parent window
@@ -150,6 +177,11 @@ void ContextMenu::Close() {
     }
     openSubmenuIndex_ = -1;
     DestroyPopupWindow();
+    /* Build 88+: debug flag 自动恢复 — `ui_debug_set_menu_autoclose(0)` 是
+     * 调试用一次性 helper, 不该跨菜单 session 持续生效. 否则脚本测一次后
+     * GuoheView 用户右键所有菜单都不会自动关, 调试痕迹污染业务. 每次菜单
+     * 关闭重置, caller 想下一个菜单也抑制就再调一次. */
+    g_debugSuppressAutoClose = false;
 }
 
 // ---- Debug / simulation accessors ----
@@ -398,6 +430,16 @@ LRESULT CALLBACK ContextMenu::PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
         }
         return 0;
     case WM_ERASEBKGND: return 1;
+    case WM_ACTIVATEAPP:
+        /* Build 86+: app 失去激活立即关菜单, 不等 WM_TIMER 50ms 轮询.
+         * wParam=FALSE 表示 app 进入非激活态 (用户切到其它软件). 这条
+         * 跟 timer Check 2 互补 — timer 有 50ms 延迟, 这里立即响应. */
+        if (!wParam && !g_debugSuppressAutoClose) {
+            KillTimer(hwnd, 1);
+            self->Close();
+            return 0;
+        }
+        break;
     case WM_TIMER:
         // Poll: if mouse is pressed outside menu, close it
         if (wParam == 1) {
@@ -405,27 +447,33 @@ LRESULT CALLBACK ContextMenu::PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
             if (GetAsyncKeyState(VK_LBUTTON) & 0x8000) {
                 POINT pt;
                 GetCursorPos(&pt);
-                RECT rc;
-                GetWindowRect(hwnd, &rc);
+                /* Build 86+: 用 "可见菜单矩形" 而不是 popup hwnd 整框 ——
+                 * hwnd 比可见 menu 大 kShadowMargin (18 DIP / each side) 一圈,
+                 * 用整框做命中导致 click 在阴影带 (visual 外) 不关菜单. 算
+                 * 可见 rect: hwnd.topLeft + kShadowMargin × dpiScale. */
+                auto visibleRect = [](HWND h) -> RECT {
+                    RECT rc; GetWindowRect(h, &rc);
+                    UINT dpi = GetDpiForWindow(h);
+                    float scale = (float)dpi / 96.0f;
+                    int marginPx = (int)(kShadowMargin * scale);
+                    return RECT{rc.left + marginPx, rc.top + marginPx,
+                                 rc.right - marginPx, rc.bottom - marginPx};
+                };
+                RECT rc = visibleRect(hwnd);
                 if (pt.x < rc.left || pt.x >= rc.right || pt.y < rc.top || pt.y >= rc.bottom) {
-                    // 点击落点也要检查：是否在"自己的子菜单"内
                     bool inSubmenu = false;
                     if (self->openSubmenuIndex_ >= 0 && self->openSubmenuIndex_ < (int)self->items_.size()) {
                         auto& sub = self->items_[self->openSubmenuIndex_].submenu;
                         if (sub && sub->popupHwnd_) {
-                            RECT src;
-                            GetWindowRect(sub->popupHwnd_, &src);
+                            RECT src = visibleRect(sub->popupHwnd_);
                             if (pt.x >= src.left && pt.x < src.right && pt.y >= src.top && pt.y < src.bottom)
                                 inSubmenu = true;
                         }
                     }
-                    // 或在任一"祖先菜单 popup"内 —— 子菜单 timer 不能把"用户在
-                    // 父菜单里按下"当成外部点击，否则会引发子菜单关-开-关 闪烁。
                     bool inAncestor = false;
                     for (ContextMenu* p = self->parentMenu_; p && !inAncestor; p = p->parentMenu_) {
                         if (!p->popupHwnd_) continue;
-                        RECT pc;
-                        GetWindowRect(p->popupHwnd_, &pc);
+                        RECT pc = visibleRect(p->popupHwnd_);
                         if (pt.x >= pc.left && pt.x < pc.right && pt.y >= pc.top && pt.y < pc.bottom)
                             inAncestor = true;
                     }
@@ -465,28 +513,56 @@ LRESULT CALLBACK ContextMenu::PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
 // ---- Geometry ----
 
 bool ContextMenu::HasAnyIcon() const {
-    for (auto& item : items_) {
-        if (item.hasIcon) return true;
-    }
-    return false;
+    /* BREAKING (build 75): MenuItem 没有 hasIcon 字段了, icon 是 customContent
+     * widget tree 的一部分. 始终预留 icon 列宽度 — 不预留会让用户写
+     * <menuitem><svg/><label/></menuitem> 时 svg 紧贴左边. */
+    return !items_.empty();
 }
 
 float ContextMenu::MenuWidth() const {
-    float maxText = 0;
+    /* BREAKING (build 75): 老的 text/shortcut 文字宽度估算改成: 用 customContent
+     * widget tree 的 SizeHint() 取 max. customContent 还没 DoLayout 过, SizeHint
+     * 在大多数 widget 上返 (fixedW, fixedH) 或 (0,0), 估算可能不准. 兜底走
+     * kMinWidth = 200. 后续如要更准, 应在 PopulateMenuItem 末尾对每个 customContent
+     * 做一遍 measure pass 写 fixedW. */
+    float maxContent  = 0;
     float maxShortcut = 0;
-    bool hasSubmenu = false;
+    bool  hasSubmenu  = false;
     for (auto& item : items_) {
         if (item.isSeparator) continue;
-        float tw = item.text.length() * 7.5f;
-        if (tw > maxText) maxText = tw;
+        if (item.customContent) {
+            auto h = item.customContent->SizeHint();
+            float w = h.width;
+            /* HBox/VBox SizeHint 不自己 clamp 到 maxW (那是 Layout 期的事),
+             * MenuWidth 这里手动 cap — 让 .uix CSS 写 `.menuitem-row {
+             * max-width: 240px }` 真正约束菜单宽度. minW 同样 honor. */
+            if (item.customContent->maxW > 0 && w > item.customContent->maxW) {
+                w = item.customContent->maxW;
+            }
+            if (item.customContent->minW > 0 && w < item.customContent->minW) {
+                w = item.customContent->minW;
+            }
+            if (w > maxContent) maxContent = w;
+        }
         float sw = item.shortcut.length() * 6.5f;
         if (sw > maxShortcut) maxShortcut = sw;
         if (item.submenu) hasSubmenu = true;
     }
-    float iconCol = HasAnyIcon() ? kIconColWidth : 12.0f;
-    float shortcutCol = maxShortcut > 0 ? maxShortcut + 24.0f : 0;
-    float arrowCol = hasSubmenu ? kSubmenuArrowWidth : 0;
-    float w = iconCol + maxText + shortcutCol + arrowCol + kPadding * 2 + 16.0f;
+    /* Build 77+/80+/81+: 反应式菜单 v-if 在不同 state 隐不同 items, 让
+     * visible items 的 max content / shortcut / hasSubmenu 都跟着变 → 两
+     * 态自然宽度差. PageState 计算 "全 items (含 v-if=false 的)" 喂三个
+     * reserved 字段, 这里 floor 住保证两态宽度完全一致. */
+    if (reservedShortcutWidth_ > maxShortcut) maxShortcut = reservedShortcutWidth_;
+    if (reservedHasSubmenu_) hasSubmenu = true;
+    if (reservedContentWidth_ > maxContent) maxContent = reservedContentWidth_;
+    /* shortcut 跟 content 之间的呼吸: 16 DIP. */
+    float shortcutCol = maxShortcut > 0 ? maxShortcut + 16.0f : 0;
+    float arrowCol    = hasSubmenu ? kSubmenuArrowWidth : 0;
+    float w = maxContent + shortcutCol + arrowCol + kPadding * 2;
+    /* Build 85+: 跨菜单树共享宽度 — submenu 撑到 parent 的 MenuWidth, 整族
+     * 菜单视觉一致. minPropagatedWidth_ 由 PageState 在 PopulateMenu 末尾
+     * 算整树最大 MenuWidth 后回写到每个 ContextMenu. */
+    if (minPropagatedWidth_ > w) w = minPropagatedWidth_;
     return std::max(w, kMinWidth);
 }
 
@@ -534,8 +610,6 @@ void ContextMenu::Draw(Renderer& r) {
 
     float w = MenuWidth();
     float h = MenuHeight();
-    bool hasIcon = HasAnyIcon();
-    float iconCol = hasIcon ? kIconColWidth : 12.0f;
 
     // Soft drop shadow — concentric semi-transparent rounded rects expand
     // outward in 1 px steps. Each ring is a slightly larger rounded rect
@@ -558,7 +632,7 @@ void ContextMenu::Draw(Renderer& r) {
             x_ + w + spread,
             y_ + h + spread + kShadowVerticalY,
         };
-        float rr = kCornerRadius + spread;
+        float rr = CornerRadius() + spread;
         r.FillRoundedRect(sr, rr, rr, sc);
     }
 
@@ -577,16 +651,20 @@ void ContextMenu::Draw(Renderer& r) {
     } else {
         cardBg = D2D1_COLOR_F{1.0f, 1.0f, 1.0f, 1.0f};
     }
-    r.FillRoundedRect(bgRect, kCornerRadius, kCornerRadius, cardBg);
+    {
+        const float cr = CornerRadius();
+        r.FillRoundedRect(bgRect, cr, cr, cardBg);
+    }
 
-    // Items
+    // BREAKING (build 75): items 走 widget-tree 渲染. 每个 menuitem 的
+    // customContent (WidgetPtr) 在 item 的 content-rect 内 DoLayout + DrawTree.
+    // ContextMenu 自己只画: separator / hover 高亮 / shortcut 文字 (右对齐) /
+    // submenu arrow. disabled 通过临时 set opacity dim.
     float iy = y_ + kPadding;
     for (int i = 0; i < (int)items_.size(); i++) {
         auto& item = items_[i];
 
         if (item.isSeparator) {
-            // Faint divider stretched edge-to-edge (kPadding inset only).
-            // Uses dividerSubtle so groups read as separated without a hard line.
             float sepY = iy + kSepHeight / 2.0f;
             r.DrawLine(x_ + kPadding, sepY, x_ + w - kPadding, sepY,
                        theme::kDividerSubtle());
@@ -594,10 +672,6 @@ void ContextMenu::Draw(Renderer& r) {
             continue;
         }
 
-        // Hover highlight — black/white tint over the card surface. Token
-        // sidebarItemHover is too pale on a pure-white card (it's grey[96]
-        // ≈ #f5f5f5, near-invisible against white), so we use a slightly
-        // stronger neutral overlay that reads on both white and dark cards.
         if (i == hoveredIndex_ && item.enabled) {
             D2D1_RECT_F hlRect = {x_ + kPadding, iy,
                                    x_ + w - kPadding, iy + kItemHeight};
@@ -607,35 +681,19 @@ void ContextMenu::Draw(Renderer& r) {
             r.FillRoundedRect(hlRect, 6.0f, 6.0f, hlColor);
         }
 
-        // Text color: per-item override > theme default
-        D2D1_COLOR_F textColor;
-        if (item.hasColor && item.enabled) {
-            textColor = item.overrideColor;
-        } else {
-            textColor = item.enabled ? theme::kBtnText()
-                                     : D2D1_COLOR_F{0.5f, 0.5f, 0.5f, 0.6f};
+        if (item.customContent) {
+            float contentLeft  = x_ + kPadding;
+            float contentRight = x_ + w - kPadding;
+            if (!item.shortcut.empty()) contentRight -= 100.0f;
+            if (item.submenu) contentRight -= kSubmenuArrowWidth;
+            item.customContent->rect = {contentLeft, iy, contentRight, iy + kItemHeight};
+            float savedOpacity = item.customContent->opacity;
+            if (!item.enabled) item.customContent->opacity = 0.4f;
+            item.customContent->DoLayout();
+            item.customContent->DrawTree(r);
+            item.customContent->opacity = savedOpacity;
         }
 
-        // Icon — 16px, fixed left inset.
-        if (item.hasIcon) {
-            constexpr float kIconSize = 16.0f;
-            constexpr float kIconLeftInset = 12.0f;
-            float iconX = x_ + kIconLeftInset;
-            float iconY = iy + (kItemHeight - kIconSize) / 2.0f;
-            D2D1_RECT_F iconRect = {iconX, iconY, iconX + kIconSize, iconY + kIconSize};
-            if (item.bitmap) {
-                r.RT()->DrawBitmap(item.bitmap.Get(), iconRect);
-            } else if (item.icon.valid) {
-                r.DrawSvgIcon(item.icon, iconRect, textColor);
-            }
-        }
-
-        // Text — 13 px (compact menu body size).
-        float textLeft = x_ + kPadding + iconCol;
-        D2D1_RECT_F textRect = {textLeft, iy, x_ + w - kPadding - 8, iy + kItemHeight};
-        r.DrawText(item.text, textRect, textColor, kFontSize);
-
-        // Shortcut — right-aligned, dimmed
         if (!item.shortcut.empty()) {
             D2D1_COLOR_F base = theme::kForeground3();
             D2D1_COLOR_F shortcutColor = {base.r, base.g, base.b, item.enabled ? 1.0f : 0.4f};
@@ -645,11 +703,15 @@ void ContextMenu::Draw(Renderer& r) {
                        DWRITE_TEXT_ALIGNMENT_TRAILING);
         }
 
-        // Submenu arrow
         if (item.submenu) {
+            D2D1_COLOR_F arrowColor = item.enabled
+                ? theme::kBtnText() : D2D1_COLOR_F{0.5f, 0.5f, 0.5f, 0.6f};
             D2D1_RECT_F arrowRect = {x_ + w - kPadding - 16, iy,
                                       x_ + w - kPadding - 2, iy + kItemHeight};
-            r.DrawText(L"\u25B8", arrowRect, textColor, theme::kFontSizeSmall,
+            /* Build 86: › "›" (single right-pointing angle quotation) —
+             * 跟 macOS / Win11 submenu arrow 同款 outline 风格. 比 ▸ ▸
+             * (黑色实心三角) 看着更克制. */
+            r.DrawText(L"›", arrowRect, arrowColor, theme::kFontSizeBody,
                        DWRITE_TEXT_ALIGNMENT_CENTER);
         }
 
@@ -704,10 +766,16 @@ bool ContextMenu::HandleMouseMove(float x, float y) {
                     RECT rc;
                     GetWindowRect(popupHwnd_, &rc);
                     D2D1_RECT_F ir = ItemRect(hit);
-                    // rc is in physical pixels, ir is in DIPs
-                    int subX = rc.right;  // right edge of parent menu
+                    // rc 是 hwnd 外圈, 含 kShadowMargin 的 drop-shadow padding.
+                    // 减掉 marginPx 拿"可见卡片"的右边作 submenu anchor — 否则
+                    // submenu 跟父菜单之间留 ~18px (高 DPI 更大) 透明空白 (L17).
                     UINT subDpi = GetDpiForWindow(popupHwnd_);
                     float subScale = (float)subDpi / 96.0f;
+                    int marginPx = (int)(kShadowMargin * subScale);
+                    /* Build 86+: 减 kSubmenuOverlap 让 submenu 往左挪, 跟
+                     * parent 右边重叠. 跟 OpenSubmenuAt 同款公式. */
+                    int overlapPx = (int)(kSubmenuOverlap * subScale);
+                    int subX = rc.right - marginPx - overlapPx;
                     int subY = rc.top + (int)(ir.top * subScale);
                     sub->ShowPopup(parentHwnd_ ? parentHwnd_ : popupHwnd_, subX, subY);
                 } else {

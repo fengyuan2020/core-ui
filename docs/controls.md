@@ -484,6 +484,41 @@ iv->onCropChanged = [](float x, float y, float w, float h) {
 - 支持锁定宽高比
 - 裁剪区域自动限制在图片范围内
 
+### 锚点缩放（`set_zoom_around`，build 49+）
+
+`ImageViewPlus`（`ui_image_view_plus_*` 系列）支持用指定的 widget 像素
+坐标作为锚点缩放 —— 锚点处的图像像素位置在 zoom 前后保持不变。
+
+```c
+/* C API：以 widget 像素坐标 (anchor_x, anchor_y) 为锚点缩放
+   到 new_zoom。anchor 处的图像像素在 zoom 前后保持不动。 */
+ui_image_view_plus_set_zoom_around(canvas, new_zoom, anchor_x, anchor_y);
+```
+
+典型用途：**reload 后保持鼠标锚点**。
+
+```c
+/* 1. 用户在画布右上角 wheel 放大 → 触发 viewport_changed callback。
+   2. 应用 reload (切高 pyramid level / 换图)，记录鼠标当前位置 (mx, my)
+      和目标 zoom。
+   3. reload 完后调 set_zoom_around 让鼠标下的图像位置不动： */
+void on_viewport_changed(UiWidget canvas, float zoom, float panX, float panY,
+                         void* user) {
+    if (zoom > kHighResThreshold) {
+        load_higher_pyramid_level(canvas);   /* 应用自己的 reload 逻辑 */
+
+        /* reload 后图重置到 fit；用户希望鼠标位置仍是同一图像点：*/
+        float mx, my;
+        get_mouse_relative_to_canvas(&mx, &my);
+        ui_image_view_plus_set_zoom_around(canvas, zoom, mx, my);
+    }
+}
+```
+
+该 API 内部用的算法跟原生 wheel 缩放完全一致。手动 `set_zoom + set_pan`
+组合在锚点不在 canvas center 时会有视觉跳跃，用 `set_zoom_around` 一行
+解决。
+
 ## Dialog（模态对话框）
 
 **窗口级 overlay，不进 widget 树**。`ui_dialog_show` 把 dialog 注册为窗口的
@@ -517,12 +552,15 @@ ui_dialog_set_theme_mode(dlg, 2);   // 2 = 强制 dark
 ## Toast（通知）
 
 ```c
-ui_toast(win, L"已保存", 2000);                    // 底部
-ui_toast_at(win, L"提示", 3000, 0);                // 0=顶, 1=中, 2=底
-ui_toast_ex(win, L"成功", 2000, 2, 1);             // 图标: 1=✓ 2=✕ 3=⚠
+ui_toast(win, L"已保存", 2000);                                    // 顶部 + slide + 无图标
+ui_toast_ex(win, L"提示", 3000, 0, 0, UI_TOAST_ANIM_SLIDE);        // 0=顶 1=中 2=底
+ui_toast_ex(win, L"成功", 2000, 2, 1, UI_TOAST_ANIM_SLIDE);        // 图标: 1=✓ 2=✕ 3=⚠
+ui_toast_ex(win, L"已复制", 1500, 1, 0, UI_TOAST_ANIM_FADE);       // 中央 + 纯渐入渐出
 ```
 
-滑入/滑出动画，自动消失。
+动画风格 `UI_TOAST_ANIM_SLIDE`(默认): top/bottom 滑入, center 直现, 退出淡出.
+`UI_TOAST_ANIM_FADE`: 不论位置全程渐入渐出, y 不动 — 适合不希望干扰用户视线
+的轻量提示 (例如复制成功、设置已应用), 或中央位置希望有进入动画的场景.
 
 ## ContextMenu（右键菜单）
 
@@ -565,6 +603,70 @@ ui_menu_destroy(menu);
 
 声明式 trigger 自动挂载，`onclick` 自动派发到 `<script>` methods，C 端零代码。
 完整参考见 [uix-guide.md §17](uix-guide.md#17-menu-完整参考自-build-22-27)。
+
+### 反应式菜单（自 1.6.0 build 73-89）
+
+1.6.0 把 `<menu>` 重构成全反应式 widget，对齐 Vue 3：menuitem 内容、enabled
+态、是否显示都跟 `data()` 状态绑定，rclick 弹出时直接读最新值，不需要手动
+"先关菜单 → 改 menu → 再弹"。
+
+```vue
+<script>
+export default {
+  data() {
+    return {
+      commands: [
+        { id: 'copy',  label: 'Copy',  enabled: true  },
+        { id: 'paste', label: 'Paste', enabled: false },
+      ],
+      isAdmin: true
+    };
+  },
+  methods: {
+    run(cmd) { /* ... */ },
+    del()    { /* ... */ }
+  }
+}
+</script>
+
+<template>
+  <div id="tree-item">…</div>
+
+  <menu trigger="#tree-item" event="rclick">
+    <menuitem v-for="cmd in commands" :key="cmd.id"
+              :disabled="!cmd.enabled" @click="run(cmd)">
+      <label>{{ cmd.label }}</label>
+    </menuitem>
+    <separator/>
+    <menuitem v-if="isAdmin" @click="del">
+      <label style="color: #d63a26">删除</label>
+    </menuitem>
+  </menu>
+</template>
+```
+
+**关键改动 (从 1.5.0 升级时需注意)：**
+
+- **`menuitem` 是 widget 模板** (BREAKING, build 75)：必须在内部包一个子 widget
+  (一般 `<label>`)，不能直接 `<menuitem>X</menuitem>`
+- **`WireMenus` 静态简化路径已删** (BREAKING, build 73)：menu 必须走 `<menu>`
+  声明式 + Vue 3 binding，不能再走 C 端 `WireMenus(...)`
+- **rclick dispatch 改 deepest-match** (build 107-108)：嵌套 `<menu trigger>` 时
+  子 widget 的 menu 不再被祖先抢走。下面的写法现在能正常工作——之前 minimap
+  右键会被 canvas_body 抢走：
+
+  ```vue
+  <div id="canvas_body">
+    <div id="minimap"></div>
+  </div>
+
+  <menu trigger="#canvas_body" event="rclick">…</menu>   <!-- 父 -->
+  <menu trigger="#minimap"     event="rclick">…</menu>   <!-- 子, 现在能弹 -->
+  ```
+
+- **submenu autoclose 用"可见矩形"判定** (build 87)：之前用 hwnd 整框，鼠标
+  滑到不可见区域 menu 会"卡住"不关
+- **submenu 箭头改 outline + 跟主菜单同宽** (build 78-86)
 
 ### 特性
 

@@ -2,6 +2,7 @@
 #include "ui_context.h"
 #include "controls.h"
 #include "image_view_plus.h"
+#include "gh_img_view.h"
 #include "theme.h"
 #include "animation.h"
 #include <windowsx.h>
@@ -77,6 +78,9 @@ constexpr UINT kToggleAnimIntervalMs = 16;
 constexpr UINT kWindowAnimIntervalMs = 16;
 constexpr UINT_PTR kToastFadeTimerId = 0xCA15;
 constexpr UINT kToastFadeIntervalMs = 16;
+/* Build 68+ (L18): toast phase 时长 (ms), time-based 推进的参数. */
+constexpr int kToastSlideInMs  = 200;
+constexpr int kToastSlideOutMs = 250;
 
 constexpr float kPopPeakScale = 1.02f;       // 关闭动画微弹峰值
 constexpr float kClosePeakPhase = 0.18f;
@@ -163,7 +167,7 @@ bool UiWindowImpl::RegisterWindowClass() {
 
 bool UiWindowImpl::Create(const wchar_t* title, int width, int height,
                            bool borderless, bool resizable, bool acceptFiles,
-                           int x, int y, bool toolWindow) {
+                           int x, int y, bool toolWindow, HWND ownerHwnd) {
     if (!RegisterWindowClass()) return false;
 
     borderless_ = borderless;
@@ -175,7 +179,9 @@ bool UiWindowImpl::Create(const wchar_t* title, int width, int height,
 
     DWORD exStyle = WS_EX_COMPOSITED | WS_EX_LAYERED;
     if (toolWindow) exStyle |= WS_EX_TOOLWINDOW;
-    else            exStyle |= WS_EX_APPWINDOW;
+    /* Build 65+ (L14): owner 窗不上 Alt+Tab / 不单独 taskbar 项. owned 顶级窗
+     * 用 WS_EX_APPWINDOW 跟 owner 语义冲突 (强制出现在 taskbar), 撤掉. */
+    else if (!ownerHwnd) exStyle |= WS_EX_APPWINDOW;
     if (acceptFiles) exStyle |= WS_EX_ACCEPTFILES;
 
     DWORD style;
@@ -187,7 +193,11 @@ bool UiWindowImpl::Create(const wchar_t* title, int width, int height,
         if (!resizable) style &= ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
     }
 
-    // Scale logical size to physical pixels using system DPI
+    // Width / height 是 DIP, 按系统 DPI scale 到 physical pixels.
+    // x / y 是 screen px (Win32 惯例, 跟 SetWindowRect / SetWindowPosition
+    // 一致, build 94+ L23). 持久化 DIP-stable 位置的应用用 ui_window_dpi()
+    // 拿 DPI 自己 MulDiv (老 build 把 DIP 隐藏在 getter / create 里, 跟
+    // setter 不自洽, L23 修).
     UINT sysDpi = 96;
     {
         HDC hdc = GetDC(nullptr);
@@ -198,8 +208,8 @@ bool UiWindowImpl::Create(const wchar_t* title, int width, int height,
 
     int winX, winY;
     if (x != CW_USEDEFAULT && y != CW_USEDEFAULT) {
-        winX = MulDiv(x, (int)sysDpi, 96);
-        winY = MulDiv(y, (int)sysDpi, 96);
+        winX = x;
+        winY = y;
     } else {
         int screenW = GetSystemMetrics(SM_CXSCREEN);
         int screenH = GetSystemMetrics(SM_CYSCREEN);
@@ -218,7 +228,7 @@ bool UiWindowImpl::Create(const wchar_t* title, int width, int height,
 
     hwnd_ = CreateWindowExW(exStyle, L"UiCore_Window", title_.c_str(), style,
                             winX, winY, physW, physH,
-                            nullptr, nullptr, GetModuleHandleW(nullptr), this);
+                            ownerHwnd, nullptr, GetModuleHandleW(nullptr), this);
     if (!hwnd_) return false;
 
     if (!skipOpenAnimation_) {
@@ -300,8 +310,12 @@ void UiWindowImpl::Show() {
 
     /* 外部可能先 ShowWindow(SW_MAXIMIZE) 了 —— 这里检测一次，
      * 如果已经是最大化，跳过 SetWindowPos 写死尺寸的路径 +
-     * 跳过 slide 动画（动画用 SW_SHOWNOACTIVATE 会把最大化态覆盖掉）。*/
-    bool preMaximized = IsZoomed(hwnd_) != 0;
+     * 跳过 slide 动画（动画用 SW_SHOWNOACTIVATE 会把最大化态覆盖掉）。
+     * Build 105+ (L25): UiWindowConfig.start_maximized 走同一分支, 让
+     * caller 持久化"最大化关→最大化开"不用自己 ShowWindow(SW_MAXIMIZE)
+     * 撞 lib 的 layered fade-in 时序. */
+    bool preMaximized = IsZoomed(hwnd_) != 0 || startMaximizedPending_;
+    startMaximizedPending_ = false;
 
     /* 从当前窗口位置同步 target（外部可能已通过 SetWindowPos 改了位置） */
     {
@@ -384,6 +398,11 @@ void UiWindowImpl::PrepareRT() {
 void UiWindowImpl::ShowImmediate() {
     if (!hwnd_) return;
 
+    /* Build 105+ (L25): start_maximized hint 走 SW_SHOWMAXIMIZED, 首帧
+     * 即最大化态. argv 启动 (文件关联) + 上次最大化关闭场景下用. */
+    bool startMax = startMaximizedPending_;
+    startMaximizedPending_ = false;
+
     SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 
@@ -395,8 +414,10 @@ void UiWindowImpl::ShowImmediate() {
     OnPaint();
     ValidateRect(hwnd_, nullptr);
 
-    /* SW_SHOWNA 显示但不激活 → 不触发 WM_ACTIVATE 的 DWM 首帧同步（部分机器 200-300ms） */
-    ShowWindow(hwnd_, SW_SHOWNA);
+    /* SW_SHOWNA 显示但不激活 → 不触发 WM_ACTIVATE 的 DWM 首帧同步（部分机器 200-300ms）。
+     * start_maximized=1 时改 SW_SHOWMAXIMIZED — 会激活窗口, 但带初始图启动
+     * 本来就要前台, 跟 SW_SHOWNA 的"不激活"约束不冲突. */
+    ShowWindow(hwnd_, startMax ? SW_SHOWMAXIMIZED : SW_SHOWNA);
     if (!toolWindow_) {
         BringWindowToTop(hwnd_);
         SetForegroundWindow(hwnd_);
@@ -451,10 +472,19 @@ void UiWindowImpl::SetWindowPosition(int xScreen, int yScreen) {
 void UiWindowImpl::GetWindowRectScreen(int* x, int* y, int* wDip, int* hDip) const {
     if (!hwnd_) return;
     RECT r; GetWindowRect(hwnd_, &r);
-    if (x) *x = r.left;
-    if (y) *y = r.top;
-    if (wDip) *wDip = (int)((r.right - r.left) / dpiScale_);
-    if (hDip) *hDip = (int)((r.bottom - r.top) / dpiScale_);
+    /* x/y 是 screen px (Win32 GetWindowRect 原值), w/h 是 DIP. build 94+ L23:
+     * 之前 x/y 也除 dpiScale_ 返 DIP 防 "save→restore round-trip 漂移", 但 sibling
+     * API set_rect / set_position / Create 输入 x/y 一直是 screen px, 两边
+     * 不自洽 — 用 get→set 复制窗口几何到 sub-window 必错位. 改回 screen px,
+     * "DPI-stable 持久化" 需求改由 caller 用 ui_window_dpi(win) 自己 MulDiv. */
+    if (x)    *x    = r.left;
+    if (y)    *y    = r.top;
+    if (wDip) *wDip = (int)((r.right  - r.left) / dpiScale_);
+    if (hDip) *hDip = (int)((r.bottom - r.top ) / dpiScale_);
+}
+
+int UiWindowImpl::Dpi() const {
+    return hwnd_ ? (int)dpi_ : 96;
 }
 
 void UiWindowImpl::ResizeWithAnchor(int wDip, int hDip,
@@ -784,6 +814,7 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             for (Widget* w = hoveredWidget_; w; w = w->Parent()) {
                 w->hovered = false;
                 w->RefreshCssState();
+                if (w->onMouseLeaveHook) w->onMouseLeaveHook();
             }
             hoveredWidget_ = nullptr;
         }
@@ -819,32 +850,34 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         if (wParam == kToastFadeTimerId) {
-            switch (toastPhase_) {
-                case 1: /* slideIn */
-                    toastSlide_ += 0.08f;
-                    if (toastSlide_ >= 1.0f) {
-                        toastSlide_ = 1.0f;
-                        toastPhase_ = 2;
-                        holdElapsed_ = 0;
-                    }
-                    break;
-                case 2: /* hold */
-                    holdElapsed_ += kToastFadeIntervalMs;
-                    if (holdElapsed_ >= holdDurationMs_) {
-                        toastPhase_ = 3;
-                        toastSlide_ = 1.0f;
-                    }
-                    break;
-                case 3: /* slideOut */
-                    toastSlide_ -= 0.06f;
-                    if (toastSlide_ <= 0.0f) {
-                        toastSlide_ = 0.0f;
-                        toastPhase_ = 0;
-                        toastText_.clear();
-                        KillTimer(hwnd_, kToastFadeTimerId);
-                        toastTimerId_ = 0;
-                    }
-                    break;
+            /* Build 68+ (L18): time-based 推进. phase / slide 都从
+             *   elapsed = now - toastShownTick_
+             * 派生. WM_TIMER 在系统忙时合并 / 丢 tick 也没事 — 下次 tick
+             * elapsed 跳跃式增加, slide 直接 catch-up 到正确值, 视觉是
+             * "帧间隔大但进度连续", 不再有 stall. */
+            const uint64_t now     = GetTickCount64();
+            const uint64_t elapsed = (toastShownTick_ != 0 && now >= toastShownTick_)
+                                         ? (now - toastShownTick_) : 0;
+            const uint64_t t1 = kToastSlideInMs;
+            const uint64_t t2 = t1 + holdDurationMs_;
+            const uint64_t t3 = t2 + kToastSlideOutMs;
+
+            if (elapsed < t1) {
+                toastPhase_ = 1;
+                toastSlide_ = static_cast<float>(elapsed) / kToastSlideInMs;
+            } else if (elapsed < t2) {
+                toastPhase_ = 2;
+                toastSlide_ = 1.0f;
+            } else if (elapsed < t3) {
+                toastPhase_ = 3;
+                toastSlide_ = 1.0f - static_cast<float>(elapsed - t2) / kToastSlideOutMs;
+            } else {
+                toastPhase_ = 0;
+                toastSlide_ = 0.0f;
+                toastText_.clear();
+                toastShownTick_ = 0;
+                KillTimer(hwnd_, kToastFadeTimerId);
+                toastTimerId_ = 0;
             }
             Invalidate();
             return 0;
@@ -1031,7 +1064,13 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         int vk = (int)wParam;
         if (DispatchKeyDown(vk)) return 0;
         if (onKey) onKey(vk);
-        break;
+        /* return 0 (而非 break) — onKey 回调里可能销毁本窗口 (典型: 自定义
+         * 快捷键 close-on-key). break 会 fall-through 到末尾的
+         * "return DefWindowProcW(hwnd_, ...)", 解引用 this->hwnd_, 撞 UAF.
+         * 既然 onKey 装了 callback 就当 caller 已完全负责派发, 不再下传
+         * DefWindowProc — 实践中 lib 应用无 system menu, 不依赖默认处理
+         * (Alt+F4 / F10 走 WM_SYSKEYDOWN, 跟此分支无关). build 95+ L24 修. */
+        return 0;
     }
 
     case WM_DROPFILES: OnDropFiles(reinterpret_cast<HDROP>(wParam)); return 0;
@@ -1520,6 +1559,7 @@ void UiWindowImpl::OnMouseMove(float x, float y) {
                 if (newChain.count(w)) continue;
                 w->hovered = false;
                 w->RefreshCssState();
+                if (w->onMouseLeaveHook) w->onMouseLeaveHook();
             }
             for (Widget* w : newChain) {
                 if (oldChain.count(w)) continue;
@@ -1732,7 +1772,9 @@ void UiWindowImpl::OnMouseDown(float x, float y) {
 
         if (dynamic_cast<SliderWidget*>(hit) ||
             dynamic_cast<ScrollViewWidget*>(hit) ||
-            dynamic_cast<ImageViewWidget*>(hit)) {
+            dynamic_cast<ImageViewWidget*>(hit) ||
+            dynamic_cast<ImageViewPlusWidget*>(hit) ||
+            dynamic_cast<GhImgViewWidget*>(hit)) {
             SetCapture(hwnd_);
         }
 
@@ -1827,6 +1869,7 @@ void UiWindowImpl::OnMouseUp(float x, float y) {
             dynamic_cast<ScrollViewWidget*>(w) ||
             dynamic_cast<ImageViewWidget*>(w) ||
             dynamic_cast<ImageViewPlusWidget*>(w) ||
+            dynamic_cast<GhImgViewWidget*>(w) ||
             dynamic_cast<SplitterWidget*>(w)) {
             ReleaseCapture();
             SetCursor(LoadCursor(nullptr, IDC_ARROW));
@@ -1874,6 +1917,11 @@ void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
             else if (auto* ivp = dynamic_cast<ImageViewPlusWidget*>(w)) {
                 if (ivp->visible) {
                     handled = ivp->OnMouseWheel(e);
+                }
+            }
+            else if (auto* gv = dynamic_cast<GhImgViewWidget*>(w)) {
+                if (gv->visible) {
+                    handled = gv->OnMouseWheel(e);
                 }
             }
             else if (auto* sv = dynamic_cast<ScrollViewWidget*>(w)) {
@@ -2081,15 +2129,13 @@ LRESULT UiWindowImpl::OnNcHitTest(int sx, int sy) {
 
         if (r) return HTRIGHT;
 
-        // 底部边缘：先检查是否命中交互控件，是则让给控件
-        if (b) {
-            if (root_) {
-                auto* hit = root_->HitTest(x, y);
-                if (hit && hit != root_.get() && !dynamic_cast<TitleBarWidget*>(hit))
-                    return HTCLIENT;
-            }
-            return HTBOTTOM;
-        }
+        /* 底部边缘 — Build 111 (L29 follow-up): 跟 left/right/top 一致, 始终
+         * 优先 resize, 不让给 widget. 之前先做 HitTest 命中 widget 就让 HTCLIENT,
+         * 主窗 toolbar / settings 窗 ScrollView 底部都被 widget 接走, 用户拖
+         * 不到 frame resize. kResizeBorder 是 ~5-8px 极小一块, 让给 resize
+         * 不会显著影响 widget 主体交互区 (button 通常 36px+, 边缘 5px 让出去
+         * 视觉无感). */
+        if (b) return HTBOTTOM;
     }
 
     // Check if hitting a widget
@@ -2237,21 +2283,23 @@ void UiWindowImpl::RegisterShortcut(int modifiers, int vk, std::function<void()>
 
 // ---- Toast ----
 
-void UiWindowImpl::ShowToast(const std::wstring& text, int durationMs, int position, int icon) {
+void UiWindowImpl::ShowToast(const std::wstring& text, int durationMs, int position, int icon, int anim) {
     toastText_ = text;
     toastPos_ = position;
     toastIcon_ = icon;
+    toastAnim_ = anim;
     toastSlide_ = 0.0f;
     toastAlpha_ = 1.0f;
-    toastPhase_ = 1;  /* slideIn */
+    toastPhase_ = 1;  /* slideIn (immediately) */
 
     if (toastTimerId_) KillTimer(hwnd_, toastTimerId_);
     toastTimerId_ = SetTimer(hwnd_, kToastFadeTimerId, kToastFadeIntervalMs, nullptr);
     toastFading_ = false;
 
-    /* 保存 hold 时长 */
+    /* 保存 hold 时长 + 记录起点. time-based 推进的锚点 (L18). */
     holdDurationMs_ = durationMs;
     holdElapsed_ = 0;
+    toastShownTick_ = GetTickCount64();
     Invalidate();
 }
 
@@ -2290,10 +2338,25 @@ void UiWindowImpl::DrawToast(Renderer& r) {
     }
 
     float slide = toastSlide_;
-    /* ease out cubic */
+    /* ease out cubic — 平滑曲线 */
     float t = 1.0f - (1.0f - slide) * (1.0f - slide) * (1.0f - slide);
-    float y = targetY + hideOffset * (1.0f - t);
-    float alpha = (toastPhase_ == 3) ? slide : 1.0f;  /* 滑出时同时淡出 */
+
+    float y;
+    float alpha;
+    if (toastAnim_ == 1 /* UI_TOAST_ANIM_FADE */) {
+        /* FADE: y 全程钉在目标, alpha 按 phase 解释 (phase1: 0→1, phase2: 1, phase3: 1→0).
+         * WM_TIMER handler 已把 toastSlide_ 推到正确进度 (phase1: 0→1, phase3: 1→0). */
+        y = targetY;
+        alpha = (toastPhase_ == 1 || toastPhase_ == 3) ? t : 1.0f;
+    } else {
+        /* SLIDE (默认, 旧行为): y 用 hideOffset 插值, alpha 仅 phase3 衰减 */
+        y = targetY + hideOffset * (1.0f - t);
+        alpha = (toastPhase_ == 3) ? slide : 1.0f;
+    }
+
+    /* alpha < 1/255 视为不可见, 跳过整次绘制省 GPU. 也防 phase 切换瞬间
+     * 残留 alpha=0 的 1 帧闪 (FillRoundedRect 在 D2D 上不是严格 no-op). */
+    if (alpha < (1.0f / 255.0f)) return;
 
     D2D1_RECT_F boxRect = { cx - boxW / 2, y, cx + boxW / 2, y + boxH };
     D2D1_COLOR_F bgColor = {0.15f, 0.15f, 0.18f, 0.92f * alpha};

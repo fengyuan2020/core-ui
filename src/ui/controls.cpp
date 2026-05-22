@@ -209,35 +209,51 @@ D2D1_SIZE_F LabelWidget::SizeHint() const {
         // 的 label 在 align-self: flex-start 下也会被撑到 60px。短文本如
         // "3 / 8"现在会按真实测量宽度（~28px）布局。
     }
+    /* SizeHint 一律返自然 intrinsic 宽 (w = estW). 不读 parent_->rect 把 w
+     * cap 到父宽 — 那是 layout 期间用 layout 结果, 跟 CSS shrink-to-fit
+     * (position: absolute / float / inline-block) 形成循环依赖:
+     *   父宽 = 子 SizeHint.w (蛋)
+     *   子 SizeHint.w = min(intrinsic, 父.previous_rect - padding) (鸡)
+     * 旧代码做这个 cap 让 absolute + wrap label 在动态文本变化时 (e.g.
+     * counter / i18n / status) 卡死在第一次 layout 的父宽里, 之后文本变长
+     * 只会增加行数而不撑开父级. 跟浏览器规范 (CSS 2.1 §10.3.7
+     * "shrink-to-fit width") 矛盾.
+     *
+     * 折行实际发生在 DrawText 阶段, 用 widget 真实 rect.width 作 layoutW
+     * (见 EnsureLayout: layoutW = wrap_ ? maxW : 1e6f). 所以即使 SizeHint
+     * 返自然宽, 受约束 (fixedW / flex shrink / 父级显式 width) 的 label 仍
+     * 然在画的时候按真实分配宽度 wrap. */
     float w = estW;
-    float h = fixedH > 0 ? fixedH : fontSize_ + 10.0f;
-    if (wrap_) {
-        /* 确定可用宽度：优先用 fixedW，其次用 parent 宽度。
-         * 注意：availW 只用于 measure 换行高度，不要把 w 也撑成 parentW —
-         * 当 label 是 flex row 里多个子项之一时，宣称占满 parent 会让 SizeHint
-         * 形成反馈循环（cc-block.SizeHint 含 label 全 parent 宽 → row-12 含
-         * 4×cc-block → 父再分配更宽 → label 再 SizeHint…）。把 w 限制在
-         * 自然文本宽 estW，并按 parent 内容宽 cap 一下即可。 */
-        float availW = 0;
-        if (fixedW > 0) {
-            availW = fixedW;
-        } else if (parent_) {
-            float parentW = parent_->rect.right - parent_->rect.left;
-            if (parentW > 20.0f) {
-                availW = parentW - padL - padR;
-                if (w > availW) w = availW;  // cap natural width to parent
-            }
-        }
+    /* line-height 决定单行 label 高度 (build 92, L20):
+     *   - lineHeightPx_     >0: CSS "Npx" 直接用
+     *   - lineHeightRatio_  >0: CSS unitless (1.3 = 1.3×fontSize)
+     *   - 否则:                  默认 1.3 × fontSize (现代浏览器 / Fluent UI)
+     * 历史 fontSize_ + 10.0f 在密集列表偏松, 见 controls.h 注释. */
+    float lineH = (lineHeightPx_ > 0.0f)    ? lineHeightPx_
+                : (lineHeightRatio_ > 0.0f) ? (lineHeightRatio_ * fontSize_)
+                                            : (fontSize_ * 1.3f);
+    float h = fixedH > 0 ? fixedH : lineH;
+    if (wrap_ && fixedW > 0) {
+        /* 仅 fixedW 显式约束时 SizeHint 能可靠预测 wrap 后的高度. 没 fixedW
+         * 时父宽未知 (要等 DoLayout 分配 rect 才知道), SizeHint 给单行高;
+         * 父级层 layout 时若分配 rect.width < intrinsic, draw 时按 rect
+         * 宽度 wrap, 可能视觉溢出 — 这条 limitation 由调用方负责 (给
+         * fixedW 或父级提供足够 cross-axis 空间), 与之前用 parent_->rect
+         * 的方案相比换来"absolute / shrink-to-fit 不死锁"的更大好处. */
+        float availW = fixedW - padL - padR;
         if (availW > 10.0f) {
             extern Renderer* g_activeRenderer;
             if (g_activeRenderer) {
                 auto weight = bold_ ? DWRITE_FONT_WEIGHT_SEMI_BOLD : DWRITE_FONT_WEIGHT_NORMAL;
-                // availW already had padL+padR subtracted → measured against
-                // text-area width.
                 float textH = g_activeRenderer->MeasureTextHeight(text_, availW, fontSize_, weight);
-                h = textH + 6.0f;
+                /* build 92 (L20): wrap 分支也走 line-height. DWrite textH 包含
+                 * ascent + descent (单行 ≈ fontSize × 1.2). 折成行数后乘 lineH.
+                 * 1.4 阈值: 单行实际 ratio ≈ 1.2, 用 1.4 当 "definitely > 1 line"
+                 * 边界, 防 ceil(1.23) 错误判 2 行. */
+                int numLines = std::max(1, (int)std::ceil(textH / (fontSize_ * 1.4f)));
+                h = numLines * lineH;
                 if (maxLines_ > 0) {
-                    float maxH = fontSize_ * 1.6f * maxLines_ + 6.0f;
+                    float maxH = lineH * maxLines_;
                     if (h > maxH) h = maxH;
                 }
             }
@@ -2066,17 +2082,24 @@ D2D1_RECT_F ScrollViewWidget::ThumbRect() const {
 void ScrollViewWidget::DoLayout() {
     if (!content_) return;
 
-    float visW = rect.right - rect.left;
-    float visH = VisibleHeight();
+    /* Build 110 (L29 follow-up): 应用 padding 给 content 区域. 之前
+     * visW/visH/content.rect 直接用 sv.rect, padL/padT/padR/padB 字段被
+     * 忽略, .uix 写 `padding: 24px 28px` 视觉上没起作用 — caller 的内容
+     * 贴 ScrollView 边. 改成跟 VBox/HBox 同款行为: content 起点偏 padding,
+     * 可用宽高扣 padding. */
+    float visW = (rect.right - padR) - (rect.left + padL);
+    float visH = (rect.bottom - padB) - (rect.top + padT);
 
     // First pass: layout content at full height to measure actual needed height
     // Give it a tall rect so VBox can place all children without compression
     float estimatedH = std::max(content_->SizeHint().height, visH);
-    content_->rect = {rect.left, rect.top, rect.left + visW, rect.top + estimatedH};
+    content_->rect = {rect.left + padL, rect.top + padT,
+                        rect.left + padL + visW,
+                        rect.top + padT + estimatedH};
     content_->DoLayout();
 
     // Measure actual content height from children bounds (EXCLUDING content_ itself)
-    float maxBottom = rect.top;
+    float maxBottom = rect.top + padT;
     std::function<void(Widget*)> measure = [&](Widget* w) {
         if (!w->visible) return;
         if (w->rect.bottom > maxBottom) maxBottom = w->rect.bottom;
@@ -2084,6 +2107,8 @@ void ScrollViewWidget::DoLayout() {
     };
     // 只 measure 子元素的 bounds，不包含 content_ 自己的 rect.bottom（那是 estimatedH，非真实内容）
     for (auto& c : content_->Children()) measure(c.get());
+    /* contentHeight_ 含 padT 但不含 padB — 内容 + 上 padding 是滚动可视范围,
+     * 下 padding 通过 visH 已经扣过 (caller 想要的"末尾留白"自然出现). */
     contentHeight_ = std::max(maxBottom - rect.top, visH);
 
 
@@ -2092,7 +2117,9 @@ void ScrollViewWidget::DoLayout() {
     ClampScroll();
 
     // Final layout with correct scroll offset and width
-    content_->rect = {rect.left, rect.top - scrollY_, rect.left + cw, rect.top - scrollY_ + contentHeight_};
+    content_->rect = {rect.left + padL, rect.top + padT - scrollY_,
+                        rect.left + padL + cw,
+                        rect.top + padT - scrollY_ + contentHeight_};
     content_->DoLayout();
 }
 
@@ -2377,7 +2404,11 @@ void ToggleWidget::UpdateCachedColors() {
     CachedTrackColorOff_ = dark ? theme::Rgb(0x3D, 0x3D, 0x3D) : theme::Rgb(0xF8, 0xF7, 0xF7);
     CachedTrackColorOn_ = theme::kAccent();
     CachedThumbColorOff_ = dark ? theme::Rgb(0xB8, 0xB8, 0xB8) : theme::Rgb(0x5B, 0x5B, 0x5B);
-    CachedThumbColorOn_ = dark ? theme::Rgb(0x00, 0x00, 0x00) : theme::Rgb(0xFF, 0xFF, 0xFF);
+    /* On thumb: always white in both modes. Material / iOS / Tailwind / shadcn
+     * 主流路线 — dark mode 下黑色 thumb 需要配 Fluent "暗模式 accent 提亮"
+     * 整套 token, 单独黑手柄套饱和中蓝 accent 视觉过重 ("丑"). 跟其他主流
+     * 设计系统对齐, ON 态 thumb 不区分主题. */
+    CachedThumbColorOn_ = theme::Rgb(0xFF, 0xFF, 0xFF);
 }
 
 void ToggleWidget::UpdateAnimation() {
@@ -3746,10 +3777,14 @@ void IconButtonWidget::OnDraw(Renderer& r) {
     // Background
     if (ghost_) {
         // Ghost mode: transparent by default, show bg on hover/press
-        D2D1_COLOR_F bg = {0, 0, 0, 0};
-        if (pressed)      bg = theme::kBtnPress();
-        else if (hovered) bg = theme::kBtnHover();
-        if (bg.a > 0) r.FillRoundedRect(rect, cornerRadius_, cornerRadius_, bg);
+        // (除非 hoverVisual_=false, 那就永远只画 icon —— titlebar 装饰按钮
+        //  /状态指示器场景).
+        if (hoverVisual_) {
+            D2D1_COLOR_F bg = {0, 0, 0, 0};
+            if (pressed)      bg = theme::kBtnPress();
+            else if (hovered) bg = theme::kBtnHover();
+            if (bg.a > 0) r.FillRoundedRect(rect, cornerRadius_, cornerRadius_, bg);
+        }
     } else {
         // Normal mode: always show button background
         D2D1_COLOR_F bg = theme::kBtnNormal();

@@ -12,13 +12,13 @@
 
 推荐用 **`.uix` 单文件组件**（Vue 3 SFC 风格：`<window>` + `<script>` + `<style>` + `<template>`）描述界面：响应式数据绑定、computed / methods、`v-if` / `v-for` / `v-model` / `@click`、CSS 子集和 CSS 变量主题——脚本由内置的 **QuickJS-NG** 在原生进程内求值，没有 DOM、没有 Webview。项目还专门为 **AI 协作**而设计：一份自包含的速查文档（[`docs/uix-ai-guide.md`](./docs/uix-ai-guide.md)）让 LLM 一次读完就能生成完整的可运行应用，真正做到"描述需求 → 得到界面"的极速原型闭环。
 
-> **8.4 MB 一个 DLL，就能写出跟 Office / VSCode 同一设计语言的 Windows 桌面应用。**
+> **3.0 MB 一个 DLL，就能写出跟 Office / VSCode 同一设计语言的 Windows 桌面应用。**
 > 不要 Chromium、不要 .NET、不要 Qt 几十兆的 moc/uic——一个 C 头文件，一份 `.uix` 单文件组件，搞定。
 
-![version](https://img.shields.io/badge/version-1.5.0.42-blue)
+![version](https://img.shields.io/badge/version-1.6.0.112-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![platform](https://img.shields.io/badge/platform-Windows%2010%2B-lightgrey)
-![size](https://img.shields.io/badge/dll-8.4MB-brightgreen)
+![size](https://img.shields.io/badge/dll-3.0MB-brightgreen)
 ![api](https://img.shields.io/badge/C%20API-250%2B-orange)
 ![script](https://img.shields.io/badge/script-QuickJS--NG-purple)
 
@@ -26,7 +26,7 @@
 
 | 对比维度 | Electron | WPF / WinUI 3 | Qt | **Core UI** |
 |---------|----------|---------------|-----|-------------|
-| **分发体积** | 100+ MB | 需要 .NET 运行时 | 40+ MB Qt DLLs | **8.4 MB 单 DLL** |
+| **分发体积** | 100+ MB | 需要 .NET 运行时 | 40+ MB Qt DLLs | **3.0 MB 单 DLL** |
 | **启动时间** | 1–3 秒 | 0.5–1 秒 | 0.5–1 秒 | **< 200 ms** |
 | **内存占用** | 150+ MB | 80+ MB | 60+ MB | **< 30 MB** |
 | **语言绑定** | 只能 JS | 只能 .NET | 只能 C++ | **C ABI，任意语言** |
@@ -93,11 +93,86 @@ ui_debug_*  自动点击 + 截图       （AI 自己跑回归，闭环）
   5. 模板事件：@click / @change / @input / @focus / @blur / @mousedown / @wheel ...
 ```
 
+## 🆕 1.6.0 重点更新（since v1.5.0 公开发布）
+
+1.6.0 整合了 1.5.0 build 46 公开发布以来 65 笔内部 build 的能力扩展和 bug 修复，
+完整 per-build 历史见 [CHANGELOG.md](./CHANGELOG.md)。
+
+### 新增能力 — Widget 级事件回调一整套
+
+之前只能给 `button` / `input` 这类预制 widget 挂 onclick。1.6.0 开放**任意 widget**
+（含自绘 `<custom>`）的事件回调，自绘控件能像内置控件一样接所有交互：
+
+```c
+ui_widget_on_mouse_move (w, on_move,  ctx);   // widget-local 坐标
+ui_widget_on_mouse_leave(w, on_leave, ctx);
+ui_widget_on_mouse_wheel(w, on_wheel, ctx);   // 不再只能在 ScrollView 拿
+ui_widget_on_focus      (w, on_focus, ctx);   // 配合 ui_custom_set_focusable
+ui_widget_on_blur       (w, on_blur,  ctx);
+ui_widget_set_cursor    (w, "hand");          // 程序化光标
+```
+
+### 新增能力 — Menu 反应式重构
+
+`<menu>` 全走 Vue 3 风格的响应式渲染，跟 `data()` 状态联动：
+
+```vue
+<menu trigger="#tree-item" event="rclick">
+  <menuitem v-for="cmd in commands" :key="cmd.id"
+            :disabled="!cmd.enabled" @click="run(cmd)">
+    <label>{{ cmd.label }}</label>
+  </menuitem>
+  <separator/>
+  <menuitem v-if="isAdmin" @click="del"><label>删除</label></menuitem>
+</menu>
+```
+
+- rclick dispatch 改 **deepest-match**：嵌套 `<menu trigger>` 时子 widget 的 menu
+  不再被祖先抢走，跟 DOM event bubbling 语义一致
+- submenu autoclose 用"可见矩形"判定，箭头改 outline，宽度跟主菜单一致
+
+### 新增能力 — 窗口生命周期 / 首帧零闪烁
+
+- `ui_page_prepare_window` — 隐藏窗 + RT 预创建，首帧零黑屏
+- `UiWindowConfig.start_maximized` — 持久化"最大化关→最大化开"无 1 帧 normal flash
+- `UiWindowConfig::owner` — 子窗口附属主窗口，任务栏不独立 / 跟随主窗 minimize
+- `ui_debug_server` 支持多 server 并存，每窗口独立 pipe（适合主窗 + 设置窗 同时调试）
+
+### 新增 — 其它
+
+- `:id="..."` 动态绑定（v-for 唯一 id 终于能用）
+- `ui_toast_ex(anim = UI_TOAST_ANIM_FADE)` 纯渐入渐出风格，center 位置也能"无 slide 直现"
+- `ui_window_dpi_scale` 通用 API
+
+### Bug 修复合集 — 用户实战反馈驱动
+
+**ScrollView 三连修：**
+- `<ScrollView>` 包多个 v-if/v-for panel 时 layout 错乱 → 总是包 wrapper VBox + patch parentWidget
+- CSS `padding` 在 ScrollView 之前 vainly → DoLayout 扣 padL/padT/padR/padB
+- frameless 窗底边拖不动 → NC hit-test 跟左右顶一致
+
+**其它关键修复：**
+- `PushRoundedClip` 加 `INITIALIZE_FOR_CLEARTYPE` 防 layer 内 ClearType 文字消失
+- SVG presentation attrs (`stroke` / `fill` / `stroke-width`) 父→子继承
+- LabelWidget 接 CSS `line-height`（默认 1.3 × font-size）+ `white-space: nowrap`
+- Toggle ON 态 thumb 暗色模式去黑改白
+- WM_KEYDOWN onKey 自销毁路径 fall-through UAF 修复
+
+### 💥 BREAKING（从 1.5.0 公开版本升级时必读）
+
+| 改动 | 旧用法 | 新用法 |
+|---|---|---|
+| menuitem 改 widget 模板 | `<menuitem>X</menuitem>` | `<menuitem><label>X</label></menuitem>` |
+| 窗口几何 API 改 screen px | `ui_window_set_rect_screen(w,x,y,w,h)` 之前 DIP/screen 混 | 现在 x/y/w/h 全 screen px，配合 `ui_window_dpi_scale` 转换 |
+| `ui_toast_ex` 加 `anim` 参数 | `ui_toast_ex(win,t,d,pos,icon)` | `ui_toast_ex(win,t,d,pos,icon, UI_TOAST_ANIM_SLIDE)` |
+| `ui_toast_at` 删除 | `ui_toast_at(win,t,d,pos)` | `ui_toast_ex(win,t,d,pos,0,UI_TOAST_ANIM_SLIDE)` |
+| `WireMenus` 静态简化路径删除 | `WireMenus(...)` 自动 wire | 改用 `<menu>` 声明式 + Vue 3 binding |
+
 ## ✨ 核心特性
 
 ### 🚀 轻到离谱，快到失真
 
-- **8.4 MB 全量 DLL**，静态编译后 demo exe 仅 **1 MB**，可装进 U 盘跑
+- **3.0 MB 全量 DLL**，静态编译后 demo exe 仅 **~2 MB**，可装进 U 盘跑
 - **Direct2D + Direct3D 11** 全硬件加速，Per-Monitor DPI V2 一次画对
 - **冷启动 < 200ms**，对 `.uix` 文件路径点一下就能看到窗口
 
@@ -173,6 +248,20 @@ ui_page_destroy(page);
 - Rust / Go / Python / C# / Delphi / Pascal / Lua 全部能直接绑定
 - Page API（`ui_page_*`）为 `.uix` 而生；底层 widget 工厂（`ui_vbox`、`ui_button` ...）仍可过程式构造控件树
 
+### ⚡ Widget 级事件回调 — 自绘 widget 也能接全套交互（1.6.0 新增）
+
+任意 widget（含 `<custom>` 自绘 widget）都能像内置控件一样挂事件回调，不再受
+"只有 button / input 能拿 onclick"的限制：
+
+```c
+ui_widget_on_mouse_move (w, on_move,  ctx);   // widget-local 坐标
+ui_widget_on_mouse_leave(w, on_leave, ctx);
+ui_widget_on_mouse_wheel(w, on_wheel, ctx);   // 通用滚轮，不局限 ScrollView
+ui_widget_on_focus      (w, on_focus, ctx);   // 配合 ui_custom_set_focusable
+ui_widget_on_blur       (w, on_blur,  ctx);
+ui_widget_set_cursor    (w, "hand");          // hand / wait / size-* / IDC_*
+```
+
 ### 🔍 自动化 / 调试：控件可编程驱动
 
 从 1.1.0 起新增一整套 **`ui_debug_*` 事件注入 API** —— 无需真实鼠标键盘即可
@@ -191,6 +280,7 @@ ui_debug_type_text(win, L"hello");           // 逐字符键盘输入
   高层操作 / 子菜单 path 点击 / HWND `PostMessage` 通道 …
 - 内置 **Named Pipe IPC**（`\\.\pipe\ui_core_debug`）45+ 条命令，PowerShell / Python
   一行能驱动；`ui_debug_server_start(win, NULL)` 启动
+- **黄金图回归**：`golden_runner.exe` 把 `demo/golden/*.uix` 渲染成 PNG，与 `*.expected.png` 比对
 - **线程安全工具** `ui_window_invoke_sync` 把工作线程的调用 marshal 到 UI 线程
 - 完整参考见 **[`docs/debug-simulation.md`](./docs/debug-simulation.md)**
 
@@ -198,8 +288,8 @@ ui_debug_type_text(win, L"hello");           // 逐字符键盘输入
 
 | 指标 | 数值 |
 |------|------|
-| `core-ui.dll` 体积（全功能） | **8.4 MB** |
-| `ui-demo-uix.exe` 体积（静态链接） | **~1 MB** |
+| `core-ui.dll` 体积（全功能） | **3.0 MB** |
+| `ui-demo-uix.exe` 体积（静态链接） | **~2 MB** |
 | 空窗口内存占用 | **< 30 MB** |
 | 冷启动到首帧 | **< 200 ms** |
 | 60 fps 动画 CPU 占用 | **< 3%** |
@@ -218,13 +308,11 @@ ui_debug_type_text(win, L"hello");           // 逐字符键盘输入
 
 ### 构建
 
-从 **Visual Studio Developer Command Prompt**（或先 source `vcvars64.bat`）开一个终端，然后：
+构建必须从 PowerShell 调用项目自带脚本（自动配置 vcvars64、用 llvm-rc 绕过 Windows SDK rc.exe 在 ninja 子进程里挂死的 bug）：
 
-```bash
-git clone https://github.com/ghboke/core-ui.git
-cd core-ui
-cmake -B build -G Ninja
-cmake --build build --target core-ui
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File scripts/build-clang-cl.ps1 -Target core-ui
 ```
 
 常用 target：
@@ -234,19 +322,15 @@ cmake --build build --target core-ui
 | `core-ui` | `core-ui.dll` + `core-ui.lib` 导入库（默认） |
 | `core-ui-static` | `core-ui-static.lib` 自包含静态归档（含 QuickJS） |
 | `ui-demo-uix` | `ui-demo-uix.exe` 单文件 demo（资源烤进 exe） |
+| `golden_runner` | `golden_runner.exe` 黄金图回归测试 |
 
-不指定 `--target` 就编全部。Visual Studio 17 2022 generator 也能用：
+加 `-Clean` 强制重建 build 目录；省略 `-Target` 编全部。
 
-```bash
-cmake -B build -G "Visual Studio 17 2022" -A x64
-cmake --build build --config Release
-```
+单 exe 分发（无 DLL 依赖）：
 
-单 exe 分发（无 DLL 依赖，所有代码 + QuickJS 静态链进 exe）：
-
-```bash
-cmake -B build -G Ninja -DUI_CORE_STATIC=ON
-cmake --build build
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File scripts/build-clang-cl.ps1 -Target core-ui -Static
 ```
 
 ### Hello World
@@ -321,43 +405,6 @@ ui_page_load_language_string(page, "zh", k_lang_zh);
 
 `demo/ui_demo_uix.cpp` 就是这种用法的最小完整例子（57 行胶水 + 单 `.uix` 文件 12 页 demo）。
 
-### 🛠️ 故障排查
-
-#### 1. ninja link 阶段卡死（Windows SDK rc.exe bug）
-
-**症状**：build 看似在 link / 资源编译阶段卡死、CPU 不动；查 `build/CMakeFiles/<target>.dir/CMakeFiles/<target>-version.rc.res` 是 **0 字节**，同目录有 9 KB 左右的 `RCa*` 临时文件。`tasklist` 看到 `cmake.exe` + `rc.exe` 进程在跑但内存恒定。
-
-**原因**：某些 Windows SDK 版本的 `rc.exe` 在 ninja 子进程上下文里有死锁 bug。
-
-**修复**：让 cmake 用 LLVM 的 `llvm-rc.exe` 替代系统 `rc.exe`：
-
-```bash
-# 找到 llvm-rc.exe 路径（通常随 LLVM / clang-cl 一起装）
-where llvm-rc
-
-cmake -B build -G Ninja -DCMAKE_RC_COMPILER=C:/path/to/llvm-rc.exe
-```
-
-#### 2. `cmake -B build` 报 `core-ui only supports MSVC / clang-cl`
-
-**原因**：cmake 没识别到 MSVC 工具链——多半是终端没初始化 vcvars。
-
-**修复**：
-
-- 用 **Visual Studio Developer Command Prompt** 开终端
-- 或在普通 cmd 里先运行：`"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"`（路径按你装的 VS 版本调整）
-
-#### 3. 静态链接缺 `JS_*` 符号
-
-**症状**：用 `core-ui-static.lib` 静态链接时报 `unresolved external __imp_JS_*` ~50 个。
-
-**原因**：`core-ui-static.lib` 不含 QuickJS 实现。**用 install target 生成的 `lib/static/core-ui.lib`** 才是合并了 QuickJS 的胖归档：
-
-```bash
-cmake --build build --target release-package
-# 产物在 release/core-ui-vX.Y.Z/lib/static/core-ui.lib
-```
-
 ## 🧩 内置控件 / 标签
 
 `.uix` 模板里的标签直接映射到原生 widget：
@@ -395,20 +442,20 @@ var(--sidebar-hover) / var(--border-subtle)
 
 ## 🔢 版本号
 
-版本号格式：`MAJOR.MINOR.PATCH.BUILD`（当前 `1.5.0.42`）
+版本号格式：`MAJOR.MINOR.PATCH.BUILD`（当前 `1.6.0.112`）
 
 - 编译期宏：`UI_CORE_VERSION_MAJOR/MINOR/PATCH/BUILD` + `UI_CORE_VERSION_STRING`
 - 运行时 API：
 
 ```c
 int major, minor, patch;
-ui_core_version(&major, &minor, &patch);   // 1, 5, 0
-int build = ui_core_version_build();        // 42
-const char* v = ui_core_version_string();   // "1.5.0.42"
+ui_core_version(&major, &minor, &patch);   // 1, 6, 0
+int build = ui_core_version_build();        // 112
+const char* v = ui_core_version_string();   // "1.6.0.112"
 ```
 
-- Windows DLL 属性页（右键 `core-ui.dll` → 属性 → 详细信息）会显示 `FileVersion 1.5.0.42`
-- 完整发布历史见 GitHub [Releases](https://github.com/ghboke/core-ui/releases) 页
+- Windows DLL 属性页（右键 `core-ui.dll` → 属性 → 详细信息）会显示 `FileVersion 1.6.0.112`
+- 完整发布历史见 [CHANGELOG.md](./CHANGELOG.md)
 
 ## 📁 项目结构
 
@@ -437,18 +484,16 @@ core-ui/
 ├── demo/
 │   ├── ui_demo.uix       # 12 页 SFC demo
 │   ├── ui_demo_uix.cpp   # 60 行胶水 + locale poll
-│   └── lang/             # 中文 / 英文语言包
+│   ├── lang/             # 中文 / 英文语言包
+│   ├── golden/           # 黄金图回归用例
+│   └── golden_runner.cpp # 渲染对比器
 ├── docs/                 # 文档
+├── scripts/              # build-clang-cl.ps1 等
 ├── cmake/                # UiCoreHelpers.cmake (embed_text)
-├── website/              # 文档站（Vite + React）发布到 GitHub Pages
-├── .github/workflows/    # GitHub Actions（Pages 部署）
+├── test/                 # 单元测试
 ├── CMakeLists.txt
-├── LICENSE
-├── README.md / README-en.md
-├── UI_CORE_API.md
-├── VERSION / version.json
-├── llms.txt
-└── logo.svg
+├── VERSION
+└── CHANGELOG.md
 ```
 
 ## 📚 文档

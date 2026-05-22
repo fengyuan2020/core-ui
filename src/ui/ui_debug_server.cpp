@@ -9,6 +9,7 @@
 #include "ui_context.h"
 #include "ui_window.h"
 #include "controls.h"
+#include "gh_img_view.h"
 #include "../../include/ui_core.h"
 
 #include <atomic>
@@ -410,7 +411,11 @@ std::string BuiltinDispatch(UiWindow win, const std::string& cmd,
         UiWidget w = WidgetByIdHandle(win, arg(0));
         if (!w) return errJson("widget not found");
         if (arg(1).empty()) return errJson("usage: zoom <id> <value>");
-        ui_image_set_zoom(w, (float)std::atof(arg(1).c_str()));
+        float z = (float)std::atof(arg(1).c_str());
+        // Try all known image widgets (each is a no-op on type mismatch via internal As<>).
+        ui_image_set_zoom(w, z);
+        ui_image_view_plus_set_zoom(w, z);
+        ui_gh_img_view_set_zoom(w, z);
         ui_window_invalidate(win);
         return okJson();
     }
@@ -418,8 +423,11 @@ std::string BuiltinDispatch(UiWindow win, const std::string& cmd,
         UiWidget w = WidgetByIdHandle(win, arg(0));
         if (!w) return errJson("widget not found");
         if (arg(2).empty()) return errJson("usage: pan <id> <x> <y>");
-        ui_image_set_pan(w, (float)std::atof(arg(1).c_str()),
-                            (float)std::atof(arg(2).c_str()));
+        float px = (float)std::atof(arg(1).c_str());
+        float py = (float)std::atof(arg(2).c_str());
+        ui_image_set_pan(w, px, py);
+        ui_image_view_plus_set_pan(w, px, py);
+        ui_gh_img_view_set_pan(w, px, py);
         ui_window_invalidate(win);
         return okJson();
     }
@@ -428,6 +436,69 @@ std::string BuiltinDispatch(UiWindow win, const std::string& cmd,
         if (!w) return errJson("widget not found");
         if (arg(1).empty()) return errJson("usage: rotate <id> <angle>");
         ui_image_set_rotation(w, std::atoi(arg(1).c_str()));
+        ui_window_invalidate(win);
+        return okJson();
+    }
+
+    // --- GhImgView (通用瓦块画布) ---
+    // gh_state <id> -> JSON { active_level, levels, full_w/h, tile_size, zoom, pan_x, pan_y, auto_level, tile_count_per_level }
+    if (cmd == "gh_state") {
+        UiWidget w = WidgetByIdHandle(win, arg(0));
+        if (!w) return errJson("widget not found");
+        auto* gv = dynamic_cast<ui::GhImgViewWidget*>(ui::GetContext().handles.LookupRaw(w));
+        if (!gv) return errJson("not a gh_img_view widget");
+        const auto& info = gv->GetInfo();
+        // 计每个 level 已喂瓦块数 —— 走 widget 内部 ClearLevel 友好的方式：触发一次
+        // Notify 取 viewport 字段；这里直接读公开 getter。
+        char buf[2048];
+        std::snprintf(buf, sizeof(buf),
+            "{\"ok\":true,\"full_width\":%u,\"full_height\":%u,"
+            "\"tile_size\":%u,\"levels\":%u,\"active_level\":%u,"
+            "\"auto_level\":%s,\"zoom\":%.4f,\"pan_x\":%.2f,\"pan_y\":%.2f}",
+            info.fullWidth, info.fullHeight, info.tileSize, info.levels,
+            gv->ActiveLevel(),
+            gv->AutoLevel() ? "true" : "false",
+            gv->Zoom(), gv->PanX(), gv->PanY());
+        return std::string(buf);
+    }
+    if (cmd == "gh_fit") {
+        UiWidget w = WidgetByIdHandle(win, arg(0));
+        if (!w) return errJson("widget not found");
+        ui_gh_img_view_fit(w);
+        ui_window_invalidate(win);
+        return okJson();
+    }
+    if (cmd == "gh_reset") {
+        UiWidget w = WidgetByIdHandle(win, arg(0));
+        if (!w) return errJson("widget not found");
+        ui_gh_img_view_reset(w);
+        ui_window_invalidate(win);
+        return okJson();
+    }
+    if (cmd == "gh_level") {
+        UiWidget w = WidgetByIdHandle(win, arg(0));
+        if (!w) return errJson("widget not found");
+        if (arg(1).empty()) return errJson("usage: gh_level <id> <level>");
+        ui_gh_img_view_set_active_level(w, (uint32_t)std::atoi(arg(1).c_str()));
+        ui_window_invalidate(win);
+        return okJson();
+    }
+    if (cmd == "gh_auto_level") {
+        UiWidget w = WidgetByIdHandle(win, arg(0));
+        if (!w) return errJson("widget not found");
+        if (arg(1).empty()) return errJson("usage: gh_auto_level <id> <0|1>");
+        ui_gh_img_view_set_auto_level(w, std::atoi(arg(1).c_str()));
+        ui_window_invalidate(win);
+        return okJson();
+    }
+    if (cmd == "gh_zoom_around") {
+        UiWidget w = WidgetByIdHandle(win, arg(0));
+        if (!w) return errJson("widget not found");
+        if (arg(3).empty()) return errJson("usage: gh_zoom_around <id> <zoom> <ax> <ay>");
+        ui_gh_img_view_set_zoom_around(w,
+            (float)std::atof(arg(1).c_str()),
+            (float)std::atof(arg(2).c_str()),
+            (float)std::atof(arg(3).c_str()));
         ui_window_invalidate(win);
         return okJson();
     }
@@ -463,6 +534,22 @@ std::string BuiltinDispatch(UiWindow win, const std::string& cmd,
         int r = ui_debug_menu_click_path(win, path.data(), (int)path.size());
         if (r == 0) ui_debug_pump();
         return r == 0 ? okJson() : errJson("menu_click_path failed");
+    }
+    if (cmd == "menu_open_submenu") {
+        std::vector<int> path;
+        if (!parseMenuPath(arg(0), path)) return errJson("usage: menu_open_submenu i0/i1/...");
+        int r = ui_debug_menu_open_submenu_path(win, path.data(), (int)path.size());
+        if (r == 0) ui_debug_pump();
+        return r == 0 ? okJson() : errJson("menu_open_submenu failed");
+    }
+    if (cmd == "screenshot_submenu") {
+        if (arg(0).empty() || arg(1).empty())
+            return errJson("usage: screenshot_submenu i0/i1/... <out_path>");
+        std::vector<int> path;
+        if (!parseMenuPath(arg(0), path)) return errJson("invalid path");
+        std::wstring wp(arg(1).begin(), arg(1).end());
+        int r = ui_debug_screenshot_submenu_path(win, path.data(), (int)path.size(), wp.c_str());
+        return r == 0 ? okJson() : errJson("screenshot_submenu failed");
     }
     if (cmd == "menu_count_at") {
         std::vector<int> path;
@@ -541,8 +628,12 @@ std::string BuiltinDispatch(UiWindow win, const std::string& cmd,
         "\"splitview <id> [0|1|toggle]\",\"scroll <id> <y>\","
         "\"input <id> <text>\",\"textarea <id> <text>\",\"set_text <id> <text>\","
         "\"zoom <id> <v>\",\"pan <id> <x> <y>\",\"rotate <id> <deg>\","
+        "\"gh_state <id>\",\"gh_fit <id>\",\"gh_reset <id>\","
+        "\"gh_level <id> <lvl>\",\"gh_auto_level <id> <0|1>\","
+        "\"gh_zoom_around <id> <zoom> <ax> <ay>\","
         "\"menu_is_open\",\"menu_count\",\"menu_click <idx>\","
         "\"menu_click_id <id>\",\"menu_close\",\"menu_click_path i0/i1/...\","
+        "\"menu_open_submenu i0/i1/...\",\"screenshot_submenu i0/i1/... <out>\","
         "\"menu_count_at [path]\",\"menu_has_sub path\",\"menu_id_at path\","
         "\"menu_autoclose 0|1\","
         "\"dialog_confirm\",\"dialog_cancel\","
@@ -559,19 +650,26 @@ std::string BuiltinDispatch(UiWindow win, const std::string& cmd,
 // Pipe server thread + global state
 // ============================================================================
 
-struct ServerState {
-    UiWindow win = 0;
-    std::string pipeName;       // without "\\.\pipe\" prefix
-    std::thread thread;
-    std::atomic<bool> shutdown{false};
-    HANDLE pipe = INVALID_HANDLE_VALUE;
-    HANDLE event = nullptr;     // overlapped ConnectNamedPipe event
-    UiDebugCommandHandler userHandler = nullptr;
-    void* userHandlerData = nullptr;
-    std::mutex handlerMu;       // guards userHandler swap during dispatch
+/* L12 (build 63+): 多个 server 并存. 每个 server 绑一个 UiWindow + 独立
+ * pipe_name + 独立 accept thread / event / pipe handle. unique_ptr 包起来
+ * 让 vector 重排不动 entry 本身, worker 持的 raw ptr 一直有效. */
+struct ServerEntry {
+    UiWindow              win = 0;
+    std::string           pipeName;
+    std::thread           thread;
+    std::atomic<bool>     shutdown{false};
+    HANDLE                pipe  = INVALID_HANDLE_VALUE;
+    HANDLE                event = nullptr;
 };
 
-static ServerState g_state;     // single global server
+static std::vector<std::unique_ptr<ServerEntry>> g_servers;
+static std::mutex                                g_serversMu;
+
+/* userHandler 保持全局 — 所有 server 共享一个回调集. GuoheView 不用 user
+ * handler, 这次不拆 per-server, 简化 ABI. */
+static UiDebugCommandHandler                     g_userHandler     = nullptr;
+static void*                                     g_userHandlerData = nullptr;
+static std::mutex                                g_handlerMu;
 
 static std::string DispatchOnce(UiWindow win, const std::string& head,
                                 const std::string& rest) {
@@ -579,9 +677,9 @@ static std::string DispatchOnce(UiWindow win, const std::string& head,
     UiDebugCommandHandler cb = nullptr;
     void* cbData = nullptr;
     {
-        std::lock_guard<std::mutex> lk(g_state.handlerMu);
-        cb = g_state.userHandler;
-        cbData = g_state.userHandlerData;
+        std::lock_guard<std::mutex> lk(g_handlerMu);
+        cb = g_userHandler;
+        cbData = g_userHandlerData;
     }
     if (cb) {
         char buf[8192];
@@ -597,37 +695,38 @@ static std::string DispatchOnce(UiWindow win, const std::string& head,
     return errJson("unknown command: " + head + "  (send 'help' for list)");
 }
 
-static void PipeWorker(UiWindow win, std::string pipeName) {
-    std::string fullName = "\\\\.\\pipe\\" + pipeName;
-    while (!g_state.shutdown.load()) {
+static void PipeWorker(ServerEntry* self) {
+    std::string fullName = "\\\\.\\pipe\\" + self->pipeName;
+    UiWindow win = self->win;
+    while (!self->shutdown.load()) {
         HANDLE pipe = CreateNamedPipeA(
             fullName.c_str(),
             PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
             1, 65536, 65536, 0, NULL);
         if (pipe == INVALID_HANDLE_VALUE) break;
-        g_state.pipe = pipe;
+        self->pipe = pipe;
 
-        OVERLAPPED ov = {}; ov.hEvent = g_state.event;
-        ResetEvent(g_state.event);
+        OVERLAPPED ov = {}; ov.hEvent = self->event;
+        ResetEvent(self->event);
         BOOL connected = ConnectNamedPipe(pipe, &ov);
         if (!connected) {
             DWORD err = GetLastError();
             if (err == ERROR_IO_PENDING) {
-                WaitForSingleObject(g_state.event, INFINITE);
-                if (g_state.shutdown.load()) {
+                WaitForSingleObject(self->event, INFINITE);
+                if (self->shutdown.load()) {
                     CancelIo(pipe); CloseHandle(pipe); break;
                 }
             } else if (err != ERROR_PIPE_CONNECTED) {
                 CloseHandle(pipe); continue;
             }
         }
-        if (g_state.shutdown.load()) { CloseHandle(pipe); break; }
+        if (self->shutdown.load()) { CloseHandle(pipe); break; }
 
         char buf[4096] = {};
         DWORD bytesRead = 0;
         if (ReadFile(pipe, buf, sizeof(buf) - 1, &bytesRead, NULL) && bytesRead > 0) {
-            if (g_state.shutdown.load()) { CloseHandle(pipe); break; }
+            if (self->shutdown.load()) { CloseHandle(pipe); break; }
             buf[bytesRead] = 0;
             while (bytesRead > 0 && (buf[bytesRead - 1] == '\n' || buf[bytesRead - 1] == '\r')) {
                 buf[--bytesRead] = 0;
@@ -659,7 +758,19 @@ static void PipeWorker(UiWindow win, std::string pipeName) {
         DisconnectNamedPipe(pipe);
         CloseHandle(pipe);
     }
-    g_state.pipe = INVALID_HANDLE_VALUE;
+    self->pipe = INVALID_HANDLE_VALUE;
+}
+
+/* 共享停止逻辑 — 给定 entry 走完整的 shutdown 流程 (set flag → 唤醒
+ * accept → cancel pending IO → join → close handles). Caller 在锁外 join,
+ * 避免 worker invoke_sync 回 UI 线程跟主线程 stop 自己 deadlock —
+ * invoke_sync 是同步等待. */
+static void StopEntry(std::unique_ptr<ServerEntry> entry) {
+    entry->shutdown.store(true);
+    if (entry->event) SetEvent(entry->event);
+    if (entry->pipe != INVALID_HANDLE_VALUE) CancelIoEx(entry->pipe, NULL);
+    if (entry->thread.joinable()) entry->thread.join();
+    if (entry->event) { CloseHandle(entry->event); entry->event = nullptr; }
 }
 
 }  // namespace ui::debug
@@ -672,41 +783,73 @@ extern "C" {
 
 UI_API int ui_debug_server_start(UiWindow win, const char* pipe_name) {
     using namespace ui::debug;
-    if (g_state.thread.joinable()) return -2;  // already running
     if (!ui::GetContext().GetWindow(win)) return -1;
+    std::string name = (pipe_name && *pipe_name) ? pipe_name : "ui_core_debug";
 
-    g_state.win = win;
-    g_state.pipeName = (pipe_name && *pipe_name) ? pipe_name : "ui_core_debug";
-    g_state.shutdown.store(false);
-    g_state.event = CreateEventA(NULL, TRUE, FALSE, NULL);
-    if (!g_state.event) return -3;
+    std::lock_guard<std::mutex> lk(g_serversMu);
+    /* 同 pipe_name 已注册 → 拒绝 (返 -2 跟旧 single-server 行为一致). */
+    for (auto& e : g_servers) {
+        if (e->pipeName == name) return -2;
+    }
 
-    g_state.thread = std::thread(ui::debug::PipeWorker, win, g_state.pipeName);
+    auto entry = std::make_unique<ServerEntry>();
+    entry->win      = win;
+    entry->pipeName = name;
+    entry->shutdown.store(false);
+    entry->event    = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if (!entry->event) return -3;
+
+    /* 必须先把 entry 移入 vector, raw ptr 才能稳定: unique_ptr 的 heap
+     * 分配本身不动, vector 重排只动 unique_ptr 容器. 但 thread 启动
+     * 后引用的是 entry.get() 即 heap 上 ServerEntry, vector 怎么动都不
+     * 影响 worker. 启动前先 emplace_back. */
+    ServerEntry* raw = entry.get();
+    g_servers.push_back(std::move(entry));
+    raw->thread = std::thread(ui::debug::PipeWorker, raw);
     return 0;
 }
 
 UI_API void ui_debug_server_stop(void) {
     using namespace ui::debug;
-    if (!g_state.thread.joinable()) return;
-    g_state.shutdown.store(true);
-    if (g_state.event) SetEvent(g_state.event);
-    if (g_state.pipe != INVALID_HANDLE_VALUE) CancelIoEx(g_state.pipe, NULL);
-    g_state.thread.join();
-    if (g_state.event) { CloseHandle(g_state.event); g_state.event = nullptr; }
-    g_state.pipeName.clear();
-    g_state.win = 0;
+    std::vector<std::unique_ptr<ServerEntry>> drained;
     {
-        std::lock_guard<std::mutex> lk(g_state.handlerMu);
-        g_state.userHandler = nullptr;
-        g_state.userHandlerData = nullptr;
+        std::lock_guard<std::mutex> lk(g_serversMu);
+        drained.swap(g_servers);
     }
+    /* 在锁外 join, 防止 worker 内 invoke_sync 死锁. */
+    for (auto& e : drained) StopEntry(std::move(e));
+    drained.clear();
+    /* userHandler 清掉, 跟旧 single-server stop 语义一致. */
+    {
+        std::lock_guard<std::mutex> lk(g_handlerMu);
+        g_userHandler = nullptr;
+        g_userHandlerData = nullptr;
+    }
+}
+
+UI_API void ui_debug_server_stop_named(const char* pipe_name) {
+    using namespace ui::debug;
+    if (!pipe_name || !*pipe_name) return;
+    std::string name(pipe_name);
+    std::unique_ptr<ServerEntry> drained;
+    {
+        std::lock_guard<std::mutex> lk(g_serversMu);
+        for (auto it = g_servers.begin(); it != g_servers.end(); ++it) {
+            if ((*it)->pipeName == name) {
+                drained = std::move(*it);
+                g_servers.erase(it);
+                break;
+            }
+        }
+    }
+    if (drained) ui::debug::StopEntry(std::move(drained));
 }
 
 UI_API void ui_debug_server_set_handler(UiDebugCommandHandler cb, void* userdata) {
     using namespace ui::debug;
-    std::lock_guard<std::mutex> lk(g_state.handlerMu);
-    g_state.userHandler = cb;
-    g_state.userHandlerData = userdata;
+    std::lock_guard<std::mutex> lk(g_handlerMu);
+    g_userHandler = cb;
+    g_userHandlerData = userdata;
 }
 
 }  // extern "C"

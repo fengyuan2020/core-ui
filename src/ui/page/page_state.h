@@ -187,8 +187,34 @@ private:
     std::unordered_map<std::string, LifecycleHook> lifecycleHooks_;
 
     // ---- Menus ----
+    /* Build 73 (L17) reactive: WireSubtreeMenus 给每个 ContextMenu 注册
+     * beforeShowHook -> PopulateMenu(menu, compiled). Show 入口先 Clear()
+     * 再 PopulateMenu, 按当前 JS state 重 build items.
+     * locals: v-for 里嵌套 menuitem 时的 (iter, idx) 变量名 + value pairs,
+     *         空 vector 表示顶层 (无 loop scope). */
+    void PopulateMenu(ContextMenu* menu, const CompiledMenu& cm,
+                       const std::vector<std::pair<std::string, JSValue>>& locals);
+    void PopulateMenuItem(ContextMenu* menu, const CompiledMenuItem& mi,
+                           const std::vector<std::pair<std::string, JSValue>>& locals,
+                           ui::Renderer* renderer);
+    /* Eval bound expr against jsState_ + optional loop-scope locals.
+     * 调用方 JS_FreeValue 返回值. 失败/无 JS state 返 JS_UNDEFINED. */
+    JSValue EvalBoundExpr(const std::string& rawExpr,
+                           const std::vector<std::pair<std::string, JSValue>>& locals);
+    /* helpers: 把 EvalBoundExpr 的 JSValue 拿成具体类型. 返回时 JS_FreeValue
+     * 已处理. */
+    bool        EvalBool(const std::string& expr,
+                          const std::vector<std::pair<std::string, JSValue>>& locals,
+                          bool defaultVal);
+    std::string EvalString(const std::string& expr,
+                            const std::vector<std::pair<std::string, JSValue>>& locals);
+
     std::vector<std::shared_ptr<ContextMenu>> menus_;
     std::unordered_map<std::string, ContextMenu*> menuById_;
+    /* Build 73 (L17): CompiledMenu* → ContextMenu* 映射. PopulateMenuItem
+     * 碰到 mi.submenu 时通过它找到对应的持久 ContextMenu (submenu shell 在
+     * WireSubtreeMenus 时已建好, 每次 parent rebuild 用同一个 sub 句柄). */
+    std::unordered_map<const CompiledMenu*, ContextMenu*> compiledToMenu_;
     struct TriggerSpec {
         Widget*      triggerElement = nullptr;
         ContextMenu* menu = nullptr;

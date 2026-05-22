@@ -119,6 +119,13 @@ public:
     /* 打开一个动图（目前仅 GIF）。返回 nullptr 表示非动画或失败。 */
     std::unique_ptr<AnimatedPlayer> OpenAnimatedImage(const std::wstring& path);
     ComPtr<ID2D1Bitmap> CreateBitmapFromPixels(const void* pixels, int width, int height, int stride);
+    /* 跟 CreateBitmapFromPixels 一样, 但接收 straight (non-premultiplied) alpha
+       BGRA — 内部做 RGB *= A/255 转 premul 再创建 D2D bitmap. 适合直接从 PNG/
+       JPEG 解码器拿到的 BGRA (ghde / WIC GUID_WICPixelFormat32bppBGRA / libpng
+       / stb_image 等). 不这么做的话, straight 字节被 D2D PREMULTIPLIED bitmap
+       按 premul 公式渲染, 抗锯齿边缘 (alpha 中间值) 颜色被错误广播 → chroma
+       fringe (透明 PNG 大倍率放大尤其明显). */
+    ComPtr<ID2D1Bitmap> CreateBitmapFromPixelsStraight(const void* pixels, int width, int height, int stride);
     ComPtr<ID2D1Bitmap> CreateEmptyBitmap(int width, int height);
     /* HICON → D2D 位图。用于把 EXE 嵌入的图标资源 / Win32 加载的图标转成
        D2D 可绘制位图。caller 仍持有 HICON 所有权，函数内不 DestroyIcon。 */

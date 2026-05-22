@@ -12,13 +12,13 @@
 
 UIs are best described in **`.uix` single-file components** — Vue 3 SFC style (`<window>` + `<script>` + `<style>` + `<template>`) with reactive bindings, computed / methods, `v-if` / `v-for` / `v-model` / `@click`, a CSS subset, and CSS-variable theming. Scripts are evaluated in-process by an embedded **QuickJS-NG** runtime — no DOM, no Webview. The project is also purpose-built for **AI-driven development**: a single self-contained cheatsheet ([`docs/uix-ai-guide.md`](./docs/uix-ai-guide.md)) lets an LLM read it once and emit a complete, runnable app, turning "describe what you want" into "see it running" in a single loop.
 
-> **An 8.4 MB single DLL that ships Office / VS Code-grade UI on Windows.**
+> **A 3.0 MB single DLL that ships Office / VS Code-grade UI on Windows.**
 > No Chromium. No .NET. No 40 MB of Qt DLLs and moc/uic preprocessors. One C header, one `.uix` single-file component — done.
 
-![version](https://img.shields.io/badge/version-1.5.0.42-blue)
+![version](https://img.shields.io/badge/version-1.6.0.112-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![platform](https://img.shields.io/badge/platform-Windows%2010%2B-lightgrey)
-![size](https://img.shields.io/badge/dll-8.4MB-brightgreen)
+![size](https://img.shields.io/badge/dll-3.0MB-brightgreen)
 ![api](https://img.shields.io/badge/C%20API-250%2B-orange)
 ![script](https://img.shields.io/badge/script-QuickJS--NG-purple)
 
@@ -26,7 +26,7 @@ UIs are best described in **`.uix` single-file components** — Vue 3 SFC style 
 
 | Dimension | Electron | WPF / WinUI 3 | Qt | **Core UI** |
 |-----------|----------|---------------|-----|-------------|
-| **Distribution size** | 100+ MB | needs .NET runtime | 40+ MB Qt DLLs | **8.4 MB single DLL** |
+| **Distribution size** | 100+ MB | needs .NET runtime | 40+ MB Qt DLLs | **3.0 MB single DLL** |
 | **Startup time** | 1–3 s | 0.5–1 s | 0.5–1 s | **< 200 ms** |
 | **Memory footprint** | 150+ MB | 80+ MB | 60+ MB | **< 30 MB** |
 | **Language bindings** | JS only | .NET only | C++ only | **C ABI, any language** |
@@ -94,11 +94,90 @@ Constraints:
   5. Template events: @click / @change / @input / @focus / @blur / @mousedown / @wheel ...
 ```
 
+## 🆕 What's New in 1.6.0 (since the v1.5.0 public release)
+
+1.6.0 consolidates 65 internal builds of capability extensions and bug fixes since
+the v1.5.0 public release (build 46). Full per-build history lives in
+[CHANGELOG.md](./CHANGELOG.md).
+
+### New capability — Widget-level event callbacks (the full set)
+
+Previously only prebuilt widgets like `button` / `input` could receive `onclick`.
+1.6.0 opens up event callbacks to **any widget** — including custom-drawn
+`<custom>` widgets — so user-drawn controls behave like first-class citizens:
+
+```c
+ui_widget_on_mouse_move (w, on_move,  ctx);   // widget-local coordinates
+ui_widget_on_mouse_leave(w, on_leave, ctx);
+ui_widget_on_mouse_wheel(w, on_wheel, ctx);   // generic, not just ScrollView
+ui_widget_on_focus      (w, on_focus, ctx);   // pair with ui_custom_set_focusable
+ui_widget_on_blur       (w, on_blur,  ctx);
+ui_widget_set_cursor    (w, "hand");          // hand / wait / size-* / IDC_*
+```
+
+### New capability — Reactive menu system (rewrite)
+
+`<menu>` is now fully reactive, Vue 3 style — wires through `data()` state:
+
+```vue
+<menu trigger="#tree-item" event="rclick">
+  <menuitem v-for="cmd in commands" :key="cmd.id"
+            :disabled="!cmd.enabled" @click="run(cmd)">
+    <label>{{ cmd.label }}</label>
+  </menuitem>
+  <separator/>
+  <menuitem v-if="isAdmin" @click="del"><label>Delete</label></menuitem>
+</menu>
+```
+
+- rclick dispatch is now **deepest-match**: nested `<menu trigger>` blocks no
+  longer let an ancestor steal the child widget's menu — matching DOM event
+  bubbling semantics
+- submenu autoclose uses the visible rect; arrow is now an outline glyph; widths
+  align with the parent menu
+
+### New capability — Window lifecycle / zero-flash first frame
+
+- `ui_page_prepare_window` — hidden window + RT pre-creation, zero black flash on first frame
+- `UiWindowConfig.start_maximized` — persisted "maximized close → maximized open" with no 1-frame normal flash
+- `UiWindowConfig::owner` — child window attached to main window (no separate taskbar entry, follows parent minimize)
+- `ui_debug_server` supports multiple servers concurrently, one pipe per window (great for main + settings windows side-by-side debugging)
+
+### Misc additions
+
+- `:id="..."` dynamic binding (finally usable for `v-for` unique ids)
+- `ui_toast_ex(anim = UI_TOAST_ANIM_FADE)` — pure fade in/out style; toasts in the center position no longer "pop in" instantly
+- `ui_window_dpi_scale` — generic helper
+
+### Bug fixes from real-world feedback
+
+**ScrollView three-fix combo:**
+- `<ScrollView>` wrapping multiple v-if/v-for panels misbehaved → always wrap children in a VBox and patch v-if/v-for `parentWidget`
+- CSS `padding` on ScrollView used to be a no-op → `DoLayout` now subtracts padL/padT/padR/padB
+- Frameless window's bottom edge couldn't be dragged to resize → NC hit-test now matches left/right/top (always HTBOTTOM)
+
+**Other notable fixes:**
+- `PushRoundedClip` initialized with `INITIALIZE_FOR_CLEARTYPE` to prevent ClearType text disappearing inside layers
+- SVG presentation attrs (`stroke` / `fill` / `stroke-width`) now inherit from parent to children
+- LabelWidget honors CSS `line-height` (default 1.3 × font-size) and `white-space: nowrap`
+- Toggle ON-state thumb in dark mode is now white instead of an invisible black
+- WM_KEYDOWN onKey self-destruct path no longer falls through into UAF
+
+### 💥 BREAKING (must read when upgrading from 1.5.0)
+
+| Change | Old | New |
+|---|---|---|
+| menuitem became a widget template | `<menuitem>X</menuitem>` | `<menuitem><label>X</label></menuitem>` |
+| Window geometry API: x/y now screen px | DIP / screen mixed | x/y/w/h all screen px; pair with `ui_window_dpi_scale` |
+| `ui_toast_ex` added `anim` parameter | `ui_toast_ex(win,t,d,pos,icon)` | `ui_toast_ex(win,t,d,pos,icon, UI_TOAST_ANIM_SLIDE)` |
+| `ui_toast_at` removed | `ui_toast_at(win,t,d,pos)` | `ui_toast_ex(win,t,d,pos,0,UI_TOAST_ANIM_SLIDE)` |
+| `WireMenus` static helper removed | `WireMenus(...)` auto-wire | use `<menu>` declarative + Vue 3 binding |
+
 ## ✨ Core Features
 
 ### 🚀 Ridiculously small, absurdly fast
 
-- **8.4 MB full DLL**, or a **~1 MB statically-linked exe** — it fits on a USB stick
+- **3.0 MB full DLL**, or a **~2 MB statically-linked exe** — it fits on a USB stick
 - **Direct2D + Direct3D 11** full hardware acceleration, Per-Monitor DPI V2 out of the box
 - **Cold start < 200 ms** — click and the window is already there
 
@@ -174,6 +253,21 @@ ui_page_destroy(page);
 - Rust / Go / Python / C# / Delphi / Pascal / Lua can all bind directly
 - The Page API (`ui_page_*`) is purpose-built for `.uix`; the lower-level widget factories (`ui_vbox`, `ui_button`, ...) remain for fully procedural construction
 
+### ⚡ Widget-level event callbacks — custom widgets handle the full set (new in 1.6.0)
+
+Any widget (including custom-drawn `<custom>` widgets) can now receive event
+callbacks the same way built-in controls do — no more "only button/input can
+receive onclick":
+
+```c
+ui_widget_on_mouse_move (w, on_move,  ctx);   // widget-local coordinates
+ui_widget_on_mouse_leave(w, on_leave, ctx);
+ui_widget_on_mouse_wheel(w, on_wheel, ctx);   // generic, not just ScrollView
+ui_widget_on_focus      (w, on_focus, ctx);   // pair with ui_custom_set_focusable
+ui_widget_on_blur       (w, on_blur,  ctx);
+ui_widget_set_cursor    (w, "hand");          // hand / wait / size-* / IDC_*
+```
+
 ### 🔍 Automation / debugging: controls are programmable
 
 Shipped in 1.1.0: a full **`ui_debug_*` event-injection API** — drive any control
@@ -193,6 +287,7 @@ ui_debug_type_text(win, L"hello");           // per-character keyboard input
   per-widget high-level ops, submenu path click, HWND `PostMessage` channel, etc.
 - Built-in **Named Pipe IPC** (`\\.\pipe\ui_core_debug`) with 45+ commands —
   drive from PowerShell / Python in one line; start with `ui_debug_server_start(win, NULL)`
+- **Golden-image regression**: `golden_runner.exe` renders `demo/golden/*.uix` to PNG and diffs against `*.expected.png`
 - **Thread-safety helper** `ui_window_invoke_sync` marshals calls from worker threads onto the UI thread
 - Full reference in **[`docs/debug-simulation.md`](./docs/debug-simulation.md)**
 
@@ -200,8 +295,8 @@ ui_debug_type_text(win, L"hello");           // per-character keyboard input
 
 | Metric | Value |
 |--------|-------|
-| `core-ui.dll` size (full feature) | **8.4 MB** |
-| `ui-demo-uix.exe` size (static link) | **~1 MB** |
+| `core-ui.dll` size (full feature) | **3.0 MB** |
+| `ui-demo-uix.exe` size (static link) | **~2 MB** |
 | Empty window memory | **< 30 MB** |
 | Cold start to first frame | **< 200 ms** |
 | 60 fps animation CPU usage | **< 3%** |
@@ -220,14 +315,13 @@ ui_debug_type_text(win, L"hello");           // per-character keyboard input
 
 ### Build
 
-Open a **Visual Studio Developer Command Prompt** (or source `vcvars64.bat`
-first), then:
+Builds must be invoked from PowerShell using the bundled script (it sets up
+vcvars64 and routes around a Windows SDK rc.exe hang in ninja subprocesses by
+swapping in llvm-rc):
 
-```bash
-git clone https://github.com/ghboke/core-ui.git
-cd core-ui
-cmake -B build -G Ninja
-cmake --build build --target core-ui
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File scripts/build-clang-cl.ps1 -Target core-ui
 ```
 
 Common targets:
@@ -237,19 +331,15 @@ Common targets:
 | `core-ui` | `core-ui.dll` + `core-ui.lib` import library (default) |
 | `core-ui-static` | `core-ui-static.lib` self-contained static archive (bundles QuickJS) |
 | `ui-demo-uix` | `ui-demo-uix.exe` single-file demo (resources baked in) |
+| `golden_runner` | `golden_runner.exe` golden-image regression runner |
 
-Omit `--target` to build everything. The Visual Studio 17 2022 generator works too:
+Pass `-Clean` to rebuild the build directory from scratch; omit `-Target` to build everything.
 
-```bash
-cmake -B build -G "Visual Studio 17 2022" -A x64
-cmake --build build --config Release
-```
+Single-exe distribution (no DLL dependency):
 
-Single-exe distribution (no DLL dependency — QuickJS and all sources statically linked into the exe):
-
-```bash
-cmake -B build -G Ninja -DUI_CORE_STATIC=ON
-cmake --build build
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File scripts/build-clang-cl.ps1 -Target core-ui -Static
 ```
 
 ### Hello World
@@ -324,52 +414,6 @@ ui_page_load_language_string(page, "zh", k_lang_zh);
 
 `demo/ui_demo_uix.cpp` is the smallest complete example of this pattern (57 lines of glue + a single `.uix` file with 12 demo pages).
 
-### 🛠️ Troubleshooting
-
-#### 1. ninja appears to hang at the link / resource-compile step (Windows SDK rc.exe bug)
-
-**Symptoms**: build looks frozen, CPU is idle. Inspect
-`build/CMakeFiles/<target>.dir/CMakeFiles/<target>-version.rc.res` — it's
-**0 bytes** with a ~9 KB `RCa*` temp file next to it. `tasklist` shows
-`cmake.exe` + `rc.exe` running with constant memory.
-
-**Cause**: certain Windows SDK builds of `rc.exe` deadlock when invoked from a
-ninja subprocess.
-
-**Fix**: tell cmake to use LLVM's `llvm-rc.exe` instead of the system `rc.exe`:
-
-```bash
-# Find llvm-rc.exe — usually shipped with LLVM / clang-cl
-where llvm-rc
-
-cmake -B build -G Ninja -DCMAKE_RC_COMPILER=C:/path/to/llvm-rc.exe
-```
-
-#### 2. `cmake -B build` errors with `core-ui only supports MSVC / clang-cl`
-
-**Cause**: cmake didn't detect the MSVC toolchain — almost always because the
-shell was started without vcvars.
-
-**Fix**:
-
-- Open a **Visual Studio Developer Command Prompt**, or
-- In a plain cmd, run first:
-  `"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"`
-  (adjust the path for your installed VS edition).
-
-#### 3. Static link fails with ~50 unresolved `JS_*` symbols
-
-**Symptoms**: linking against `core-ui-static.lib` reports
-`unresolved external __imp_JS_*` for ~50 symbols.
-
-**Cause**: `core-ui-static.lib` doesn't bundle QuickJS. The fat archive that
-**does** bundle it is produced by the install target:
-
-```bash
-cmake --build build --target release-package
-# Output: release/core-ui-vX.Y.Z/lib/static/core-ui.lib
-```
-
 ## 🧩 Built-in Tags / Controls
 
 Tags inside `.uix` templates map directly to native widgets:
@@ -407,7 +451,7 @@ var(--sidebar-hover) / var(--border-subtle)
 
 ## 🔢 Versioning
 
-Version format: `MAJOR.MINOR.PATCH.BUILD` (currently `1.5.0.42`)
+Version format: `MAJOR.MINOR.PATCH.BUILD` (currently `1.6.0.112`)
 
 - Compile-time macros: `UI_CORE_VERSION_MAJOR/MINOR/PATCH/BUILD` + `UI_CORE_VERSION_STRING`
 - Runtime API:
@@ -416,11 +460,11 @@ Version format: `MAJOR.MINOR.PATCH.BUILD` (currently `1.5.0.42`)
 int major, minor, patch;
 ui_core_version(&major, &minor, &patch);   // 1, 5, 0
 int build = ui_core_version_build();        // 42
-const char* v = ui_core_version_string();   // "1.5.0.42"
+const char* v = ui_core_version_string();   // "1.6.0.112"
 ```
 
-- Windows DLL properties (right-click `core-ui.dll` → Properties → Details) show `FileVersion 1.5.0.42`
-- Full release history on the GitHub [Releases](https://github.com/ghboke/core-ui/releases) page
+- Windows DLL properties (right-click `core-ui.dll` → Properties → Details) show `FileVersion 1.6.0.112`
+- Full release history in [CHANGELOG.md](./CHANGELOG.md)
 
 ## 📁 Project Layout
 
@@ -449,18 +493,16 @@ core-ui/
 ├── demo/
 │   ├── ui_demo.uix       # 12-page SFC demo
 │   ├── ui_demo_uix.cpp   # 60 lines of glue + locale poll
-│   └── lang/             # zh / en language packs
+│   ├── lang/             # zh / en language packs
+│   ├── golden/           # Golden-image regression cases
+│   └── golden_runner.cpp # Render-and-diff runner
 ├── docs/                 # Documentation
+├── scripts/              # build-clang-cl.ps1 etc.
 ├── cmake/                # UiCoreHelpers.cmake (embed_text)
-├── website/              # Docs site (Vite + React) — published to GitHub Pages
-├── .github/workflows/    # GitHub Actions (Pages deployment)
+├── test/                 # Unit tests
 ├── CMakeLists.txt
-├── LICENSE
-├── README.md / README-en.md
-├── UI_CORE_API.md
-├── VERSION / version.json
-├── llms.txt
-└── logo.svg
+├── VERSION
+└── CHANGELOG.md
 ```
 
 ## 📚 Documentation

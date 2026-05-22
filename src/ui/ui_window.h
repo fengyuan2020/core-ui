@@ -33,7 +33,8 @@ public:
     bool Create(const wchar_t* title, int width, int height,
                 bool borderless, bool resizable, bool acceptFiles,
                 int x = CW_USEDEFAULT, int y = CW_USEDEFAULT,
-                bool toolWindow = false);
+                bool toolWindow = false,
+                HWND ownerHwnd = nullptr);  /* Build 65+ (L14) */
     void Show();
     void ShowImmediate();  /* 跳过开场动画 */
     void SetIconFromPixels(const uint8_t* rgba, int w, int h);
@@ -76,7 +77,8 @@ public:
     // Toast notification
     // position: 0=top, 1=center, 2=bottom
     // icon: 0=none, 1=success(green✓), 2=error(red✕), 3=warning(yellow⚠)
-    void ShowToast(const std::wstring& text, int durationMs = 2000, int position = 0, int icon = 0);
+    // anim: 0=slide(默认, 旧行为), 1=fade(纯渐入渐出, y 不变)
+    void ShowToast(const std::wstring& text, int durationMs = 2000, int position = 0, int icon = 0, int anim = 0);
     void DrawToast(Renderer& r);
 
     static bool RegisterWindowClass();
@@ -86,6 +88,10 @@ public:
     void LayoutRoot();
     WidgetPtr Root() const { return root_; }
     bool skipOpenAnimation_ = false;
+    /* Build 105+ (L25): config.start_maximized 状态. ui_window_create 拷,
+     * Show / ShowImmediate 消费一次 (走 SW_SHOWMAXIMIZED 路径) 后清零, 不
+     * 残留影响后续 ShowWindow(SW_HIDE)+Show() 循环. */
+    bool startMaximizedPending_ = false;
 
     // Public so Context::UpdateAnimTimers can fire it after a binding
     // application flips a widget into animating_=true outside an event handler.
@@ -146,10 +152,15 @@ private:
     int   toastPos_ = 0;       // 0=top, 1=center, 2=bottom
     int   toastPhase_ = 0;     // 0=idle, 1=slideIn, 2=hold, 3=slideOut
     int   toastIcon_ = 0;     // 0=none, 1=success, 2=error, 3=warning
+    int   toastAnim_ = 0;     // 0=slide(旧行为), 1=fade(纯透明度过渡, y 不变)
     UINT_PTR toastTimerId_ = 0;
     bool  toastFading_ = false;
     int   holdDurationMs_ = 2000;
-    int   holdElapsed_ = 0;
+    int   holdElapsed_ = 0;        /* deprecated, kept for ABI 兼容; 新代码用 toastShownTick_ */
+    /* Build 68+ (L18): toast 动画起点, time-based 推进, 防 WM_TIMER 合并 tick 时
+     * 进度卡顿. ShowToast 时记一次 GetTickCount64, tick handler 用 now-shown 算
+     * phase + slide. */
+    uint64_t toastShownTick_ = 0;
 
     bool        startupRevealPending_ = false;
     bool        startupRevealPosted_ = false;
@@ -231,6 +242,7 @@ public:
     void SetWindowSize(int wDip, int hDip);             /* 保持位置不变 */
     void SetWindowPosition(int xScreen, int yScreen);   /* 保持尺寸不变 */
     void GetWindowRectScreen(int* x, int* y, int* wDip, int* hDip) const;
+    int  Dpi() const;                                   /* GetDpiForWindow 值, 96/120/144/... */
     /* 以 client(ax_dip, ay_dip) 点与屏幕(sx, sy) 对齐的方式 resize。 */
     void ResizeWithAnchor(int wDip, int hDip,
                           float anchorClientXDip, float anchorClientYDip,

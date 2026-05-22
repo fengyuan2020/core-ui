@@ -77,20 +77,57 @@ typedef struct UiRect {
 /* ------------------------------------------------------------------ */
 /* Window configuration                                               */
 /* ------------------------------------------------------------------ */
+/* IMPORTANT — 单位语义 (build 92+ 文档化):
+ *
+ * 所有窗口几何字段 (width / height / x / y) + ui_window_set_size /
+ * ui_window_set_min_size 的参数, 单位都是 **DIP** (device-independent pixel,
+ * 1/96 inch), 跟 CSS / Win32 GDI / WPF 的 "logical pixel" 一致.
+ *
+ * 物理像素换算: phys = dip × monitor_dpi ÷ 96
+ *   - 100% 缩放 (96 DPI):  width=400 → 400 物理 px
+ *   - 125% 缩放 (120 DPI): width=400 → 500 物理 px
+ *   - 150% 缩放 (144 DPI): width=400 → 600 物理 px
+ *   - 200% 缩放 (192 DPI): width=400 → 800 物理 px
+ *
+ * 同款语义适用于 .uix `<window width="..." height="..." x="..." y="...">`
+ * 属性. 想要 "在 1.5x 屏看上去 425 物理 px 宽" 的窗口, 应该填
+ * 425 × 96/144 ≈ 283.
+ *
+ * 这跟 CSS 的 px 单位完全一致 (CSS 1px = 1 reference pixel = 1/96 inch),
+ * 不是 raw screen pixel. */
 typedef struct UiWindowConfig {
     const wchar_t* title;
-    int width;
-    int height;
+    int width;          /* DIP — 见结构体顶部 "单位语义" 注释 */
+    int height;         /* DIP */
     int system_frame;   /* 0 (default) = borderless custom chrome, 1 = system title bar */
     int resizable;      /* 1 = WS_THICKFRAME */
     int accept_files;   /* 1 = WS_EX_ACCEPTFILES */
-    int x;              /* 窗口初始 x 坐标，0 = 屏幕居中 */
-    int y;              /* 窗口初始 y 坐标，0 = 屏幕居中 */
+    int x;              /* 屏幕物理像素 (Win32 惯例). x=0 且 y=0 → 屏幕居中.
+                           build 94+ L23: 之前是 DIP, 跟 set_position / set_rect
+                           的 screen-px 输入不自洽, 改齐. 持久化 DPI-stable 位置
+                           用 ui_window_dpi() 自己 MulDiv. */
+    int y;              /* 屏幕物理像素. 见上. */
     int tool_window;    /* 1 = 工具窗口（不在任务栏显示图标） */
     int skip_animation; /* 1 = 跳过开场动画（文件关联打开时用，加速首次显示） */
     const void* icon_pixels; /* RGBA 像素数据（32bpp），NULL = 默认图标 */
     int icon_width;          /* 图标宽度 */
     int icon_height;         /* 图标高度 */
+    /* Build 65+ (L14): owner 窗口 handle. 0 = 顶级窗口 (默认). 非 0 时新窗口
+     * 附属于该 UiWindow — Z-order 在 owner 之上, owner 最小化 / 关闭时跟随,
+     * 不在 Alt+Tab / taskbar 单独显示一项 (lib 内部会撤掉 WS_EX_APPWINDOW
+     * ex style). Win32 owner 关系是顶级窗口之间的生命周期绑定, 不是 child
+     * window (child window 会限制在父窗矩形里 — 不是这里的语义). 适合设置
+     * 对话框 / 偏好窗 / 子工具窗附属于主窗口. */
+    UiWindow owner;
+    /* Build 105+ (L25): 1 = 首帧即 maximized 态; 0 (default) = normal.
+     * 持久化"最大化关 → 最大化开"用. caller 自己在 Create 后调
+     * ShowWindow(SW_MAXIMIZE) 会跟 lib 内部 layered fade-in / SW_HIDE 时序
+     * 撞车出 1 帧 normal → max 闪烁, 用这个 hint 让 lib 内部走现有的
+     * preMaximized 路径 (Show / ShowImmediate 都识别) 一次到位.
+     *
+     * x/y/width/height 在 start_maximized=1 时仍要填 — 那是用户双击 titlebar
+     * 还原后的位置/尺寸, lib 不会丢弃. */
+    int start_maximized;
 } UiWindowConfig;
 
 /* ------------------------------------------------------------------ */
@@ -126,6 +163,12 @@ UI_API void     ui_window_invalidate(UiWindow win);
 UI_API void     ui_window_relayout(UiWindow win);
 UI_API void*    ui_window_hwnd(UiWindow win);   /* returns HWND */
 
+/* DPI 比例 = 当前显示器 DPI / 96. 100% 缩放 → 1.0, 125% → 1.25, 150% → 1.5.
+ * 用于把"屏幕物理像素 vs DIP/logical 像素"换算. 例如 1:1 zoom 语义 (image
+ * pixel = screen physical pixel) 在 PMv2 + SetDpi(144) 环境下需要
+ * ui_gh_img_view_set_zoom(canvas, 1.0f / ui_window_dpi_scale(win)) 才正确. */
+UI_API float    ui_window_dpi_scale(UiWindow win);
+
 /* ------------------------------------------------------------------ */
 /* Window callbacks                                                   */
 /* ------------------------------------------------------------------ */
@@ -139,22 +182,41 @@ typedef void (*UiWindowKeyCallback)(UiWindow win, int vk_code, void* userdata);
 /* ------------------------------------------------------------------ */
 typedef uint64_t UiMenu;
 
+/* BREAKING (build 75 / L17 follow-up): menu 改为 widget-template 模型 ——
+ * 老的 ui_menu_add_item / add_item_ex / add_submenu(text, sub) imperative
+ * 构造路径全删. 菜单只能通过声明式 .uix `<menu>` `<menuitem>` 声明, lib
+ * PageState 内部按 widget tree 实例化. 保留下面的 lifecycle / 视觉 API
+ * 供 imperative show + 全局视觉 tweak 用. */
 UI_API UiMenu   ui_menu_create(void);
 UI_API void     ui_menu_destroy(UiMenu menu);
-UI_API void     ui_menu_add_item(UiMenu menu, int id, const wchar_t* text);
-UI_API void     ui_menu_add_item_ex(UiMenu menu, int id, const wchar_t* text,
-                                     const wchar_t* shortcut, const char* svg);
 UI_API void     ui_menu_add_separator(UiMenu menu);
-UI_API void     ui_menu_add_submenu(UiMenu menu, const wchar_t* text, UiMenu submenu);
 UI_API void     ui_menu_set_enabled(UiMenu menu, int id, int enabled);
 UI_API void     ui_menu_set_bg_color(UiMenu menu, UiColor color);
+/* Build 69+ (L19): 单菜单圆角半径覆盖. <0 = 用 lib 默认 (10.0). 影响 shadow
+ * + card bg. hover item highlight (6px) 不动 — 它是 item 级视觉, 不属于
+ * 容器圆角范畴. submenu 单独设, 不继承父菜单. */
+UI_API void     ui_menu_set_corner_radius(UiMenu menu, float radius);
 UI_API void     ui_menu_show(UiWindow win, UiMenu menu, float x, float y);
 UI_API void     ui_menu_close(UiWindow win);
 
-/* Toast notification (bottom-center, auto-fade) */
+/* Toast notification (auto-dismiss)
+ *
+ * 简单入口 ui_toast: 顶部 + slide-in/out + 无图标, 覆盖 95% 场景.
+ * 完整入口 ui_toast_ex: position (0=top 1=center 2=bottom) + icon
+ *   (0=none 1=success 2=error 3=warning) + anim (UI_TOAST_ANIM_*).
+ *
+ * BREAKING (build 106): ui_toast_at 已删除; ui_toast_ex 签名增加 anim 参数.
+ *   旧 caller 改 ui_toast_ex(win, text, dur, pos, icon, UI_TOAST_ANIM_SLIDE)
+ *   保留原行为. ui_toast(3 参数) 不变.
+ */
+enum {
+    UI_TOAST_ANIM_SLIDE = 0,  /* 默认: top/bottom 滑入, center 直现, 退出淡出 */
+    UI_TOAST_ANIM_FADE  = 1,  /* 纯渐入渐出: alpha 0→1→1→0, y 全程钉在目标位置 */
+};
+
 UI_API void     ui_toast(UiWindow win, const wchar_t* text, int duration_ms);
-UI_API void     ui_toast_at(UiWindow win, const wchar_t* text, int duration_ms, int position); /* 0=top 1=center 2=bottom */
-UI_API void     ui_toast_ex(UiWindow win, const wchar_t* text, int duration_ms, int position, int icon); /* icon: 0=none 1=success 2=error 3=warning */
+UI_API void     ui_toast_ex(UiWindow win, const wchar_t* text, int duration_ms,
+                            int position, int icon, int anim);
 
 /* ------------------------------------------------------------------ */
 /* Dialog (modal confirm / alert)                                     */
@@ -288,6 +350,11 @@ UI_API void     ui_image_view_plus_clear(UiWidget w);
 
 UI_API float    ui_image_view_plus_get_zoom(UiWidget w);
 UI_API void     ui_image_view_plus_set_zoom(UiWidget w, float zoom);
+/* 以 widget 像素坐标 (anchor_x, anchor_y) 为锚点缩放：anchor 处的图像
+ * 像素位置在 zoom 前后保持不变。鼠标 wheel 缩放就是这条路径；下游 reload
+ * (切 pyramid level / 换图) 后想保持鼠标锚点也用这个。 */
+UI_API void     ui_image_view_plus_set_zoom_around(UiWidget w, float zoom,
+                                                    float anchor_x, float anchor_y);
 UI_API void     ui_image_view_plus_fit(UiWidget w);
 UI_API void     ui_image_view_plus_reset(UiWidget w);
 UI_API void     ui_image_view_plus_get_pan(UiWidget w, float* out_x, float* out_y);
@@ -348,6 +415,105 @@ UI_API void     ui_image_view_plus_set_tile(UiWidget w, int tile_x, int tile_y,
 UI_API void     ui_image_view_plus_clear_tiles(UiWidget w);
 
 /* ------------------------------------------------------------------ */
+/* GhImgView (通用瓦块画布；按 ghde 数据形状设计但不依赖解码器)        */
+/*                                                                    */
+/* 数据契约（见 CLAUDE.md "ui_gh_img_view widget — 数据形状契约"）：   */
+/*   - 像素布局 = BGRA8 premultiplied                                 */
+/*   - 瓦块尺寸 = 256 × 256（边缘可不足）                              */
+/*   - 多级 pyramid，顶级 = 0，每级 1/2 降采样                         */
+/*   - 旋转 = 像素已烘焙（widget 不二次旋转）                          */
+/*                                                                    */
+/* 调用方负责喂数据；widget 只管显示与交互。不做文件 IO / 解码 / 动画。*/
+/* ------------------------------------------------------------------ */
+typedef struct UiGhImgViewInfo {
+    uint32_t full_width;
+    uint32_t full_height;
+    uint32_t tile_size;       /* 256 */
+    uint32_t levels;          /* 1 = 单级；N = pyramid N 级 */
+    uint32_t pixel_format;    /* 0 = BGRA8 premul（v1 仅此） */
+    uint32_t reserved[3];     /* 必须置零，留给 v2 字段（HDR fp16 等） */
+} UiGhImgViewInfo;
+
+typedef struct UiGhImgViewport {
+    uint32_t active_level;
+    float    zoom;
+    float    pan_x, pan_y;
+    /* 当前 level 网格下，可见瓦块半开区间 [tx0,tx1) × [ty0,ty1) */
+    uint32_t visible_tx0, visible_ty0;
+    uint32_t visible_tx1, visible_ty1;
+} UiGhImgViewport;
+
+typedef void (*UiGhImgViewViewportCallback)(UiWidget w, const UiGhImgViewport* vp, void* userdata);
+
+UI_API UiWidget ui_gh_img_view(void);
+UI_API void     ui_gh_img_view_begin(UiWidget w, UiWindow win, const UiGhImgViewInfo* info);
+UI_API void     ui_gh_img_view_set_preview(UiWidget w, UiWindow win,
+                                            const void* bgra, uint32_t pw, uint32_t ph,
+                                            uint32_t stride);
+UI_API void     ui_gh_img_view_set_tile(UiWidget w, UiWindow win,
+                                         uint32_t level, uint32_t tx, uint32_t ty,
+                                         const void* bgra, uint32_t tw, uint32_t th,
+                                         uint32_t stride);
+UI_API void     ui_gh_img_view_clear_level(UiWidget w, uint32_t level);
+UI_API void     ui_gh_img_view_clear(UiWidget w);
+
+/* Build 70+ (L20): SVG 矢量源. 喂一个 .svg 文件, widget 进入 SVG 模式 —
+ * 跳过瓦块逻辑, OnDraw 直接 DrawSvgDocument (ID2D1DeviceContext5 原生光栅化).
+ * info_.fullWidth/Height 由 SVG natural size (优先 viewBox, fallback width/
+ * height) 喂入, Fit/Reset/zoom 等几何全部复用瓦块路径代码.
+ *
+ * 之前 tile / preview 状态被清空 (转换 source type).
+ *
+ * 返 0 OK / 非 0 失败 (文件不存在 / SVG 解析失败 / Win10 1607 前
+ * CreateSvgDocument 不可用). 失败时 widget 状态不变.
+ *
+ * out_w / out_h 出 SVG natural size, 可为 NULL (调用方不需要时跳过).
+ * 拿到尺寸后通常配 ui_gh_img_view_get_zoom 算实际显示像素 (zoom × natural). */
+UI_API int      ui_gh_img_view_set_svg_file(UiWidget w, const wchar_t* path,
+                                              uint32_t* out_w, uint32_t* out_h);
+UI_API int      ui_gh_img_view_is_svg_mode(UiWidget w);
+
+/* Build 71+ (L21): 把 SetSvgFile 加载的 SVG 光栅化到 caller 缓冲, 用于鸟瞰图缩
+ * 略图等场景. fit 保 aspect, 实际像素尺寸经 out_w/out_h 回填, BGRA8 premul 数据
+ * 写 out_bgra (大小 = out_w*out_h*4 字节, packed). out_bgra 至少分配
+ * target_w*target_h*4 字节.
+ *
+ * 返 0 OK / 非 0 失败 (-1 = 未加载 SVG, -2 = 参数错, -3 = D2D 不支持, 其他
+ * 内部 D2D 错误). 失败时 out_bgra 内容未定义. */
+UI_API int      ui_gh_img_view_render_svg_to_bgra(UiWidget w,
+                                                    uint32_t target_w,
+                                                    uint32_t target_h,
+                                                    uint8_t* out_bgra,
+                                                    uint32_t* out_w,
+                                                    uint32_t* out_h);
+
+UI_API void     ui_gh_img_view_set_auto_level(UiWidget w, int on);
+UI_API int      ui_gh_img_view_get_auto_level(UiWidget w);
+UI_API void     ui_gh_img_view_set_active_level(UiWidget w, uint32_t level);
+UI_API uint32_t ui_gh_img_view_get_active_level(UiWidget w);
+
+UI_API float    ui_gh_img_view_get_zoom(UiWidget w);
+UI_API void     ui_gh_img_view_set_zoom(UiWidget w, float zoom);
+UI_API void     ui_gh_img_view_set_zoom_around(UiWidget w, float zoom,
+                                                float anchor_x, float anchor_y);
+UI_API void     ui_gh_img_view_set_zoom_range(UiWidget w, float lo, float hi);
+UI_API void     ui_gh_img_view_get_pan(UiWidget w, float* out_x, float* out_y);
+UI_API void     ui_gh_img_view_set_pan(UiWidget w, float x, float y);
+UI_API void     ui_gh_img_view_fit(UiWidget w);
+UI_API void     ui_gh_img_view_reset(UiWidget w);
+
+/* Rotation (90° 倍数, CW). pan/zoom 不变. angle: 任意 int → 规整到
+ * 0/90/180/270 (mod 360 + round to nearest 90). pan 存屏幕空间, 鼠标
+ * 拖动方向永远匹配视觉方向, 跟旋转角度解耦. Begin / Clear 把 rotation
+ * 重置为 0. */
+UI_API void     ui_gh_img_view_set_rotation(UiWidget w, int angle);
+UI_API int      ui_gh_img_view_get_rotation(UiWidget w);
+
+UI_API void     ui_gh_img_view_on_viewport(UiWidget w,
+                                            UiGhImgViewViewportCallback cb,
+                                            void* userdata);
+
+/* ------------------------------------------------------------------ */
 /* IconButton (SVG icon button)                                      */
 /* ------------------------------------------------------------------ */
 UI_API UiWidget ui_icon_button(const char* svg, int ghost);
@@ -355,6 +521,11 @@ UI_API void     ui_icon_button_set_svg(UiWidget w, const char* svg);
 UI_API void     ui_icon_button_set_ghost(UiWidget w, int ghost);
 UI_API void     ui_icon_button_set_icon_color(UiWidget w, UiColor color);
 UI_API void     ui_icon_button_set_icon_padding(UiWidget w, float padding);
+/* ghost 模式 hover/press bg 视觉开关. 1 (默认) = 标准按钮反馈,
+ * 0 = 永远只画 icon (titlebar 装饰按钮 / 状态指示器场景). 仅对 ghost
+ * 模式有意义; normal 模式 hover bg 是核心 feature, 不受这个开关影响. */
+UI_API void     ui_icon_button_set_hover_visual(UiWidget w, int enabled);
+UI_API int      ui_icon_button_get_hover_visual(UiWidget w);
 
 /* ------------------------------------------------------------------ */
 /* TitleBar (borderless window title bar)                             */
@@ -498,6 +669,74 @@ typedef void (*UiFloatCallback)(UiWidget widget, float value, void* userdata);
 typedef void (*UiSelectionCallback)(UiWidget widget, int index, void* userdata);
 
 UI_API void ui_widget_set_tooltip(UiWidget w, const wchar_t* text);
+
+/* 光标类型 (跟 widget_factory 解析的 CSS cursor 关键字对齐, 程序化 widget
+ * 可通过 ui_widget_set_cursor 直接设置). 数值跟 lib 内部 CursorKind enum
+ * 一一对应, 不要重排. */
+typedef enum {
+    UI_CURSOR_DEFAULT     = 0,     /* IDC_ARROW (inherit) */
+    UI_CURSOR_POINTER     = 1,     /* IDC_HAND (hand) */
+    UI_CURSOR_TEXT        = 2,     /* IDC_IBEAM */
+    UI_CURSOR_CROSSHAIR   = 3,     /* IDC_CROSS */
+    UI_CURSOR_WAIT        = 4,     /* IDC_WAIT */
+    UI_CURSOR_MOVE        = 5,     /* IDC_SIZEALL */
+    UI_CURSOR_NOT_ALLOWED = 6,     /* IDC_NO */
+    UI_CURSOR_EW_RESIZE   = 7,     /* IDC_SIZEWE */
+    UI_CURSOR_NS_RESIZE   = 8,     /* IDC_SIZENS */
+    UI_CURSOR_NESW_RESIZE = 9,     /* IDC_SIZENESW */
+    UI_CURSOR_NWSE_RESIZE = 10,    /* IDC_SIZENWSE */
+    UI_CURSOR_HELP        = 11,    /* IDC_HELP */
+    UI_CURSOR_NONE        = 12     /* 隐藏光标 */
+} UiCursor;
+UI_API void ui_widget_set_cursor(UiWidget w, int cursor);
+UI_API int  ui_widget_get_cursor(UiWidget w);
+
+/* 通用 widget mouse_move 回调 (任意 widget 类型都可挂, 不限于 ImageView).
+ * x/y 为 widget-local DIP (相对 widget rect 左上). 调用 cb=NULL 解绑.
+ * ui_image_on_mouse_move 只对 ImageViewWidget 有效; ui_gh_img_view /
+ * 自绘 widget / div / svg 等需要 mouse 跟踪请用此 API. */
+typedef void (*UiWidgetMouseMoveCallback)(UiWidget w, float x, float y, void* userdata);
+UI_API void ui_widget_on_mouse_move(UiWidget w,
+                                     UiWidgetMouseMoveCallback cb,
+                                     void* userdata);
+
+/* widget mouse_leave 回调 (跟 web mouseleave 语义对齐, 任意 widget 类型可挂).
+ * 两条触发路径:
+ *   1) cursor 同窗口内移到别的 widget → 旧 hovered ancestor 链里不在新链的
+ *      widget 触发 leave (逐层);
+ *   2) cursor 出窗口 (WM_MOUSELEAVE) → 当前 hovered ancestor 链全员触发.
+ * 无 x/y 参数 (leave 时 cursor 已脱离, 坐标无意义). cb=NULL 解绑. */
+typedef void (*UiWidgetMouseLeaveCallback)(UiWidget w, void* userdata);
+UI_API void ui_widget_on_mouse_leave(UiWidget w,
+                                      UiWidgetMouseLeaveCallback cb,
+                                      void* userdata);
+
+/* Build 64+ (L13): widget 焦点切换回调. 当 lib 内部 SetFocus 把 widget 切入 /
+ * 切出 focusedWidget_ 槽时触发. 任意 widget 类型可挂. 鼠标点击触发的失焦也
+ * 走这里 (lib mouse_down 分发完会按 hit-test 结果 SetFocus). cb=NULL 解绑. */
+typedef void (*UiWidgetFocusCallback)(UiWidget w, void* userdata);
+UI_API void ui_widget_on_focus(UiWidget w,
+                                UiWidgetFocusCallback cb,
+                                void* userdata);
+UI_API void ui_widget_on_blur (UiWidget w,
+                                UiWidgetFocusCallback cb,
+                                void* userdata);
+
+/* Build 66+ (L16): widget 滚轮回调. 任意 widget 类型可挂 — 之前
+ * ui_custom_on_mouse_wheel 只对 CustomWidget 生效, 而且 lib 的 OnMouseWheel
+ * dispatch loop 写死只识别 TextArea/ImageView/ImageViewPlus/GhImgView/
+ * ScrollView 五种, CustomWidget 不在内, mouse_wheel 实际收不到.
+ *
+ * 这个 API 接 Widget::onMouseWheelHook (跟 .uix @wheel 同一条路径, 在
+ * OnMouseWheel 分发开头无条件 fire, 不挑 widget 类型). x/y 是 widget 内
+ * 屏幕坐标, delta 正值上滚 / 负值下滚 (跟 WM_MOUSEWHEEL WHEEL_DELTA 同号).
+ * cb=NULL 解绑. */
+typedef void (*UiWidgetWheelCallback)(UiWidget w, float x, float y,
+                                       float delta, void* userdata);
+UI_API void ui_widget_on_mouse_wheel(UiWidget w,
+                                       UiWidgetWheelCallback cb,
+                                       void* userdata);
+
 UI_API void ui_widget_on_click(UiWidget w, UiClickCallback cb, void* userdata);
 UI_API void ui_checkbox_on_changed(UiWidget w, UiValueCallback cb, void* userdata);
 UI_API void ui_slider_on_changed(UiWidget w, UiFloatCallback cb, void* userdata);
@@ -550,8 +789,15 @@ UI_API void ui_custom_on_mouse_wheel(UiWidget w, UiCustomWheelCallback cb, void*
 UI_API void ui_custom_on_key_down(UiWidget w, UiCustomKeyCallback cb, void* ud);
 UI_API void ui_custom_on_char(UiWidget w, UiCustomCharCallback cb, void* ud);
 UI_API void ui_custom_on_layout(UiWidget w, UiCustomLayoutCallback cb, void* ud);
+/* Build 64+ (L13): 同时把 widget 推进 owner window 的 focusedWidget_ 槽 — 让
+ * WM_KEYDOWN 路由到这里的 keyDown 回调, 触发 widget 的 onFocus/onBlur hook.
+ * 调用前请先 ui_custom_set_focusable(w, 1) — 没标 focusable 的 custom widget
+ * 鼠标点击不会自动获得焦点 (跟 ButtonWidget 等原生 widget 行为对齐). */
 UI_API void ui_custom_set_focused(UiWidget w, int focused);
 UI_API int  ui_custom_get_focused(UiWidget w);
+/* Build 64+ (L13): opt-in 让 <custom> 进入 lib 的键盘焦点系统. 默认 false (纯
+ * 展示型 custom widget 不吃 Tab / 鼠标点击不抢焦点). 接管键盘交互前置位 1. */
+UI_API void ui_custom_set_focusable(UiWidget w, int focusable);
 
 /* ------------------------------------------------------------------ */
 /* Drawing API (use inside UiCustomDrawCallback)                      */
@@ -589,11 +835,20 @@ UI_API int      ui_debug_screenshot_widget(UiWindow win, UiWidget w, const wchar
 /* ------------------------------------------------------------------ */
 /* Debug server — named-pipe IPC（库级，所有应用均可一行启用）          */
 /* ------------------------------------------------------------------ */
-/* 启动后 \\.\pipe\<pipe_name> 接收文本命令，返回 JSON 响应。命令集合见 */
-/* docs/debug-simulation.md。pipe_name=NULL 用默认 "ui_core_debug"。   */
-/* 同进程仅一个 server；连续 _start 会返回 -2。返回 0 = OK。            */
+/* 启动后 \\.\pipe\<pipe_name> 接收文本命令，返回 JSON 响应。命令集合见
+ * docs/debug-simulation.md。pipe_name=NULL 用默认 "ui_core_debug".
+ *
+ * Build 63+ (L12): 同进程可启动多个 server, 每个绑独立 UiWindow + 独立
+ * pipe_name (多窗口应用每个窗口可有自己的调试 pipe). 同 pipe_name 重复
+ * start 返 -2; 不同 pipe_name 都返 0. */
 UI_API int   ui_debug_server_start(UiWindow win, const char* pipe_name);
+/* Stop 所有 server 并清掉 userHandler (跟旧 single-server 语义一致).
+ * 注意: 不要在 UI 线程内同步调 — worker invoke_sync 回 UI 线程跑 widget
+ * 命令时, 主线程 join 会 deadlock. */
 UI_API void  ui_debug_server_stop(void);
+/* Stop 指定 pipe_name 的一个 server, 其它继续运行. NULL / 找不到 no-op.
+ * 多窗口场景下析构子窗口时用 (主窗口的 pipe 不受影响). userHandler 不动. */
+UI_API void  ui_debug_server_stop_named(const char* pipe_name);
 /* 自定义命令处理器，可覆盖 builtin 或新增私有命令。                     */
 /* 返回值：>0 = 写入 out_buf 的字节数（作为 JSON 响应），0 = 不处理（回退 */
 /* 到 builtin），<0 = 错误（也回退）。out_buf 容量由 out_cap 给出。     */
@@ -667,6 +922,13 @@ UI_API int   ui_debug_menu_item_count_at(UiWindow win, const int* path, int dept
 UI_API int   ui_debug_menu_item_id_at(UiWindow win, const int* path, int depth);
 UI_API int   ui_debug_menu_has_submenu_at(UiWindow win, const int* path, int depth);
 UI_API int   ui_debug_menu_click_path(UiWindow win, const int* path, int depth);
+/* build 85 (调试用): 沿 path 逐级打开 submenu (不是 click leaf), 让 caller
+   可以拍照截图深层 submenu. path 每个 index 都必须指向有 submenu 的 item.
+   返 0 成功 (最深 submenu 已 ShowPopup), 负数失败. */
+UI_API int   ui_debug_menu_open_submenu_path(UiWindow win, const int* path, int depth);
+/* combo: 沿 path 打开 submenu + 截图最深 submenu 的 popup. */
+UI_API int   ui_debug_screenshot_submenu_path(UiWindow win, const int* path, int depth,
+                                                const wchar_t* outPath);
 
 /* 开关 context menu 的"前台变化即自动关闭"行为。
    自动化脚本（如 PowerShell 发 pipe 命令）持有前台窗口时，需要调用
@@ -706,10 +968,21 @@ UI_API void  ui_window_set_background_mode(UiWindow win, int mode);
    典型用法：无边框画布模式给根 Panel 打上这个标，让整个画布都能拖窗口。 */
 UI_API void  ui_widget_set_drag_window(UiWidget w, int enable);
 
-/* ---- 窗口几何（DIP-native） ---- */
-/* x / y 是屏幕物理像素（Win32 惯例）；w_dip / h_dip 是 DIP（按当前 DPI 换算）。
-   每次调用都会触发一次同步重绘（InvalidateRect + UpdateWindow），配合
-   ui_window_set_background_mode(win, 1) 能把扩大窗口时的背景闪减到最小。 */
+/* ---- 窗口几何 ---- */
+/* x / y 是屏幕物理像素 (Win32 惯例); w_dip / h_dip 是 DIP (按当前 DPI 换算).
+   getter / setter / UiWindowConfig.x/y 全部统一 — get→set round-trip
+   把窗口几何复制到 sub-window 不再错位 (build 94+ L23 修, 之前 getter
+   返 DIP 跟 setter 不自洽).
+
+   持久化 DPI-stable 位置 (DPI 变了重启窗口不漂移): caller 用 ui_window_dpi
+   自己换算:
+       int dpi  = ui_window_dpi(win);
+       int xDip = MulDiv(xScreen, 96, dpi);   // 存盘
+       int xPx  = MulDiv(xDip,    dpi, 96);   // 读盘 restore
+
+   set_rect / set_size 每次调用都会触发一次同步重绘 (InvalidateRect +
+   UpdateWindow), 配合 ui_window_set_background_mode(win, 1) 把扩大窗口
+   时背景闪减到最小. */
 UI_API void  ui_window_set_rect(UiWindow win, int x_screen, int y_screen,
                                  int w_dip, int h_dip);
 UI_API void  ui_window_set_size(UiWindow win, int w_dip, int h_dip);
@@ -717,6 +990,15 @@ UI_API void  ui_window_set_position(UiWindow win, int x_screen, int y_screen);
 UI_API void  ui_window_get_rect_screen(UiWindow win,
                                         int* out_x, int* out_y,
                                         int* out_w_dip, int* out_h_dip);
+
+/* 返当前窗口 DPI (96 / 120 / 144 / 192...). 用 Win32 GetDpiForWindow,
+ * 跟随窗口所在 monitor 的 DPI. 配合 MulDiv 做 screen px ↔ DIP 转换:
+ *   int dip      = MulDiv(screen_px, 96, ui_window_dpi(win));
+ *   int screen   = MulDiv(dip,       ui_window_dpi(win), 96);
+ * 典型场景: 应用想跨 DPI / 跨显示器持久化窗口位置, 存 DIP 重启 restore
+ * 时按当前 DPI 转回 screen px, 这样把窗口从 100% DPI 主屏拖到 150% 副屏
+ * 再重启, 位置不会偏移. */
+UI_API int   ui_window_dpi(UiWindow win);
 
 /* 滚轮缩放"光标不动"原语：resize 到 (w_dip, h_dip)，
    并把新客户区里的 (client_x_dip, client_y_dip) 对齐到屏幕 (screen_x, screen_y)。
@@ -837,6 +1119,13 @@ UI_API UiWidget ui_page_root(UiPage p);
  * The page's root widget is automatically installed as the window content.
  * Returns the new UiWindow handle, or 0 on failure. */
 UI_API UiWindow ui_page_open_window(UiPage p, const UiWindowConfig* override_defaults);
+
+/* Same as ui_page_open_window but returns window 处于 hidden 状态, D2D RT 已
+ * 预创建. Caller 自己同步预热 (decode + 喂 widget bitmap / 调整 reactive state)
+ * 后调 ui_window_show_immediate(win) 一次性出图. 用于 "argv 启动 → 双击文件
+ * 关联 → 用户期望瞬间看到图" 场景, 避免 ui_page_open_window 内嵌 ShowWindow
+ * 后用户看到"空窗 → 0.3-1s 后图替换"两段式视觉. build 99+ L27. */
+UI_API UiWindow ui_page_prepare_window(UiPage p, const UiWindowConfig* override_defaults);
 
 /* Set reactive variables. The page's template re-evaluates any dependent bindings. */
 UI_API void     ui_page_set_bool(UiPage p, const char* name, int value);

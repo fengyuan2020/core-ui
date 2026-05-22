@@ -338,9 +338,17 @@ ui_debug_server_stop();   // 程序退出前清理
 ui_shutdown();
 ```
 
-`pipe_name=NULL` 用默认 `ui_core_debug`；同进程仅一个 server，重复 `_start`
-返回 `-2`。内部跑一个 worker thread `accept` 连接，每条命令通过
-`ui_window_invoke_sync` marshal 回 UI 线程执行。
+`pipe_name=NULL` 用默认 `ui_core_debug`。**自 1.6.0 build 63 开始**支持多 server
+并存，每窗口一个独立 pipe——同进程主窗 + 设置窗 / 子窗都能各自挂 server，互不
+抢占：
+
+```c
+ui_debug_server_start(main_win,     L"my_app_main_debug");
+ui_debug_server_start(settings_win, L"my_app_settings_debug");
+```
+
+之前同进程只能一个 server，重复 `_start` 返回 `-2`；1.6.0+ 不再有这个限制。
+每条命令通过 `ui_window_invoke_sync` marshal 回对应窗口的 UI 线程执行。
 
 ### 自定义命令处理器
 

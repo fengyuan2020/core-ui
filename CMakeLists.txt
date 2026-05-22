@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
-set(UI_CORE_VERSION "1.5.0")
-set(UI_CORE_INTERNAL_VERSION "46")
+set(UI_CORE_VERSION "1.6.0")
+set(UI_CORE_INTERNAL_VERSION "112")
 project(core-ui-project VERSION ${UI_CORE_VERSION} LANGUAGES C CXX)
 
 set(UI_CORE_VERSION_TAG "v${PROJECT_VERSION}")
@@ -58,6 +58,7 @@ set(UI_CORE_SOURCES
     src/ui/controls.cpp
     src/ui/image_view_gdi.cpp
     src/ui/image_view_plus.cpp
+    src/ui/gh_img_view.cpp
     src/ui/image_source.cpp
     src/ui/image_source_bitmap.cpp
     src/ui/image_source_svg.cpp

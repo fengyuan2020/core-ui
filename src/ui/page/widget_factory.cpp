@@ -661,6 +661,32 @@ void ApplyCommonStyle(Widget& w, const ui::css::ComputedStyle& s) {
             lbl->SetSelectable(v == "text" || v == "all");
         }
     }
+    // white-space — applies to LabelWidget (build 93, L22).
+    // CSS: nowrap → 单行渲染, 文本超出容器自动 ellipsis "abc..." (DWrite
+    // 在 renderer.cpp 已实现, wrap=false 时自动启 trimming). normal /
+    // pre-wrap / 缺省 = 保持默认 wrap=true.
+    if (s.Has("white-space")) {
+        if (auto* lbl = dynamic_cast<LabelWidget*>(&w)) {
+            const std::string& v = s.Get("white-space");
+            if (v == "nowrap") lbl->SetWrap(false);
+            else if (v == "normal" || v == "pre-wrap") lbl->SetWrap(true);
+        }
+    }
+    // line-height — applies to LabelWidget single-row height (build 92, L20).
+    // CSS spec: unitless (1.3) = multiplier of font-size; with unit (17px) = absolute.
+    // 0 / 缺省 = lib default 1.3 × font-size.
+    if (s.Has("line-height")) {
+        if (auto* lbl = dynamic_cast<LabelWidget*>(&w)) {
+            const std::string& v = s.Get("line-height");
+            // 尝试解析为 px 字符串 ("17px"); 失败 fallback unitless float.
+            if (v.size() > 2 && v.substr(v.size() - 2) == "px") {
+                try { lbl->SetLineHeightPx(std::stof(v.substr(0, v.size() - 2))); }
+                catch (...) {}
+            } else if (!v.empty()) {
+                try { lbl->SetLineHeightRatio(std::stof(v)); } catch (...) {}
+            }
+        }
+    }
     // text-align — applies to LabelWidget. ButtonWidget hardcodes CENTER in
     // its OnDraw, so this is a no-op on buttons.
     if (s.Has("text-align")) {

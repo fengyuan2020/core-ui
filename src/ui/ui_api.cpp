@@ -7,6 +7,8 @@
 #include "ui_window.h"
 #include "ui.h"        // pulls in all widget/control/builder headers
 #include "image_view_gdi.h"  // GDI-based image view (for images > D2D texture limit)
+#include "image_view_plus.h" // forward decl needed for GhImgView 临近的 ImageViewPlus 引用
+#include "gh_img_view.h"     // 通用瓦块画布
 #include "css/value.h"       // ParseColor for ui_theme_set_accent_hex
 #include "page/compiler.h"   // ui::page::RefreshAllPageThemes — runtime theme push
 #include "../../include/ui_core.h"
@@ -102,8 +104,15 @@ UI_API UiWindow ui_window_create(const UiWindowConfig* config) {
 
     auto win = std::make_unique<ui::UiWindowImpl>();
     win->skipOpenAnimation_ = (config->skip_animation != 0);
+    win->startMaximizedPending_ = (config->start_maximized != 0);
     int initX = (config->x != 0 || config->y != 0) ? config->x : CW_USEDEFAULT;
     int initY = (config->x != 0 || config->y != 0) ? config->y : CW_USEDEFAULT;
+    /* Build 65+ (L14): 把 owner UiWindow handle 解析成 HWND 传给 Create.
+     * 0 / 找不到 = nullptr (顶级窗口). */
+    HWND ownerHwnd = nullptr;
+    if (config->owner) {
+        if (auto* ow = Ctx().GetWindow(config->owner)) ownerHwnd = ow->Handle();
+    }
     if (!win->Create(
             config->title ? config->title : L"",
             config->width > 0 ? config->width : 800,
@@ -112,7 +121,8 @@ UI_API UiWindow ui_window_create(const UiWindowConfig* config) {
             config->resizable != 0,
             config->accept_files != 0,
             initX, initY,
-            config->tool_window != 0)) {
+            config->tool_window != 0,
+            ownerHwnd)) {
         return UI_INVALID;
     }
 
@@ -192,6 +202,11 @@ UI_API void* ui_window_hwnd(UiWindow win) {
     return w ? (void*)w->Handle() : nullptr;
 }
 
+UI_API float ui_window_dpi_scale(UiWindow win) {
+    auto* w = Win(win);
+    return w ? w->DpiScale() : 1.0f;
+}
+
 // ================================================================
 // Window callbacks
 // ================================================================
@@ -241,32 +256,16 @@ UI_API void ui_menu_destroy(UiMenu menu) {
     Ctx().RemoveMenu(menu);
 }
 
-UI_API void ui_menu_add_item(UiMenu menu, int id, const wchar_t* text) {
-    auto m = Ctx().GetMenu(menu);
-    if (m && text) m->AddItem(id, text);
-}
-
-UI_API void ui_menu_add_item_ex(UiMenu menu, int id, const wchar_t* text,
-                                 const wchar_t* shortcut, const char* svg) {
-    auto m = Ctx().GetMenu(menu);
-    if (!m || !text) return;
-    // Need a renderer for SVG parsing.
-    ui::Renderer* r = nullptr;
-    if (auto* win = Ctx().FirstWindow()) {
-        r = &win->GetRenderer();
-    }
-    m->AddItemEx(id, text, shortcut ? shortcut : L"", svg ? svg : "", r);
-}
+/* BREAKING (build 75): 老的 imperative C API ui_menu_add_item / add_item_ex /
+ * add_submenu(text, sub) 全删 — menu 现在只走声明式 .uix 路径 (PageState 内部
+ * 用 AddItemContent / AddSubmenu(widget, sub)). 这一条体现"早期 lib 砍老兼容,
+ * 别留 C 端老 caller 路径". 仍保留: ui_menu_create / destroy / add_separator /
+ * set_enabled / set_bg_color / set_corner_radius / show / close — 这些是声明式
+ * 路径也会用到的菜单生命周期 / 全局视觉控制 API. */
 
 UI_API void ui_menu_add_separator(UiMenu menu) {
     auto m = Ctx().GetMenu(menu);
     if (m) m->AddSeparator();
-}
-
-UI_API void ui_menu_add_submenu(UiMenu menu, const wchar_t* text, UiMenu submenu) {
-    auto m = Ctx().GetMenu(menu);
-    auto sub = Ctx().GetMenu(submenu);
-    if (m && sub && text) m->AddSubmenu(text, sub);
 }
 
 UI_API void ui_menu_set_enabled(UiMenu menu, int id, int enabled) {
@@ -277,6 +276,11 @@ UI_API void ui_menu_set_enabled(UiMenu menu, int id, int enabled) {
 UI_API void ui_menu_set_bg_color(UiMenu menu, UiColor color) {
     auto m = Ctx().GetMenu(menu);
     if (m) m->SetBgColor({color.r, color.g, color.b, color.a});
+}
+
+UI_API void ui_menu_set_corner_radius(UiMenu menu, float radius) {
+    auto m = Ctx().GetMenu(menu);
+    if (m) m->SetCornerRadius(radius);
 }
 
 UI_API void ui_menu_show(UiWindow win, UiMenu menu, float x, float y) {
@@ -292,17 +296,13 @@ UI_API void ui_menu_close(UiWindow win) {
 
 UI_API void ui_toast(UiWindow win, const wchar_t* text, int duration_ms) {
     auto* w = Win(win);
-    if (w && text) w->ShowToast(text, duration_ms > 0 ? duration_ms : 2000, 0, 0);
+    if (w && text) w->ShowToast(text, duration_ms > 0 ? duration_ms : 2000, 0, 0, 0);
 }
 
-UI_API void ui_toast_at(UiWindow win, const wchar_t* text, int duration_ms, int position) {
+UI_API void ui_toast_ex(UiWindow win, const wchar_t* text, int duration_ms,
+                        int position, int icon, int anim) {
     auto* w = Win(win);
-    if (w && text) w->ShowToast(text, duration_ms > 0 ? duration_ms : 2000, position, 0);
-}
-
-UI_API void ui_toast_ex(UiWindow win, const wchar_t* text, int duration_ms, int position, int icon) {
-    auto* w = Win(win);
-    if (w && text) w->ShowToast(text, duration_ms > 0 ? duration_ms : 2000, position, icon);
+    if (w && text) w->ShowToast(text, duration_ms > 0 ? duration_ms : 2000, position, icon, anim);
 }
 
 UI_API void ui_window_on_menu(UiWindow win, UiMenuCallback cb, void* userdata) {
@@ -663,7 +663,13 @@ UI_API void ui_image_on_mouse_down(UiWidget w, UiImageMouseDownCallback cb, void
 
 UI_API void ui_image_on_mouse_move(UiWidget w, UiImageMouseMoveCallback cb, void* userdata) {
     auto* iv = As<ui::ImageViewWidget>(w);
-    if (!iv) return;
+    if (!iv) {
+        /* L7: 默默 return 让调用方拿不到反馈, 容易写成 dead code (e.g.
+         * GuoheView 一直对着 ui_gh_img_view 调这个, 永不触发). 提示一下. */
+        OutputDebugStringA("[core-ui] ui_image_on_mouse_move: widget is not ImageView. "
+                           "For ui_gh_img_view or other widget types, use ui_widget_on_mouse_move.\n");
+        return;
+    }
     if (!cb) { iv->onMouseMoveHook = nullptr; return; }
     uint64_t handle = w;
     iv->onMouseMoveHook = [cb, userdata, handle](float x, float y) -> bool {
@@ -770,6 +776,11 @@ UI_API float ui_image_view_plus_get_zoom(UiWidget w) {
 UI_API void ui_image_view_plus_set_zoom(UiWidget w, float zoom) {
     auto* iv = As<ui::ImageViewPlusWidget>(w);
     if (iv) iv->SetZoom(zoom);
+}
+UI_API void ui_image_view_plus_set_zoom_around(UiWidget w, float zoom,
+                                               float anchor_x, float anchor_y) {
+    auto* iv = As<ui::ImageViewPlusWidget>(w);
+    if (iv) iv->SetZoomAround(zoom, anchor_x, anchor_y);
 }
 UI_API void ui_image_view_plus_fit(UiWidget w) {
     auto* iv = As<ui::ImageViewPlusWidget>(w);
@@ -975,6 +986,171 @@ UI_API void ui_image_view_plus_clear_tiles(UiWidget w) {
 }
 
 // ================================================================
+// GhImgView — 通用瓦块画布（数据形状契约：BGRA8 premul + 256 瓦块 + pyramid）
+// ================================================================
+
+UI_API UiWidget ui_gh_img_view(void) {
+    return Reg(std::make_shared<ui::GhImgViewWidget>());
+}
+
+UI_API void ui_gh_img_view_begin(UiWidget w, UiWindow win, const UiGhImgViewInfo* info) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    auto* wn = Win(win);
+    if (!gv || !wn || !info) return;
+    ui::GhImgViewWidget::Info ii;
+    ii.fullWidth   = info->full_width;
+    ii.fullHeight  = info->full_height;
+    ii.tileSize    = info->tile_size ? info->tile_size : 256u;
+    ii.levels      = info->levels    ? info->levels    : 1u;
+    ii.pixelFormat = info->pixel_format;
+    gv->Begin(ii, wn->GetRenderer());
+}
+
+UI_API void ui_gh_img_view_set_preview(UiWidget w, UiWindow win,
+                                        const void* bgra, uint32_t pw, uint32_t ph,
+                                        uint32_t stride) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    auto* wn = Win(win);
+    if (!gv || !wn || !bgra) return;
+    gv->SetPreview(bgra, pw, ph, stride, wn->GetRenderer());
+}
+
+UI_API void ui_gh_img_view_set_tile(UiWidget w, UiWindow win,
+                                     uint32_t level, uint32_t tx, uint32_t ty,
+                                     const void* bgra, uint32_t tw, uint32_t th,
+                                     uint32_t stride) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    auto* wn = Win(win);
+    if (!gv || !wn || !bgra) return;
+    gv->SetTile(level, tx, ty, bgra, tw, th, stride, wn->GetRenderer());
+}
+
+UI_API void ui_gh_img_view_clear_level(UiWidget w, uint32_t level) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (gv) gv->ClearLevel(level);
+}
+
+UI_API void ui_gh_img_view_clear(UiWidget w) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (gv) gv->Clear();
+}
+
+UI_API int ui_gh_img_view_set_svg_file(UiWidget w, const wchar_t* path,
+                                          uint32_t* out_w, uint32_t* out_h) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (!gv || !path) return -1;
+    /* 找 widget 所属 window 拿 Renderer (SVG 解析需要 ID2D1DeviceContext5). */
+    auto* wi = Ctx().FindWindowByWidget(gv);
+    if (!wi) return -2;
+    if (!gv->SetSvgFromFile(path, wi->GetRenderer())) return -3;
+    if (out_w) *out_w = gv->GetInfo().fullWidth;
+    if (out_h) *out_h = gv->GetInfo().fullHeight;
+    return 0;
+}
+
+UI_API int ui_gh_img_view_is_svg_mode(UiWidget w) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    return (gv && gv->IsSvgMode()) ? 1 : 0;
+}
+
+UI_API int ui_gh_img_view_render_svg_to_bgra(UiWidget w,
+                                                uint32_t target_w,
+                                                uint32_t target_h,
+                                                uint8_t* out_bgra,
+                                                uint32_t* out_w,
+                                                uint32_t* out_h) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (!gv) return -1;
+    auto* wi = Ctx().FindWindowByWidget(gv);
+    if (!wi) return -2;
+    return gv->RenderSvgToBgra(target_w, target_h, out_bgra, out_w, out_h,
+                                  wi->GetRenderer());
+}
+
+UI_API void ui_gh_img_view_set_auto_level(UiWidget w, int on) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (gv) gv->SetAutoLevel(on != 0);
+}
+UI_API int ui_gh_img_view_get_auto_level(UiWidget w) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    return (gv && gv->AutoLevel()) ? 1 : 0;
+}
+UI_API void ui_gh_img_view_set_active_level(UiWidget w, uint32_t level) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (gv) gv->SetActiveLevel(level);
+}
+UI_API uint32_t ui_gh_img_view_get_active_level(UiWidget w) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    return gv ? gv->ActiveLevel() : 0u;
+}
+
+UI_API float ui_gh_img_view_get_zoom(UiWidget w) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    return gv ? gv->Zoom() : 1.0f;
+}
+UI_API void ui_gh_img_view_set_zoom(UiWidget w, float zoom) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (gv) gv->SetZoom(zoom);
+}
+UI_API void ui_gh_img_view_set_zoom_around(UiWidget w, float zoom,
+                                            float anchor_x, float anchor_y) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (gv) gv->SetZoomAround(zoom, anchor_x, anchor_y);
+}
+UI_API void ui_gh_img_view_set_zoom_range(UiWidget w, float lo, float hi) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (gv) gv->SetZoomRange(lo, hi);
+}
+UI_API void ui_gh_img_view_get_pan(UiWidget w, float* out_x, float* out_y) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (!gv) return;
+    if (out_x) *out_x = gv->PanX();
+    if (out_y) *out_y = gv->PanY();
+}
+UI_API void ui_gh_img_view_set_pan(UiWidget w, float x, float y) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (gv) gv->SetPan(x, y);
+}
+UI_API void ui_gh_img_view_fit(UiWidget w) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (gv) gv->Fit();
+}
+UI_API void ui_gh_img_view_reset(UiWidget w) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (gv) gv->Reset();
+}
+
+UI_API void ui_gh_img_view_set_rotation(UiWidget w, int angle) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (gv) gv->SetRotation(angle);
+}
+UI_API int  ui_gh_img_view_get_rotation(UiWidget w) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    return gv ? gv->Rotation() : 0;
+}
+
+UI_API void ui_gh_img_view_on_viewport(UiWidget w,
+                                        UiGhImgViewViewportCallback cb,
+                                        void* userdata) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (!gv) return;
+    UiWidget apiHandle = w;
+    gv->onViewportChanged = [cb, userdata, apiHandle](const ui::GhImgViewWidget::Viewport& vp) {
+        if (!cb) return;
+        UiGhImgViewport out;
+        out.active_level = vp.activeLevel;
+        out.zoom         = vp.zoom;
+        out.pan_x        = vp.panX;
+        out.pan_y        = vp.panY;
+        out.visible_tx0  = vp.visibleTx0;
+        out.visible_ty0  = vp.visibleTy0;
+        out.visible_tx1  = vp.visibleTx1;
+        out.visible_ty1  = vp.visibleTy1;
+        cb(apiHandle, &out, userdata);
+    };
+}
+
+// ================================================================
 // ImageViewGDI — GDI-based image view (bypasses D2D texture limit)
 // 用途：显示超过 D3D feature level 最大纹理 (16384 常见) 的大图
 // 架构：CreateDIBSection + StretchBlt 子窗口，无 GPU 参与
@@ -1059,6 +1235,15 @@ UI_API void ui_icon_button_set_icon_padding(UiWidget w, float padding) {
     if (ib) ib->SetIconPadding(padding);
 }
 
+UI_API void ui_icon_button_set_hover_visual(UiWidget w, int enabled) {
+    auto* ib = As<ui::IconButtonWidget>(w);
+    if (ib) ib->SetHoverVisual(enabled != 0);
+}
+UI_API int  ui_icon_button_get_hover_visual(UiWidget w) {
+    auto* ib = As<ui::IconButtonWidget>(w);
+    return ib ? (ib->HoverVisual() ? 1 : 0) : 1;
+}
+
 // ================================================================
 // TitleBar
 // ================================================================
@@ -1111,16 +1296,30 @@ UI_API void ui_titlebar_set_title_weight(UiWidget titlebar, int weight) {
 // Widget tree operations
 // ================================================================
 
+// 运行时改 widget 几何 / 树结构后必须 mark layout dirty + invalidate window，
+// 否则 widget rect 一直停在初始 [0,0,0,0]，肉眼不可见。下游用 C API 写
+// "运行时插入 / 改尺寸" 的 100% 会撞这个坑。
+static void MarkLayoutAndRepaint() {
+    ui::RequestLayout();
+    Ctx().InvalidateAllWindows();
+}
+
 UI_API void ui_widget_add_child(UiWidget parent, UiWidget child) {
     auto p = Ctx().handles.Lookup(parent);
     auto c = Ctx().handles.Lookup(child);
-    if (p && c) p->AddChild(c);
+    if (p && c) {
+        p->AddChild(c);
+        MarkLayoutAndRepaint();
+    }
 }
 
 UI_API void ui_widget_remove_child(UiWidget parent, UiWidget child) {
     auto* p = W(parent);
     auto* c = W(child);
-    if (p && c) p->RemoveChild(c);
+    if (p && c) {
+        p->RemoveChild(c);
+        MarkLayoutAndRepaint();
+    }
 }
 
 UI_API void ui_widget_destroy(UiWidget widget) {
@@ -1155,29 +1354,37 @@ UI_API void ui_widget_set_id(UiWidget w, const char* id) {
 }
 
 UI_API void ui_widget_set_width(UiWidget w, float width) {
-    auto* p = W(w); if (p) p->fixedW = width;
+    auto* p = W(w); if (p) { p->fixedW = width; MarkLayoutAndRepaint(); }
 }
 
 UI_API void ui_widget_set_height(UiWidget w, float height) {
-    auto* p = W(w); if (p) p->fixedH = height;
+    auto* p = W(w); if (p) { p->fixedH = height; MarkLayoutAndRepaint(); }
 }
 
 UI_API void ui_widget_set_size(UiWidget w, float width, float height) {
-    auto* p = W(w); if (p) { p->fixedW = width; p->fixedH = height; }
+    auto* p = W(w);
+    if (p) { p->fixedW = width; p->fixedH = height; MarkLayoutAndRepaint(); }
 }
 
 UI_API void ui_widget_set_expand(UiWidget w, int expand) {
-    auto* p = W(w); if (p) p->expanding = (expand != 0);
+    auto* p = W(w);
+    if (p) { p->expanding = (expand != 0); MarkLayoutAndRepaint(); }
 }
 
 UI_API void ui_widget_set_padding(UiWidget w, float left, float top, float right, float bottom) {
     auto* p = W(w);
-    if (p) { p->padL = left; p->padT = top; p->padR = right; p->padB = bottom; }
+    if (p) {
+        p->padL = left; p->padT = top; p->padR = right; p->padB = bottom;
+        MarkLayoutAndRepaint();
+    }
 }
 
 UI_API void ui_widget_set_padding_uniform(UiWidget w, float pad) {
     auto* p = W(w);
-    if (p) { p->padL = p->padT = p->padR = p->padB = pad; }
+    if (p) {
+        p->padL = p->padT = p->padR = p->padB = pad;
+        MarkLayoutAndRepaint();
+    }
 }
 
 UI_API void ui_widget_set_gap(UiWidget w, float gap) {
@@ -1212,6 +1419,99 @@ UI_API void ui_widget_set_bg_color(UiWidget w, UiColor color) {
 
 UI_API void ui_widget_set_tooltip(UiWidget w, const wchar_t* text) {
     auto* p = W(w); if (p) p->tooltip = text ? text : L"";
+}
+
+UI_API void ui_widget_set_cursor(UiWidget w, int cursor) {
+    auto* p = W(w);
+    if (!p) return;
+    /* clamp 到 enum 合法范围, 越界保留当前值 (不破坏现有 widget 状态). */
+    if (cursor < 0 || cursor > (int)ui::CursorKind::None) return;
+    p->cursor = static_cast<ui::CursorKind>(cursor);
+}
+
+UI_API int ui_widget_get_cursor(UiWidget w) {
+    auto* p = W(w);
+    return p ? static_cast<int>(p->cursor) : 0;
+}
+
+/* 通用 widget mouse_move hook — 任意 widget 类型 (div / gh_img_view /
+ * image / svg / custom...) 都可挂. 利用 ui_window dispatch 已经在 hit
+ * widget 上触发的 Widget::onMouseMoveHook 字段, 不依赖具体子类.
+ * x/y 为 widget-local DIP (减去 widget rect 左上). cb=NULL 解绑. */
+UI_API void ui_widget_on_mouse_move(UiWidget w,
+                                     UiWidgetMouseMoveCallback cb,
+                                     void* userdata) {
+    auto* p = W(w);
+    if (!p) return;
+    if (!cb) { p->onMouseMoveHook = nullptr; return; }
+    uint64_t handle = w;
+    /* 捕 p 指针 hook 内部用 — Widget 生命周期跟 hook 一致 (hook 存在 widget
+     * 上, widget 析构时一起销毁), p 不会悬空. */
+    p->onMouseMoveHook = [cb, userdata, handle, p](const ui::MouseEvent& e) {
+        cb(handle, e.x - p->rect.left, e.y - p->rect.top, userdata);
+    };
+}
+
+/* 通用 widget mouse_leave hook — 跟 web mouseleave 语义对齐. 触发路径两条:
+ * (a) cursor 在同窗口内从 widget A 转去 widget B, A (含其 ancestor 链中
+ *     不在 B 链的部分) 触发 leave;
+ * (b) cursor 整体离开窗口 (WM_MOUSELEAVE), 当前 hovered widget 链全员触发.
+ * cb=NULL 解绑. 无 x/y 参数 — leave 时 cursor 在别处或已脱离, 给坐标无意义. */
+UI_API void ui_widget_on_mouse_leave(UiWidget w,
+                                      UiWidgetMouseLeaveCallback cb,
+                                      void* userdata) {
+    auto* p = W(w);
+    if (!p) return;
+    if (!cb) { p->onMouseLeaveHook = nullptr; return; }
+    uint64_t handle = w;
+    p->onMouseLeaveHook = [cb, userdata, handle]() {
+        cb(handle, userdata);
+    };
+}
+
+/* Build 64+ (L13): 通用 widget focus / blur hook. 内部接 Widget::onFocusHook /
+ * onBlurHook (这两个 hook lib 内已存在, JS 端通过 page_state.cpp 用着, 现在
+ * 暴露 C API). 触发点: UiWindowImpl::SetFocus 切换 focusedWidget_ 时, 旧 widget
+ * 触发 blur, 新 widget 触发 focus. cb=NULL 解绑. */
+UI_API void ui_widget_on_focus(UiWidget w,
+                                UiWidgetFocusCallback cb,
+                                void* userdata) {
+    auto* p = W(w);
+    if (!p) return;
+    if (!cb) { p->onFocusHook = nullptr; return; }
+    uint64_t handle = w;
+    p->onFocusHook = [cb, userdata, handle]() {
+        cb(handle, userdata);
+    };
+}
+
+UI_API void ui_widget_on_blur(UiWidget w,
+                               UiWidgetFocusCallback cb,
+                               void* userdata) {
+    auto* p = W(w);
+    if (!p) return;
+    if (!cb) { p->onBlurHook = nullptr; return; }
+    uint64_t handle = w;
+    p->onBlurHook = [cb, userdata, handle]() {
+        cb(handle, userdata);
+    };
+}
+
+/* Build 66+ (L16): 通用 widget 滚轮回调. 接 Widget::onMouseWheelHook
+ * (跟 .uix @wheel 同路径). UiWindowImpl::OnMouseWheel 开头会无条件 fire
+ * 这个 hook, 跟 widget 子类的 OnMouseWheel dispatch loop 无关 — 所以
+ * <custom> 等不在 dispatch list 里的 widget 也能收到. cb=NULL 解绑. */
+UI_API void ui_widget_on_mouse_wheel(UiWidget w,
+                                       UiWidgetWheelCallback cb,
+                                       void* userdata) {
+    auto* p = W(w);
+    if (!p) return;
+    if (!cb) { p->onMouseWheelHook = nullptr; return; }
+    uint64_t handle = w;
+    /* widget 内坐标: e.x / e.y 是 widget 坐标系 (跟 onMouseMoveHook 同). */
+    p->onMouseWheelHook = [cb, userdata, handle, p](const ui::MouseEvent& e) {
+        cb(handle, e.x - p->rect.left, e.y - p->rect.top, e.delta, userdata);
+    };
 }
 
 UI_API int ui_widget_get_visible(UiWidget w) {
@@ -1629,14 +1929,35 @@ UI_API void ui_custom_on_layout(UiWidget w, UiCustomLayoutCallback cb, void* ud)
 
 #undef CUSTOM_SET_CB
 
+/* Build 64+ (L13): set_focused 同时把 widget 推进 owner window 的 focusedWidget_
+ * 槽, 让键盘事件 (WM_KEYDOWN) 能路由到这里; 同时触发 onFocusHook / onBlurHook.
+ * 旧调用方 (只把 paint bool 切来切去, 不需要键盘) 行为完全兼容 — 仍然写 paint
+ * bool, 多做的 SetFocus / ClearFocus 对没注册 keyDown 回调的 widget 无副作用. */
 UI_API void ui_custom_set_focused(UiWidget w, int focused) {
     auto* cw = As<ui::CustomWidget>(w);
-    if (cw) cw->focused = (focused != 0);
+    if (!cw) return;
+    cw->focused = (focused != 0);
+    auto* wi = Ctx().FindWindowByWidget(cw);
+    if (!wi) return;
+    if (focused) {
+        wi->SetFocus(cw);
+    } else if (wi->FocusedWidget() == cw) {
+        wi->ClearFocus();
+    }
+    wi->Invalidate();
 }
 
 UI_API int ui_custom_get_focused(UiWidget w) {
     auto* cw = As<ui::CustomWidget>(w);
     return cw ? (int)cw->focused : 0;
+}
+
+/* Build 64+ (L13): 让 <custom> 进入 lib 的键盘焦点系统 (focusable=true 时, 鼠标
+ * 点击会 SetFocus(this), Tab 也能走到). 默认 false 保留"纯展示型" custom widget
+ * 不吃键盘的行为. 调用方接管键盘交互时 opt-in. */
+UI_API void ui_custom_set_focusable(UiWidget w, int focusable) {
+    auto* cw = As<ui::CustomWidget>(w);
+    if (cw) cw->focusable = (focusable != 0);
 }
 
 // ================================================================
@@ -2117,6 +2438,31 @@ UI_API int ui_debug_menu_click_path(UiWindow win, const int* path, int depth) {
     return m->SimulateClickPath(path, depth) ? 0 : -1;
 }
 
+UI_API int ui_debug_menu_open_submenu_path(UiWindow win, const int* path, int depth) {
+    auto* wi = Win(win); if (!wi) return -1;
+    if (depth <= 0 || !path) return -2;
+    auto m = wi->ActiveMenu(); if (!m) return -3;
+    ui::ContextMenu* cur = m.get();
+    for (int i = 0; i < depth; ++i) {
+        cur = cur->OpenSubmenuAt(path[i]);
+        if (!cur) return -4;
+    }
+    return 0;
+}
+
+UI_API int ui_debug_screenshot_submenu_path(UiWindow win, const int* path, int depth,
+                                              const wchar_t* outPath) {
+    auto* wi = Win(win); if (!wi || !outPath) return -1;
+    if (depth <= 0 || !path) return -2;
+    auto m = wi->ActiveMenu(); if (!m) return -3;
+    ui::ContextMenu* cur = m.get();
+    for (int i = 0; i < depth; ++i) {
+        cur = cur->OpenSubmenuAt(path[i]);
+        if (!cur) return -4;
+    }
+    return cur->Screenshot(outPath);
+}
+
 UI_API void ui_debug_set_menu_autoclose(int enabled) {
     // enabled=0 → 抑制自动关闭；=非0 → 恢复默认
     ui::ContextMenu::g_debugSuppressAutoClose = (enabled == 0);
@@ -2179,6 +2525,11 @@ UI_API void ui_window_get_rect_screen(UiWindow win,
                                        int* out_w_dip, int* out_h_dip) {
     auto* wi = Win(win); if (!wi) return;
     wi->GetWindowRectScreen(out_x, out_y, out_w_dip, out_h_dip);
+}
+
+UI_API int ui_window_dpi(UiWindow win) {
+    auto* wi = Win(win);
+    return wi ? wi->Dpi() : 96;
 }
 
 UI_API void ui_window_resize_with_anchor(UiWindow win,

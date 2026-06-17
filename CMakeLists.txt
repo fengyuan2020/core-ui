@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 set(UI_CORE_VERSION "1.6.0")
-set(UI_CORE_INTERNAL_VERSION "135")
+set(UI_CORE_INTERNAL_VERSION "170")
 project(core-ui-project VERSION ${UI_CORE_VERSION} LANGUAGES C CXX)
 
 set(UI_CORE_VERSION_TAG "v${PROJECT_VERSION}")
@@ -51,6 +51,25 @@ set(QJS_BUILD_CLI_STATIC OFF CACHE BOOL "" FORCE)
 set(QJS_ENABLE_INSTALL   OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(quickjs)
 
+# ---- LunaSVG (+ plutovg) — 统一 SVG 引擎 (L173 / core-ui Phase 4) ----
+# vendored 源码 (含 gh-svg 自研 feDropShadow 滤镜层 + 提速), 静态编译折进 core-ui。
+# 与 gh-img-decode 用同一份引擎 → 看图器 SVG 渲染跟缩略图行为一致 (统一)。
+# 取代原 D2D ID2D1SvgDocument 路径: 支持 filter/text/mask 等 D2D 子集外能力。
+set(LUNASVG_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(PLUTOVG_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+# lunasvg/plutovg 静态折进 core-ui.dll, 不单独安装到 release/。用 EXCLUDE_FROM_ALL
+# 让父级 install 脚本不递归进该子目录 —— 之前用 CMAKE_SKIP_INSTALL_RULES ON/OFF
+# 包夹会抑制子目录 cmake_install.cmake 的生成, 但父级 cmake_install.cmake 仍
+# 无条件 include 它, 导致 `cmake --install` 报 "include could not find requested
+# file .../third_party/lunasvg/cmake_install.cmake" (L174 打 release 时暴露)。
+# EXCLUDE_FROM_ALL 会传递给嵌套的 plutovg 子目录, 一并排除出 install 递归。
+add_subdirectory(third_party/lunasvg EXCLUDE_FROM_ALL)
+foreach(_lunasvg_t lunasvg plutovg)
+    if(TARGET ${_lunasvg_t})
+        target_compile_options(${_lunasvg_t} PRIVATE /W0)
+    endif()
+endforeach()
+
 # ---- Core UI sources ----
 set(UI_CORE_SOURCES
     src/ui/renderer.cpp
@@ -68,6 +87,7 @@ set(UI_CORE_SOURCES
     src/ui/handle_table.cpp
     src/ui/asset.cpp
     src/ui/context_menu.cpp
+    src/ui/msgbox.cpp
     src/ui/ui_window.cpp
     src/ui/ui_context.cpp
     src/ui/ui_api.cpp
@@ -133,7 +153,7 @@ if(UI_CORE_STATIC)
                 ${UI_CORE_WIN_VERSION_DEFS}
         PRIVATE UI_CORE_BUILDING
     )
-    target_link_libraries(core-ui PUBLIC ${UI_CORE_SYSTEM_LIBS} qjs)
+    target_link_libraries(core-ui PUBLIC ${UI_CORE_SYSTEM_LIBS} qjs lunasvg)
 else()
     # ---- Shared library: core-ui.dll ----
     add_library(core-ui SHARED ${UI_CORE_SOURCES})
@@ -143,7 +163,7 @@ else()
                 ${UI_CORE_WIN_VERSION_DEFS}
         PRIVATE UI_CORE_BUILDING
     )
-    target_link_libraries(core-ui PRIVATE ${UI_CORE_SYSTEM_LIBS} qjs)
+    target_link_libraries(core-ui PRIVATE ${UI_CORE_SYSTEM_LIBS} qjs lunasvg)
 
     # 同时再编一份独立的"自包含静态归档"，发布到 lib/static/。
     # 这必须从源重新编译一次：UI_CORE_STATIC 宏改变了 ui_core.h 里
@@ -158,7 +178,7 @@ else()
                     ${UI_CORE_WIN_VERSION_DEFS}
             PRIVATE UI_CORE_BUILDING
         )
-        target_link_libraries(core-ui-static PUBLIC ${UI_CORE_SYSTEM_LIBS} qjs)
+        target_link_libraries(core-ui-static PUBLIC ${UI_CORE_SYSTEM_LIBS} qjs lunasvg)
         target_include_directories(core-ui-static
             PUBLIC  include
             PRIVATE src/ui
@@ -263,7 +283,9 @@ else()
                     "/OUT:${_fat_static}"
                     "$<TARGET_FILE:core-ui-static>"
                     "$<TARGET_FILE:qjs>"
-            DEPENDS core-ui-static qjs
+                    "$<TARGET_FILE:lunasvg>"
+                    "$<TARGET_FILE:plutovg>"
+            DEPENDS core-ui-static qjs lunasvg plutovg
             COMMENT "Bundling core-ui-static + qjs → core-ui-fat.lib"
             VERBATIM
         )

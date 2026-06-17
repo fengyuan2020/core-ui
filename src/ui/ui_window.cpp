@@ -10,12 +10,14 @@
 #include <shellapi.h>
 #include <wrl/client.h>
 #include <wincodec.h>
+#include <timeapi.h>   /* timeBeginPeriod/timeEndPeriod — WIN32_LEAN_AND_MEAN 下 windows.h 不带 mmsystem */
 #include <cmath>
 #include <unordered_set>
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "winmm.lib")   /* timeBeginPeriod/timeEndPeriod — toast 叠加窗 16ms timer 提精度 */
 
 #if !defined(_WIN32_WINNT) || _WIN32_WINNT < 0x0A00
 static inline UINT GetDpiForWindow(HWND hwnd) {
@@ -63,6 +65,7 @@ struct UiInvokeReq {
 };
 
 bool UiWindowImpl::classRegistered_ = false;
+bool UiWindowImpl::s_toastClassRegistered_ = false;
 
 #ifndef DWMWA_TRANSITIONS_FORCEDISABLED
 #define DWMWA_TRANSITIONS_FORCEDISABLED 3
@@ -144,6 +147,9 @@ static void ForEachToggleWidget(Widget* w, const std::function<void(ToggleWidget
 
 UiWindowImpl::UiWindowImpl() = default;
 UiWindowImpl::~UiWindowImpl() {
+    /* toast 叠加窗 owner = hwnd_, DestroyWindow(hwnd_) 会连带销毁它, 但仍要
+     * 显式 KillTimer + timeEndPeriod 配对 (DestroyToast 负责), 防泄漏时钟精度. */
+    DestroyToast();
     if (hwnd_) DestroyWindow(hwnd_);
     if (hIcon_) DestroyIcon(hIcon_);
 }
@@ -177,7 +183,11 @@ bool UiWindowImpl::Create(const wchar_t* title, int width, int height,
     configWidth_ = width;
     configHeight_ = height;
 
-    DWORD exStyle = WS_EX_COMPOSITED | WS_EX_LAYERED;
+    /* L174: 去掉 WS_EX_COMPOSITED —— core-ui 是单 HWND + D2D 自绘, 无子窗口,
+     * 该 flag (给子窗自下而上双缓冲 alpha 用) 在此零收益, 却让 DWM 每次合成多走
+     * 一层重定向双缓冲, 拖动/缩放时平添开销。WS_EX_LAYERED 仍单独保留给开场动画/
+     * 透明路径 (走 SetLayeredWindowAttributes), 不受影响。 */
+    DWORD exStyle = WS_EX_LAYERED;
     if (toolWindow) exStyle |= WS_EX_TOOLWINDOW;
     /* Build 65+ (L14): owner 窗不上 Alt+Tab / 不单独 taskbar 项. owned 顶级窗
      * 用 WS_EX_APPWINDOW 跟 owner 语义冲突 (强制出现在 taskbar), 撤掉. */
@@ -305,6 +315,18 @@ void UiWindowImpl::SetIconFromPixels(const uint8_t* rgba, int w, int h) {
     }
 }
 
+/* L101: 最大化态客户区 = 显示器工作区 (与 OnGetMinMaxInfo 把 ptMaxSize 限到
+ * rcWork 一致)。Show / PrepareRT 在 start_maximized hint 下用它把隐藏窗口预置到
+ * 最终最大化尺寸, 避免首帧按常规尺寸布局/fit 再被 SW_SHOWMAXIMIZED resize (内容
+ * "先常规一帧再放大")。 */
+static bool MaximizedWorkRect(HWND hwnd, RECT& out) {
+    MONITORINFO mi{ sizeof(mi) };
+    if (!GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi))
+        return false;
+    out = mi.rcWork;
+    return true;
+}
+
 void UiWindowImpl::Show() {
     if (!hwnd_) return;
 
@@ -314,7 +336,11 @@ void UiWindowImpl::Show() {
      * Build 105+ (L25): UiWindowConfig.start_maximized 走同一分支, 让
      * caller 持久化"最大化关→最大化开"不用自己 ShowWindow(SW_MAXIMIZE)
      * 撞 lib 的 layered fade-in 时序. */
-    bool preMaximized = IsZoomed(hwnd_) != 0 || startMaximizedPending_;
+    bool alreadyZoomed = IsZoomed(hwnd_) != 0;
+    bool preMaximized  = alreadyZoomed || startMaximizedPending_;
+    /* L101: hint 触发(尚未 zoom) → 下面要先把窗口预置到最大化尺寸再 OnPaint;
+     * 已 IsZoomed(外部 SW_MAXIMIZE) → 保持原 SWP_NOSIZE 不动尺寸。 */
+    bool maxFromHint   = startMaximizedPending_ && !alreadyZoomed;
     startMaximizedPending_ = false;
 
     /* 从当前窗口位置同步 target（外部可能已通过 SetWindowPos 改了位置） */
@@ -339,9 +365,20 @@ void UiWindowImpl::Show() {
     startupRevealPosted_ = false;
 
     if (preMaximized) {
-        /* 最大化路径：只触发 NCCALCSIZE 让 borderless 客户区生效，不改位置/尺寸 */
-        SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        /* 最大化路径：不走 slide 动画。
+         * - 已 IsZoomed(外部已 SW_MAXIMIZE): 只触发 NCCALCSIZE 让 borderless 客户区
+         *   生效, 不改位置/尺寸。
+         * - L101 start_maximized hint(尚未 zoom): 先把窗口预置到最大化客户区(=工作区),
+         *   让下面 OnPaint 的首帧即最大化尺寸, 不留常规尺寸帧。 */
+        RECT wr;
+        if (maxFromHint && MaximizedWorkRect(hwnd_, wr)) {
+            SetWindowPos(hwnd_, nullptr, wr.left, wr.top,
+                         wr.right - wr.left, wr.bottom - wr.top,
+                         SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        } else {
+            SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        }
         if (!renderer_.RT()) renderer_.CreateRenderTarget(hwnd_);
         LayoutRoot();
         OnPaint();
@@ -379,17 +416,47 @@ void UiWindowImpl::PrepareRT() {
     if (exStyle & WS_EX_LAYERED)
         SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, exStyle & ~WS_EX_LAYERED);
 
-    {
-        RECT wr; GetWindowRect(hwnd_, &wr);
-        windowTargetX_ = wr.left;
-        windowTargetY_ = wr.top;
-        windowTargetWidth_ = (float)(wr.right - wr.left);
-        windowTargetHeight_ = (float)(wr.bottom - wr.top);
+    /* L101: start_maximized hint 命中时, prepare 阶段就把隐藏窗口预置到最大化
+     * 客户区(=工作区, 同 OnGetMinMaxInfo)。这样 caller 在 show 前做的布局/图片
+     * fit 就按最大化尺寸算; 随后 ShowImmediate 的 SW_SHOWMAXIMIZED 是同尺寸,
+     * 无 reflow、无"先常规 fit 一帧再放大"。未命中走原常规尺寸路径。 */
+    RECT target;
+    if (startMaximizedPending_ && MaximizedWorkRect(hwnd_, target)) {
+        /* L101/L102/L103 + 首帧全屏 + 无闪: 真最大化, 但全程**屏幕上不可见**。
+         * 窗口此刻在创建时的常规尺寸, 直接 SW_SHOWMAXIMIZED 会把还没建 RT/绘内容的
+         * 窗口短暂合成一帧出来(黑底 + 顶部最大化窗自带的 1px 白边线)= 用户看到的白条闪。
+         * 故先 WS_EX_LAYERED + alpha 0 让窗口透明, 再 SW_SHOWMAXIMIZED:
+         *   - maximize 把 rcNormalPosition 记成常规创建尺寸 → 拖标题/双击还原到常规窗口(L102);
+         *   - client → 工作区 → caller 图片 fit 按最大化算(L101 无"先小后大");
+         *   - 全程 alpha 0, 屏幕上完全不可见 → 无黑底/白边闪。
+         * 窗口保持 shown+透明, ShowImmediate 绘完内容后一次 alpha→255 揭示 = 首帧即全屏
+         * +有内容, 无任何闪/白边/先小后大。不再 SetWindowPos(已最大化在工作区)。 */
+        SetWindowLongPtrW(hwnd_, GWL_EXSTYLE,
+                          GetWindowLongPtrW(hwnd_, GWL_EXSTYLE) | WS_EX_LAYERED);
+        SetLayeredWindowAttributes(hwnd_, 0, 0, LWA_ALPHA);   /* alpha 0 = 不可见 */
+        maximized_ = true;
+        if (borderless_) {
+            MARGINS mz{0, 0, 0, 0};
+            DwmExtendFrameIntoClientArea(hwnd_, &mz);
+        }
+        ShowWindow(hwnd_, SW_SHOWMAXIMIZED);   /* 透明状态下最大化, 屏上不可见 */
+        framePrepared_ = true;
+        GetWindowRect(hwnd_, &target);
+        windowTargetX_      = target.left;
+        windowTargetY_      = target.top;
+        windowTargetWidth_  = (float)(target.right - target.left);
+        windowTargetHeight_ = (float)(target.bottom - target.top);
+    } else {
+        GetWindowRect(hwnd_, &target);
+        windowTargetX_      = target.left;
+        windowTargetY_      = target.top;
+        windowTargetWidth_  = (float)(target.right - target.left);
+        windowTargetHeight_ = (float)(target.bottom - target.top);
+        SetWindowPos(hwnd_, nullptr, windowTargetX_, windowTargetY_,
+                     (int)windowTargetWidth_, (int)windowTargetHeight_,
+                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        framePrepared_ = true;
     }
-
-    SetWindowPos(hwnd_, nullptr, windowTargetX_, windowTargetY_,
-                 (int)windowTargetWidth_, (int)windowTargetHeight_,
-                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 
     if (!renderer_.RT()) renderer_.CreateRenderTarget(hwnd_);
     LayoutRoot();
@@ -403,8 +470,12 @@ void UiWindowImpl::ShowImmediate() {
     bool startMax = startMaximizedPending_;
     startMaximizedPending_ = false;
 
-    SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    if (!framePrepared_) {
+        /* 未经 PrepareRT 的直接 show: 仍需 FRAMECHANGED 触发 NCCALCSIZE
+         * (borderless 客户区)。prepared 路径已做过, 跳过省一笔 DWM 事务。 */
+        SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    }
 
     if (!renderer_.RT()) renderer_.CreateRenderTarget(hwnd_);
 
@@ -414,10 +485,15 @@ void UiWindowImpl::ShowImmediate() {
     OnPaint();
     ValidateRect(hwnd_, nullptr);
 
-    /* SW_SHOWNA 显示但不激活 → 不触发 WM_ACTIVATE 的 DWM 首帧同步（部分机器 200-300ms）。
-     * start_maximized=1 时改 SW_SHOWMAXIMIZED — 会激活窗口, 但带初始图启动
-     * 本来就要前台, 跟 SW_SHOWNA 的"不激活"约束不冲突. */
-    ShowWindow(hwnd_, startMax ? SW_SHOWMAXIMIZED : SW_SHOWNA);
+    if (startMax) {
+        /* L102/L103: 窗口已在 PrepareRT 真最大化 + WS_EX_LAYERED alpha 0(shown 但透明,
+         * client=工作区, rcNormalPosition=常规)。OnPaint 已把内容绘进 RT, 这里一次
+         * alpha→255 揭示 → 首帧即全屏 + 有内容, 无黑底/白边/先小后大闪。 */
+        SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA);
+    } else {
+        /* SW_SHOWNA 显示但不激活 → 不触发 WM_ACTIVATE 的 DWM 首帧同步(部分机器 200-300ms)。 */
+        ShowWindow(hwnd_, SW_SHOWNA);
+    }
     if (!toolWindow_) {
         BringWindowToTop(hwnd_);
         SetForegroundWindow(hwnd_);
@@ -753,6 +829,23 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_PAINT:
     case WM_DISPLAYCHANGE:
+        /* L175/L177: 隐藏/最小化窗口的 WM_PAINT —— DWM 不合成这类窗口, 其
+         * flip-model swapchain Present 等不到 back buffer 释放, 在某些 GPU 驱动
+         * (实测 AMD) 的 IDXGISwapChain::Present1 永久死锁, 卡死消息循环。
+         * L175(build 166) 当时整帧跳过(ValidateRect+return), 但那让"预创建隐藏窗 +
+         * ui_run 渐进上屏"的 caller 因 widget 永不绘制而被瓦片交付反复 invalidate
+         * → WM_PAINT 洪流 (GuoheView 超长图缓存命中启动卡死, bug-075)。
+         * L177 改为"绘制但不 present": skipPresent 让 OnPaint 照常 BeginDraw/
+         * DrawTree/EndDraw(flush 到 back buffer → widget 状态落定不再 invalidate),
+         * 只跳 swapChain flip(不撞驱动死锁)。窗口 show 后由 ShowImmediate/正常
+         * WM_PAINT present 揭示。ShowImmediate 直调 OnPaint 不设此标志, 上屏零影响。 */
+        if (!IsWindowVisible(hwnd_) || IsIconic(hwnd_)) {
+            renderer_.skipPresent = true;
+            OnPaint();
+            renderer_.skipPresent = false;
+            ValidateRect(hwnd_, nullptr);
+            return 0;
+        }
         OnPaint(); ValidateRect(hwnd_, nullptr); return 0;
 
     case WM_ENTERSIZEMOVE:
@@ -765,7 +858,6 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         // 收到 WM_SIZING 说明是 resize，不是纯移动
         if (!isResizing_) {
             isResizing_ = true;
-            ReleaseDragCache();  // 清除可能已创建的缓存
         }
         /* L57: aspect ratio lock — borderless 看图器 enter 时 SetAspectLock(image_w, image_h),
          * 用户拖窗任意边/角时这里按比例修正 RECT, Win32 把修正后的 RECT 当 user
@@ -817,15 +909,9 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         break;
     }
 
-    case WM_MOVING:
-        /* 强制 DWM 同步合成，消除拖动果冻延迟 */
-        DwmFlush();
-        break;
-
     case WM_EXITSIZEMOVE:
         isMoving_ = false;
         isResizing_ = false;
-        ReleaseDragCache();
         Invalidate();
         break;
 
@@ -906,39 +992,9 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
         }
-        if (wParam == kToastFadeTimerId) {
-            /* Build 68+ (L18): time-based 推进. phase / slide 都从
-             *   elapsed = now - toastShownTick_
-             * 派生. WM_TIMER 在系统忙时合并 / 丢 tick 也没事 — 下次 tick
-             * elapsed 跳跃式增加, slide 直接 catch-up 到正确值, 视觉是
-             * "帧间隔大但进度连续", 不再有 stall. */
-            const uint64_t now     = GetTickCount64();
-            const uint64_t elapsed = (toastShownTick_ != 0 && now >= toastShownTick_)
-                                         ? (now - toastShownTick_) : 0;
-            const uint64_t t1 = kToastSlideInMs;
-            const uint64_t t2 = t1 + holdDurationMs_;
-            const uint64_t t3 = t2 + kToastSlideOutMs;
-
-            if (elapsed < t1) {
-                toastPhase_ = 1;
-                toastSlide_ = static_cast<float>(elapsed) / kToastSlideInMs;
-            } else if (elapsed < t2) {
-                toastPhase_ = 2;
-                toastSlide_ = 1.0f;
-            } else if (elapsed < t3) {
-                toastPhase_ = 3;
-                toastSlide_ = 1.0f - static_cast<float>(elapsed - t2) / kToastSlideOutMs;
-            } else {
-                toastPhase_ = 0;
-                toastSlide_ = 0.0f;
-                toastText_.clear();
-                toastShownTick_ = 0;
-                KillTimer(hwnd_, kToastFadeTimerId);
-                toastTimerId_ = 0;
-            }
-            Invalidate();
-            return 0;
-        }
+        /* Build 165+ (L172 follow-up): toast 的 kToastFadeTimerId 现在跑在
+         * 独立的 toast 叠加窗 (toastHwnd_) 上, 由 ToastWndProc 处理 —— 主窗
+         * WndProc 不再有 toast timer 分支 (淡变只重渲那个小窗, 不碰主窗 RT). */
         if (wParam == kCaretBlinkTimerId) {
             if (HasFocusedTextInput()) {
                 Invalidate();
@@ -1119,6 +1175,16 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_KEYDOWN: {
         int vk = (int)wParam;
+        /* L96: IME(中文等)激活、正在处理该键时, Windows 把 wParam 设成
+         * VK_PROCESSKEY(0xE5), 真实键拿不到 → key 消费者(如快捷键捕获)记成
+         * 0xE5 显示"?"。从 lParam 的扫描码反查真实 VK(MapVirtualKey 走扫描码、
+         * IME 无关、user32 已链接, 不引 imm32)。IME 文字输入走 WM_CHAR/
+         * WM_IME_CHAR 另一条路, 不受此影响。 */
+        if (vk == VK_PROCESSKEY) {
+            UINT sc = (UINT)((lParam >> 16) & 0xFF);
+            UINT real = MapVirtualKeyW(sc, MAPVK_VSC_TO_VK);
+            if (real) vk = (int)real;
+        }
         if (DispatchKeyDown(vk)) return 0;
         if (onKey) onKey(vk);
         /* return 0 (而非 break) — onKey 回调里可能销毁本窗口 (典型: 自定义
@@ -1275,6 +1341,9 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             KillTimer(hwnd_, kCaretBlinkTimerId);
             caretBlinkTimerRunning_ = false;
         }
+        /* 主窗销毁前先收掉 toast 叠加窗 + 其 timer + timeEndPeriod 配对
+         * (this 在 RemoveWindow 后失效, 不能拖到那之后). */
+        DestroyToast();
         HWND oldHwnd = hwnd_;
         hwnd_ = nullptr;
         auto& ctx = GetContext();
@@ -1299,6 +1368,15 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_NCACTIVATE: return DefWindowProcW(hwnd_, WM_NCACTIVATE, wParam, -1);
         case WM_NCPAINT: return 0;
         case WM_NCHITTEST: return OnNcHitTest(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+        case WM_NCLBUTTONDOWN:
+            /* L90: 菜单开着时, 点窗口非客户区 (含 canvas mode 下 OnNcHitTest 把
+             * 整窗/画布判成 HTCAPTION 的可拖区) 先关菜单并消掉本次点击 —— 对齐
+             * HTCLIENT 路径 OnMouseDown→CloseMenu 的行为. 否则 borderless 看图
+             * 左键点画布走 WM_NCLBUTTONDOWN → DefWindowProc 进窗口移动 modal
+             * loop, 完全不经 OnMouseDown, 菜单关不掉. 无菜单时 fall through 照常
+             * 拖窗 / 系统行为. */
+            if (activeMenu_) { CloseMenu(); return 0; }
+            break;
         case WM_NCLBUTTONDBLCLK:
             if (wParam == HTCAPTION) {
                 ShowWindow(hwnd_, maximized_ ? SW_RESTORE : SW_MAXIMIZE);
@@ -1370,16 +1448,6 @@ void UiWindowImpl::OnPaint() {
         Viewport() = root_->rect;
         root_->DrawTree(renderer_);
         root_->DrawOverlays(renderer_);
-    }
-
-    // Active modal dialog draws on top of the entire tree (including overlays
-    // like dropdowns/flyouts). Dialog never lives in the widget tree — its
-    // rect is forced to the full client area here so the mask covers
-    // everything and the centered panel sits at the visual window center.
-    if (activeDialog_ && activeDialog_->IsActive()) {
-        D2D1_SIZE_F sz = renderer_.RT()->GetSize();
-        activeDialog_->rect = {0, 0, sz.width, sz.height};
-        activeDialog_->OnDraw(renderer_);
     }
 
     // Debug highlight: draw red border around widget with matching ID
@@ -1467,8 +1535,8 @@ void UiWindowImpl::OnPaint() {
         renderer_.DrawRect(border, theme::kWindowBorder(), theme::kBorderWidth);
     }
 
-    // Toast notification
-    DrawToast(renderer_);
+    // Toast notification — Build 165+ (L172 follow-up): 移到独立 DComp 叠加窗
+    // (toastHwnd_ / PaintToast), 不再画进主窗 RT. 这里不画.
 
     HRESULT hr = renderer_.EndDraw();
     if (hr == D2DERR_RECREATE_TARGET) renderer_.CreateRenderTarget(hwnd_);
@@ -1497,83 +1565,18 @@ void UiWindowImpl::OnPaint() {
     }
 }
 
-// 创建窗口拖动缓存
-void UiWindowImpl::CreateDragCache() {
-    if (!renderer_.RT()) return;
-
-    auto* mainCtx = renderer_.RT();
-    D2D1_SIZE_F size = mainCtx->GetSize();
-
-    // 获取当前渲染目标的 DPI
-    float dpiX, dpiY;
-    mainCtx->GetDpi(&dpiX, &dpiY);
-
-    // 保存 DPI 和尺寸
-    dragCacheDpi_ = dpiX;
-    dragCacheWidth_ = size.width;
-    dragCacheHeight_ = size.height;
-
-    // 创建兼容渲染目标
-    ComPtr<ID2D1BitmapRenderTarget> bitmapRenderTarget;
-    D2D1_SIZE_F desiredSize = {size.width, size.height};
-    HRESULT hr = mainCtx->CreateCompatibleRenderTarget(
-        &desiredSize,
-        nullptr,
-        nullptr,
-        D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE,
-        bitmapRenderTarget.GetAddressOf());
-
-    if (FAILED(hr) || !bitmapRenderTarget) return;
-
-    // 设置 DPI
-    bitmapRenderTarget->SetDpi(dpiX, dpiY);
-
-    // 获取兼容渲染目标的 DeviceContext 接口
-    ComPtr<ID2D1DeviceContext> cacheCtx;
-    if (FAILED(bitmapRenderTarget->QueryInterface(cacheCtx.GetAddressOf()))) return;
-
-    // 保存原始渲染目标
-    ComPtr<ID2D1DeviceContext> originalCtx(renderer_.RT());
-
-    // 临时切换 Renderer 到兼容渲染目标
-    renderer_.SetTarget(cacheCtx.Get());
-
-    // 绘制窗口内容到兼容渲染目标
-    cacheCtx->BeginDraw();
-    if (bgMode_ == 0) {
-        cacheCtx->Clear(theme::kWindowBg());
-    } else {
-        cacheCtx->Clear(D2D1::ColorF(0, 0, 0, 0));
-    }
-
-    if (root_) {
-        D2D1_RECT_F originalViewport = Viewport();
-        Viewport() = root_->rect;
-        root_->DrawTree(renderer_);
-        Viewport() = originalViewport;
-    }
-
-    cacheCtx->EndDraw();
-
-    // 恢复原始渲染目标
-    renderer_.SetTarget(originalCtx.Get());
-
-    // 从兼容渲染目标获取位图
-    bitmapRenderTarget->GetBitmap(dragCacheBitmap_.GetAddressOf());
-}
-
-// 释放窗口拖动缓存
-void UiWindowImpl::ReleaseDragCache() {
-    dragCacheBitmap_.Reset();
-    dragCacheWidth_ = 0.0f;
-    dragCacheHeight_ = 0.0f;
-    dragCacheDpi_ = 96.0f;
-}
-
 void UiWindowImpl::OnResize(UINT width, UINT height) {
     renderer_.Resize(width, height);
     LayoutRoot();
-    if (onResize) onResize((int)width, (int)height);
+    /* L91: 回调单位补统一为 DIP. width/height 来自 WM_SIZE = 物理像素, 但
+     * ui_window_set_size / ui_widget_get_rect / 窗口几何 API 都已是 DIP
+     * (L6/L23 v1.2.0 统一过, 当时漏了本回调). 转成 DIP 跟它们一致, 消费者
+     * (如无边框看图记忆窗口长边) 拿到的尺寸跟 set_size 同单位, 高 DPI 屏不再
+     * 错乘 dpiScale_. */
+    if (onResize) {
+        const float s = dpiScale_ > 0.0f ? dpiScale_ : 1.0f;
+        onResize((int)(width / s + 0.5f), (int)(height / s + 0.5f));
+    }
 }
 
 void UiWindowImpl::OnDpiChanged(UINT dpi, const RECT* suggested) {
@@ -1605,14 +1608,6 @@ void UiWindowImpl::CloseMenu() {
 
 void UiWindowImpl::OnMouseMove(float x, float y) {
     float dx = x / dpiScale_, dy = y / dpiScale_;
-
-    // Active modal dialog swallows all mouse input.
-    if (activeDialog_ && activeDialog_->IsActive()) {
-        MouseEvent e{dx, dy, 0, false};
-        activeDialog_->OnMouseMove(e);
-        Invalidate();
-        return;
-    }
 
     // If a popup menu is open, clicking in the main window should close it
     // (the popup's WM_ACTIVATE handler closes it when focus shifts)
@@ -1710,16 +1705,6 @@ void UiWindowImpl::OnMouseDown(float x, float y) {
     // Hide tooltip on click
     tooltipVisible_ = false; tooltipWidget_ = nullptr;
     if (tooltipTimerId_) { KillTimer(hwnd_, tooltipTimerId_); tooltipTimerId_ = 0; }
-
-    // Active modal dialog swallows all mouse input. Routed *before* the
-    // CloseMenu / focus-update / dropdown / flyout / hit-test paths so the
-    // underlying tree never sees the click.
-    if (activeDialog_ && activeDialog_->IsActive()) {
-        MouseEvent e{dx, dy, 0, true};
-        activeDialog_->OnMouseDown(e);
-        Invalidate();
-        return;
-    }
 
     // Close any open context menu on left click
     if (activeMenu_) CloseMenu();
@@ -1899,7 +1884,6 @@ void UiWindowImpl::OnMouseDoubleClick(float x, float y) {
     // so press/release/focus are handled there — here we only need the
     // hit-test → widget dispatch for @dblclick listeners. Modal dialogs
     // and active menus still swallow input.
-    if (activeDialog_ && activeDialog_->IsActive()) return;
     if (activeMenu_) return;
 
     float dx = x / dpiScale_, dy = y / dpiScale_;
@@ -1919,14 +1903,6 @@ void UiWindowImpl::OnMouseDoubleClick(float x, float y) {
 
 void UiWindowImpl::OnMouseUp(float x, float y) {
     float dx = x / dpiScale_, dy = y / dpiScale_;
-
-    // Active modal dialog swallows all mouse input.
-    if (activeDialog_ && activeDialog_->IsActive()) {
-        MouseEvent e{dx, dy, 0, false};
-        activeDialog_->OnMouseUp(e);
-        Invalidate();
-        return;
-    }
 
     if (pressedWidget_) {
         // Lifetime guard: an @click handler may end up unmounting THIS
@@ -1989,14 +1965,6 @@ void UiWindowImpl::OnMouseUp(float x, float y) {
 
 void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
     float dx = x / dpiScale_, dy = y / dpiScale_;
-
-    // Active modal dialog blocks scroll events from reaching the underlying
-    // tree (otherwise pages behind the modal could still scroll).
-    if (activeDialog_ && activeDialog_->IsActive()) {
-        MouseEvent e{dx, dy, (float)delta};
-        activeDialog_->OnMouseWheel(e);
-        return;
-    }
 
     if (root_) {
         // HitTest to find deepest widget, then bubble up looking for scroll handler
@@ -2065,11 +2033,6 @@ void UiWindowImpl::SimKeyDown(int vk) {
 
 // 共用的 WM_KEYDOWN 分发逻辑。返回 true 表示事件被消费。
 bool UiWindowImpl::DispatchKeyDown(int vk) {
-    // 0. Active dialog intercepts all keys
-    if (activeDialog_ && activeDialog_->IsActive()) {
-        if (activeDialog_->OnKeyDown(vk)) { Invalidate(); return true; }
-    }
-
     // 1. Tab / Shift+Tab → focus traversal (only when enabled)
     if (vk == VK_TAB && tabNavigationEnabled_) {
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -2402,7 +2365,39 @@ void UiWindowImpl::RegisterShortcut(int modifiers, int vk, std::function<void()>
 
 // ---- Toast ----
 
+/* Build 165+ (L172 follow-up): toast 改成独立 DirectComposition 透明叠加窗.
+ *
+ * 旧实现把 toast 画进主窗 D2D RT, 淡变靠主窗 WM_TIMER → Invalidate() 驱动,
+ * 每个淡变帧都重渲整个主窗 (含大图) + WM_TIMER 低优先级/15.6ms 粒度 → 卡顿.
+ * 现照 ContextMenu 弹窗模式建一个透明叠加小窗, 淡变只重渲该小窗, 不碰主窗.
+ *
+ * 坐标: ShowToast 用主 renderer_ 量文字算 boxW/boxH(DIP) + 屏幕落位(物理像素),
+ * 缓存到 toastBoxW_/H_, toastScreenX_/TargetY_. toast 窗按物理像素建, RT 已
+ * SetDpi → PaintToast 用 DIP 画 (0,0)..(boxW,boxH). FADE 窗口位置全程不动只动
+ * alpha; SLIDE 用 SetWindowPos 移窗口 Y, phase3 alpha 也衰减. */
+
+void UiWindowImpl::DestroyToast() {
+    if (toastHwnd_) {
+        KillTimer(toastHwnd_, kToastFadeTimerId);
+        DestroyWindow(toastHwnd_);
+        toastHwnd_ = nullptr;
+    }
+    toastTimerId_ = 0;
+    if (toastTimePeriodSet_) {
+        timeEndPeriod(1);
+        toastTimePeriodSet_ = false;
+    }
+    toastPhase_ = 0;
+    toastShownTick_ = 0;
+    toastText_.clear();
+}
+
 void UiWindowImpl::ShowToast(const std::wstring& text, int durationMs, int position, int icon, int anim) {
+    if (!hwnd_) return;
+
+    /* 多次快速 toast: 先彻底销毁旧的 (窗口/timer/timeEndPeriod 配对), 再重建. */
+    DestroyToast();
+
     toastText_ = text;
     toastPos_ = position;
     toastIcon_ = icon;
@@ -2410,74 +2405,143 @@ void UiWindowImpl::ShowToast(const std::wstring& text, int durationMs, int posit
     toastSlide_ = 0.0f;
     toastAlpha_ = 1.0f;
     toastPhase_ = 1;  /* slideIn (immediately) */
-
-    if (toastTimerId_) KillTimer(hwnd_, toastTimerId_);
-    toastTimerId_ = SetTimer(hwnd_, kToastFadeTimerId, kToastFadeIntervalMs, nullptr);
-    toastFading_ = false;
-
-    /* 保存 hold 时长 + 记录起点. time-based 推进的锚点 (L18). */
     holdDurationMs_ = durationMs;
     holdElapsed_ = 0;
-    toastShownTick_ = GetTickCount64();
-    Invalidate();
-}
 
-void UiWindowImpl::DrawToast(Renderer& r) {
-    if (toastText_.empty() || toastPhase_ == 0) return;
-
-    auto* rt = r.RT();
-    if (!rt) return;
-
-    D2D1_SIZE_F size = rt->GetSize();
+    /* ---- 用主 renderer_ 量文字算 box 尺寸 (DIP) ---- */
     float fontSize = theme::kFontSizeNormal;
-
-    float textW = r.MeasureTextWidth(toastText_, fontSize);
+    float textW = renderer_.MeasureTextWidth(toastText_, fontSize);
     float iconSize = fontSize + 2.0f;
     float iconGap = (toastIcon_ > 0) ? 8.0f : 0.0f;
     float iconSpace = (toastIcon_ > 0) ? (iconSize + iconGap) : 0.0f;
     float padH = 20.0f, padV = 10.0f;
     float boxW = textW + iconSpace + padH * 2;
     float boxH = fontSize + padV * 2;
-    float cx = size.width / 2.0f;
+    toastBoxW_ = boxW;
+    toastBoxH_ = boxH;
 
-    /* 计算目标 Y 和滑入方向偏移 */
-    float targetY = 0, hideOffset = 0;
-    if (toastPos_ == 0) {
-        /* 上方：从顶部滑入 */
-        targetY = 50.0f;
-        hideOffset = -(boxH + 60.0f);
-    } else if (toastPos_ == 1) {
-        /* 中间 */
-        targetY = (size.height - boxH) / 2.0f;
-        hideOffset = 0;
-    } else {
-        /* 下方：从底部滑入 */
-        targetY = size.height - boxH - 60.0f;
-        hideOffset = boxH + 60.0f;
+    /* ---- 取主窗客户区, 转屏幕坐标算 toast 落位 (物理像素) ---- */
+    RECT cr{};
+    GetClientRect(hwnd_, &cr);
+    POINT origin{0, 0};
+    ClientToScreen(hwnd_, &origin);                 // 客户区 (0,0) 的屏幕物理坐标
+    float clientW = (float)(cr.right - cr.left) / dpiScale_;   // 客户区宽 (DIP)
+    float clientH = (float)(cr.bottom - cr.top) / dpiScale_;   // 客户区高 (DIP)
+
+    /* X: 主窗客户区水平居中 (DIP) → 物理像素. */
+    float boxXDip = (clientW - boxW) / 2.0f;
+
+    /* Y (DIP) 按 position; 同时算 SLIDE 模式的 hideOffset 像素幅度. */
+    float targetYDip = 0.0f, hideOffsetDip = 0.0f;
+    if (toastPos_ == 0) {            /* 上: 顶 +50 DIP, 从上方滑入 */
+        targetYDip = 50.0f;
+        hideOffsetDip = -(boxH + 60.0f);
+    } else if (toastPos_ == 1) {     /* 中 */
+        targetYDip = (clientH - boxH) / 2.0f;
+        hideOffsetDip = 0.0f;
+    } else {                          /* 下: 底 -boxH-60 DIP, 从下方滑入 */
+        targetYDip = clientH - boxH - 60.0f;
+        hideOffsetDip = boxH + 60.0f;
     }
 
+    toastScreenX_       = origin.x + (int)(boxXDip * dpiScale_);
+    toastScreenTargetY_ = origin.y + (int)(targetYDip * dpiScale_);
+    toastSlideRangePx_  = (int)(hideOffsetDip * dpiScale_);
+
+    int winW = std::max<int>(1, (int)(boxW * dpiScale_ + 0.5f));
+    int winH = std::max<int>(1, (int)(boxH * dpiScale_ + 0.5f));
+
+    /* SLIDE 模式起始位置在 hideOffset 处; FADE 模式直接落在 target. */
+    int startY = (toastAnim_ == 1) ? toastScreenTargetY_
+                                   : (toastScreenTargetY_ + toastSlideRangePx_);
+
+    /* ---- 注册窗口类 (一次) ---- */
+    if (!s_toastClassRegistered_) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_HREDRAW | CS_VREDRAW;
+        wc.lpfnWndProc = ToastWndProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)GetStockObject(NULL_BRUSH);
+        wc.lpszClassName = L"UiCore_ToastOverlay";
+        RegisterClassExW(&wc);
+        s_toastClassRegistered_ = true;
+    }
+
+    /* ---- 建透明叠加窗 (照 CreatePopupWindow). WS_EX_TRANSPARENT 让点击穿透
+     * (toast 不吃事件); WS_EX_NOACTIVATE 不抢焦点; owner = hwnd_ 跟随 z-order
+     * 且主窗销毁时自动清. ---- */
+    toastHwnd_ = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE |
+            WS_EX_NOREDIRECTIONBITMAP | WS_EX_TRANSPARENT,
+        L"UiCore_ToastOverlay", L"",
+        WS_POPUP,
+        toastScreenX_, startY, winW, winH,
+        hwnd_, nullptr, GetModuleHandleW(nullptr), this);
+
+    if (!toastHwnd_) {
+        toastPhase_ = 0;
+        toastText_.clear();
+        return;
+    }
+
+    /* 共享主 renderer_ 的 factories — composition 模式 (透明 swapchain + DComp). */
+    toastRenderer_.Init(renderer_.Factory(), renderer_.DWFactory(), renderer_.WIC());
+    toastRenderer_.CreateRenderTargetForLayered(toastHwnd_);
+    /* 透明叠加窗强制 GRAYSCALE 抗锯齿 (ClearType 在 alpha-aware surface 会出
+     * 红蓝 fringe), 同 ContextMenu popup. */
+    toastRenderer_.SetTextRenderMode(theme::TextRenderMode::Smooth);
+
+    toastShownTick_ = GetTickCount64();   /* time-based 推进锚点 (L18) */
+
+    /* 16ms timer 需 1ms 系统时钟精度 (默认 15.6ms 粒度会让 60fps 淡变卡顿).
+     * timeBeginPeriod/timeEndPeriod 严格配对 — DestroyToast 收尾时 timeEndPeriod. */
+    timeBeginPeriod(1);
+    toastTimePeriodSet_ = true;
+    toastTimerId_ = SetTimer(toastHwnd_, kToastFadeTimerId, kToastFadeIntervalMs, nullptr);
+
+    /* 先 Paint 再 Show, 避免白闪 (同 ContextMenu). */
+    PaintToast();
+    ShowWindow(toastHwnd_, SW_SHOWNOACTIVATE);
+}
+
+void UiWindowImpl::PaintToast() {
+    if (!toastHwnd_ || !toastRenderer_.RT() || toastPhase_ == 0) return;
+
+    Renderer& r = toastRenderer_;
+    const float boxW = toastBoxW_;
+    const float boxH = toastBoxH_;
+    float fontSize = theme::kFontSizeNormal;
+    float iconSize = fontSize + 2.0f;
+    float iconGap = (toastIcon_ > 0) ? 8.0f : 0.0f;
+    float iconSpace = (toastIcon_ > 0) ? (iconSize + iconGap) : 0.0f;
+    float padH = 20.0f;
+
+    /* ease out cubic — 平滑曲线. toastSlide_ 由 ToastWndProc 按 elapsed 推进. */
     float slide = toastSlide_;
-    /* ease out cubic — 平滑曲线 */
     float t = 1.0f - (1.0f - slide) * (1.0f - slide) * (1.0f - slide);
 
-    float y;
+    /* 窗口位置由 ToastWndProc 用 SetWindowPos 处理 (SLIDE), 这里只算 alpha.
+     * FADE: phase1/3 alpha 走 ease 曲线, phase2 满; SLIDE: 仅 phase3 衰减. */
     float alpha;
     if (toastAnim_ == 1 /* UI_TOAST_ANIM_FADE */) {
-        /* FADE: y 全程钉在目标, alpha 按 phase 解释 (phase1: 0→1, phase2: 1, phase3: 1→0).
-         * WM_TIMER handler 已把 toastSlide_ 推到正确进度 (phase1: 0→1, phase3: 1→0). */
-        y = targetY;
         alpha = (toastPhase_ == 1 || toastPhase_ == 3) ? t : 1.0f;
     } else {
-        /* SLIDE (默认, 旧行为): y 用 hideOffset 插值, alpha 仅 phase3 衰减 */
-        y = targetY + hideOffset * (1.0f - t);
         alpha = (toastPhase_ == 3) ? slide : 1.0f;
     }
 
-    /* alpha < 1/255 视为不可见, 跳过整次绘制省 GPU. 也防 phase 切换瞬间
-     * 残留 alpha=0 的 1 帧闪 (FillRoundedRect 在 D2D 上不是严格 no-op). */
-    if (alpha < (1.0f / 255.0f)) return;
+    r.BeginDraw();
+    r.Clear({0, 0, 0, 0});   /* 透明背景 — alpha=0 处 DWM 合成穿透 */
 
-    D2D1_RECT_F boxRect = { cx - boxW / 2, y, cx + boxW / 2, y + boxH };
+    /* alpha < 1/255 视为不可见, 跳过整次绘制省 GPU. */
+    if (alpha < (1.0f / 255.0f)) {
+        r.EndDraw();
+        return;
+    }
+
+    /* box 填满 toast 窗 (0,0)..(boxW,boxH). */
+    D2D1_RECT_F boxRect = { 0.0f, 0.0f, boxW, boxH };
     D2D1_COLOR_F bgColor = {0.15f, 0.15f, 0.18f, 0.92f * alpha};
     D2D1_COLOR_F textColor = {0.95f, 0.95f, 0.97f, alpha};
 
@@ -2486,7 +2550,7 @@ void UiWindowImpl::DrawToast(Renderer& r) {
     /* 绘制图标 */
     if (toastIcon_ > 0) {
         float ix = boxRect.left + padH;
-        float iy = y + (boxH - iconSize) / 2.0f;
+        float iy = (boxH - iconSize) / 2.0f;
         float icx = ix + iconSize / 2.0f;
         float icy = iy + iconSize / 2.0f;
         float rad = iconSize / 2.0f;
@@ -2525,6 +2589,78 @@ void UiWindowImpl::DrawToast(Renderer& r) {
     r.DrawText(toastText_, textRect, textColor, fontSize,
                DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_FONT_WEIGHT_NORMAL,
                DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+    r.EndDraw();
+}
+
+LRESULT CALLBACK UiWindowImpl::ToastWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    UiWindowImpl* self = nullptr;
+    if (msg == WM_NCCREATE) {
+        auto cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        self = static_cast<UiWindowImpl*>(cs->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+    } else {
+        self = reinterpret_cast<UiWindowImpl*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    }
+    if (!self) return DefWindowProcW(hwnd, msg, wParam, lParam);
+
+    switch (msg) {
+    case WM_PAINT:
+        self->PaintToast();
+        ValidateRect(hwnd, nullptr);
+        return 0;
+    case WM_TIMER:
+        if (wParam == kToastFadeTimerId) {
+            /* time-based 推进 (L18): phase / slide 都从 elapsed 派生, WM_TIMER
+             * 合并 / 丢 tick 也没事 — 下次 tick elapsed 跳跃, slide catch-up. */
+            const uint64_t now = GetTickCount64();
+            const uint64_t elapsed = (self->toastShownTick_ != 0 && now >= self->toastShownTick_)
+                                         ? (now - self->toastShownTick_) : 0;
+            const uint64_t t1 = kToastSlideInMs;
+            const uint64_t t2 = t1 + self->holdDurationMs_;
+            const uint64_t t3 = t2 + kToastSlideOutMs;
+
+            if (elapsed < t1) {
+                self->toastPhase_ = 1;
+                self->toastSlide_ = static_cast<float>(elapsed) / kToastSlideInMs;
+            } else if (elapsed < t2) {
+                self->toastPhase_ = 2;
+                self->toastSlide_ = 1.0f;
+            } else if (elapsed < t3) {
+                self->toastPhase_ = 3;
+                self->toastSlide_ = 1.0f - static_cast<float>(elapsed - t2) / kToastSlideOutMs;
+            } else {
+                /* 结束: 销毁叠加窗 + KillTimer + timeEndPeriod 配对, 清状态. */
+                self->DestroyToast();
+                return 0;   /* DestroyToast 已 DestroyWindow(hwnd), 不能再碰 self->toast* */
+            }
+
+            /* SLIDE 模式: 按 ease 曲线移窗口 Y (起点 = target + range, 终点 = target).
+             * FADE 模式: 窗口位置全程不动, 只 PaintToast 改 alpha. */
+            if (self->toastAnim_ != 1) {
+                float slide = self->toastSlide_;
+                float t = 1.0f - (1.0f - slide) * (1.0f - slide) * (1.0f - slide);
+                int y = self->toastScreenTargetY_ +
+                        (int)(self->toastSlideRangePx_ * (1.0f - t));
+                SetWindowPos(hwnd, nullptr, self->toastScreenX_, y, 0, 0,
+                             SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER);
+            }
+            self->PaintToast();
+            return 0;
+        }
+        break;
+    case WM_NCCALCSIZE:
+        if (wParam) return 0;   /* 去掉非客户区 */
+        break;
+    case WM_NCHITTEST:
+        return HTTRANSPARENT;   /* 点击穿透 (配合 WS_EX_TRANSPARENT) */
+    case WM_SIZE:
+        if (self->toastRenderer_.RT()) {
+            self->toastRenderer_.Resize(LOWORD(lParam), HIWORD(lParam));
+        }
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
 // ---- Debug: Highlight ----

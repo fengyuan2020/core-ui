@@ -152,13 +152,28 @@ void ContextMenu::ShowPopup(HWND parentHwnd, int screenX, int screenY) {
     int pw = (int)(MenuWidth() * dpiScale);
     int ph = (int)(MenuHeight() * dpiScale);
 
-    // Clamp to screen — based on visual menu rect (not the shadow-padded hwnd).
-    int sw = GetSystemMetrics(SM_CXSCREEN);
-    int sh = GetSystemMetrics(SM_CYSCREEN);
-    if (screenX + pw > sw) screenX = sw - pw;
-    if (screenY + ph > sh) screenY = sh - ph;
-    if (screenX < 0) screenX = 0;
-    if (screenY < 0) screenY = 0;
+    // Clamp to the monitor under the requested point — based on visual menu rect
+    // (not the shadow-padded hwnd). 旧代码用 GetSystemMetrics(SM_CXSCREEN/CYSCREEN)
+    // (主屏尺寸) + clamp 到 [0, 主屏宽], 会把副屏的菜单坐标 (screenX 可能 > 主屏宽
+    // 或 < 0) 硬拉回主屏 → 副屏右键菜单 / 菜单栏下拉 / submenu 全弹到主屏 (L120)。
+    // 改用菜单所在屏 (鼠标点所在 monitor) 的 rcWork (工作区, 顺带避开任务栏)。
+    HMONITOR hMon = MonitorFromPoint(POINT{ screenX, screenY }, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{ sizeof(mi) };
+    if (GetMonitorInfoW(hMon, &mi)) {
+        const RECT& wa = mi.rcWork;
+        if (screenX + pw > wa.right)  screenX = wa.right  - pw;
+        if (screenY + ph > wa.bottom) screenY = wa.bottom - ph;
+        if (screenX < wa.left) screenX = wa.left;
+        if (screenY < wa.top)  screenY = wa.top;
+    } else {
+        // Fallback: 拿不到 monitor info 时退回主屏 clamp (退化但不崩)。
+        int sw = GetSystemMetrics(SM_CXSCREEN);
+        int sh = GetSystemMetrics(SM_CYSCREEN);
+        if (screenX + pw > sw) screenX = sw - pw;
+        if (screenY + ph > sh) screenY = sh - ph;
+        if (screenX < 0) screenX = 0;
+        if (screenY < 0) screenY = 0;
+    }
 
     // Menu content is drawn at (kShadowMargin, kShadowMargin) inside the
     // hwnd; the surrounding margin holds the blurred drop shadow.

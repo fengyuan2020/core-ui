@@ -12,12 +12,20 @@
 
 #include "gh_img_view.h"
 #include "event.h"
-#include "svg_style_inliner.h"   /* L48 — <style>+class 预处理 */
+
+#include <lunasvg.h>     /* L173 / core-ui Phase 4: 统一 SVG 引擎 (替 D2D
+                          * ID2D1SvgDocument; 原生支持 CSS / filter / text /
+                          * mask, 不再需要 svg_style_inliner 与 text→path 补丁) */
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <fstream>
+#include <iterator>
+#include <mutex>
+#include <thread>
+#include <vector>
 #include <Windows.h>
-#include <shlwapi.h>     /* SHCreateMemStream — SVG 加载 (L20 / L48) */
 
 namespace ui {
 
@@ -76,18 +84,37 @@ GhImgViewWidget::GhImgViewWidget() {
     focusable = true;
 }
 
+// L173 Phase 4: 后台 SVG 栅格化结果槽。widget 与后台渲染线程经 shared_ptr 共享,
+// 线程只碰这个 slot + 自己持有的 Document/HWND (不碰 widget), 故 widget 析构 /
+// 换图都不悬空; slot 在双方都释放后销毁。
+struct SvgRenderSlot {
+    std::mutex            mu;            // 保护 bgra / w / h / ready
+    std::vector<uint8_t>  bgra;          // 渲好的紧凑 BGRA premul (w*h*4)
+    uint32_t              w = 0, h = 0;
+    bool                  ready = false;
+    std::atomic<bool>     inFlight{false};    // 是否有后台线程在渲
+    std::atomic<uint32_t> wantW{0}, wantH{0}; // 最新期望尺寸 (缩放变了 → 渲完再渲最新)
+};
+
 GhImgViewWidget::~GhImgViewWidget() = default;
 
 // ===== 数据形状 =====
 
 void GhImgViewWidget::Begin(const Info& info, Renderer& r) {
     tiles_.clear();
-    preview_.Reset();
-    previewW_ = previewH_ = 0;
-    /* 切瓦块 source 前清 SVG 状态. */
-    svgDoc_.Reset();
-    svgTextRuns_.clear();
+    /* L168: keepPreview 时不清 preview 兜底层 — preview 在 OnDraw 永远先画兜底,
+     * tile 逐级盖上, 清晰度物理单调, 消除切金字塔时的闪烁。 */
+    if (!info.keepPreview) {
+        preview_.Reset();
+        previewW_ = previewH_ = 0;
+    }
+    /* 切瓦块 source 前清 SVG 状态. svgSlot_ 置空 = 放弃任何在飞后台渲染 (其线程
+     * 写到的是旧 slot, 自然丢弃)。 */
+    svgDoc_.reset();
+    svgRaster_.Reset();
+    svgRasterW_ = svgRasterH_ = 0;
     svgW_ = svgH_ = 0;
+    svgSlot_.reset();
 
     /* Cache DPI scale for PickAutoLevel — 算物理像素密度需要 zoom 乘上
      * dpi_scale, 不然 DPI>100% 时按 DIP 算阈值会偏向上采样 level → fit
@@ -153,6 +180,11 @@ void GhImgViewWidget::SetTile(uint32_t level, uint32_t tx, uint32_t ty,
     t.w   = tw;
     t.h   = th;
     tiles_[TileKey{level, tx, ty}] = std::move(t);
+    if (!tileBatch_) InvalidateAllWindows();   // L115: batch 内不刷, EndTileBatch 一次刷
+}
+
+void GhImgViewWidget::EndTileBatch() {
+    tileBatch_ = false;
     InvalidateAllWindows();
 }
 
@@ -171,7 +203,10 @@ void GhImgViewWidget::TrimToViewport_(uint32_t active_level,
         const bool in_viewport = (k.level == active_level &&
                                     k.tx >= visible_tx0 && k.tx < visible_tx1 &&
                                     k.ty >= visible_ty0 && k.ty < visible_ty1);
-        if (in_viewport) { ++it; continue; }
+        // L115: 保留上一个 active level 的 tile — OnDraw 多级 fallback 用它覆盖新级
+        // 未到达的 tile, 切级清晰→更清晰无波浪 (旧级 tile 数约新级 1/4, 内存可忽略)。
+        const bool keep_prev = (k.level == prevActiveLevel_);
+        if (in_viewport || keep_prev) { ++it; continue; }
         if (onTileEvicted) {
             onTileEvicted(k.level, k.tx, k.ty);
         }
@@ -194,9 +229,11 @@ void GhImgViewWidget::Clear() {
     tiles_.clear();
     preview_.Reset();
     previewW_ = previewH_ = 0;
-    svgDoc_.Reset();
-    svgTextRuns_.clear();
+    svgDoc_.reset();
+    svgRaster_.Reset();
+    svgRasterW_ = svgRasterH_ = 0;
     svgW_ = svgH_ = 0;
+    svgSlot_.reset();
     info_ = Info{};
     activeLevel_ = 0;
     zoom_ = 1.0f; panX_ = 0; panY_ = 0;
@@ -207,67 +244,41 @@ void GhImgViewWidget::Clear() {
 // ---- SVG 矢量源 (Build 70+ L20) ----
 
 bool GhImgViewWidget::SetSvgFromFile(const std::wstring& path, Renderer& r) {
-    auto* ctx5 = r.RT5();
-    if (!ctx5) return false;   /* Win10 1607 前 D2D1DeviceContext5 不可用 */
+    (void)r;   /* LunaSVG 纯 CPU 栅格化, 加载阶段不需要 D2D 渲染器 */
 
-    /* L48 — 读文件 + <style>+class 预处理后喂 mem stream. D2D ID2D1SvgDocument
-     * 不识别 <style> 内 CSS 规则, Adobe Illustrator / Figma / Sketch 等设计
-     * 工具默认导出的 SVG (style block + class 引用) 不预处理会全图渲染纯黑. */
-    std::string xml = LoadSvgWithInlinedStyles(path);
+    /* L173 / core-ui Phase 4: 改用 LunaSVG。它原生解析 <style> CSS 选择器 / 渐变 /
+     * clip / mask / <text> / filter, 不再需要 svg_style_inliner 预处理或
+     * <text>→<path> 转换 (那些是 D2D ID2D1SvgDocument 不支持时的补丁)。
+     * loadFromFile 走 UTF-8 路径, 这里把宽字符路径转 UTF-8。 */
+    /* 用宽字符路径读文件再 loadFromData — Windows 的 fopen/loadFromFile 把窄路径
+     * 按系统 ANSI 码页解释, 传 UTF-8 路径会打不开带中文的文件。MSVC 的 ifstream
+     * 支持 wchar_t* 路径, 绕开码页问题 (跟 ghde gh_svg_decoder 同思路)。 */
+    std::ifstream f(path.c_str(), std::ios::binary);
+    if (!f) return false;
+    std::string xml((std::istreambuf_iterator<char>(f)),
+                    std::istreambuf_iterator<char>());
     if (xml.empty()) return false;
 
-    Microsoft::WRL::ComPtr<IStream> stream;
-    stream.Attach(SHCreateMemStream(
-        reinterpret_cast<const BYTE*>(xml.data()),
-        static_cast<UINT>(xml.size())));
-    if (!stream) return false;
+    auto doc = lunasvg::Document::loadFromData(xml);
+    if (!doc) return false;
 
-    Microsoft::WRL::ComPtr<ID2D1SvgDocument> doc;
-    if (FAILED(ctx5->CreateSvgDocument(stream.Get(),
-                                         D2D1::SizeF(1024, 1024), &doc))) {
-        return false;
-    }
-
-    /* 读 root 的 viewBox / width / height 拿 natural size. 跟
-     * image_source_svg.cpp CreateSvgSourceFromFile 同款逻辑. */
-    uint32_t natW = 1024, natH = 1024;
-    Microsoft::WRL::ComPtr<ID2D1SvgElement> root;
-    doc->GetRoot(&root);
-    if (root) {
-        D2D1_SVG_VIEWBOX vb{};
-        if (SUCCEEDED(root->GetAttributeValue(L"viewBox",
-                                                D2D1_SVG_ATTRIBUTE_POD_TYPE_VIEWBOX,
-                                                &vb, sizeof(vb)))
-            && vb.width > 0 && vb.height > 0) {
-            natW = (uint32_t)vb.width;
-            natH = (uint32_t)vb.height;
-        } else {
-            D2D1_SVG_LENGTH lw{}, lh{};
-            if (SUCCEEDED(root->GetAttributeValue(L"width",
-                                                    D2D1_SVG_ATTRIBUTE_POD_TYPE_LENGTH,
-                                                    &lw, sizeof(lw)))
-                && lw.value > 0) {
-                natW = (uint32_t)lw.value;
-            }
-            if (SUCCEEDED(root->GetAttributeValue(L"height",
-                                                    D2D1_SVG_ATTRIBUTE_POD_TYPE_LENGTH,
-                                                    &lh, sizeof(lh)))
-                && lh.value > 0) {
-                natH = (uint32_t)lh.value;
-            }
-        }
-    }
+    /* natural size = LunaSVG intrinsic (viewBox 优先, 否则 width/height 属性)。 */
+    uint32_t natW = static_cast<uint32_t>(doc->width()  + 0.5f);
+    uint32_t natH = static_cast<uint32_t>(doc->height() + 0.5f);
+    if (natW == 0) natW = 1024;
+    if (natH == 0) natH = 1024;
 
     /* 进入 SVG 模式 — 清瓦块 state, 把 natural size 写进 info_ 让 Fit / zoom
      * 几何全部复用瓦块路径的代码. levels = 1 (SVG 不分级). */
     tiles_.clear();
     preview_.Reset();
     previewW_ = previewH_ = 0;
-    svgDoc_  = std::move(doc);
+    svgRaster_.Reset();              /* 新文件 — 作废旧栅格缓存 */
+    svgRasterW_ = svgRasterH_ = 0;
+    svgSlot_ = std::make_shared<SvgRenderSlot>();   /* 新文件 → 新结果槽 */
+    svgDoc_  = std::move(doc);       /* unique_ptr → shared_ptr */
     svgW_    = natW;
     svgH_    = natH;
-    /* L75: 解析 <text>/<foreignObject> 文字 (D2D 不画文字, OnDraw 里叠加). */
-    svgTextRuns_ = r.ParseSvgTextRuns(xml);
     info_ = Info{};
     info_.fullWidth   = natW;
     info_.fullHeight  = natH;
@@ -292,8 +303,7 @@ int GhImgViewWidget::RenderSvgToBgra(uint32_t target_w, uint32_t target_h,
                                        Renderer& r) {
     if (!svgDoc_ || svgW_ == 0 || svgH_ == 0) return -1;
     if (!out_bgra || target_w == 0 || target_h == 0) return -2;
-    auto* ctx5 = r.RT5();
-    if (!ctx5) return -3;
+    (void)r;   /* LunaSVG 纯 CPU 栅格化, 不需要 D2D 渲染器 */
 
     /* fit 保 aspect, 长边贴到 target 边 */
     double src_aspect = (double)svgW_ / (double)svgH_;
@@ -309,85 +319,175 @@ int GhImgViewWidget::RenderSvgToBgra(uint32_t target_w, uint32_t target_h,
     if (out_w_v == 0) out_w_v = 1;
     if (out_h_v == 0) out_h_v = 1;
 
-    /* off-screen target bitmap (GPU, 可作 RT) */
-    D2D1_BITMAP_PROPERTIES1 gpuProps = {};
-    gpuProps.pixelFormat = D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
-                                              D2D1_ALPHA_MODE_PREMULTIPLIED);
-    gpuProps.dpiX = 96.0f;
-    gpuProps.dpiY = 96.0f;
-    gpuProps.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
-
-    Microsoft::WRL::ComPtr<ID2D1Bitmap1> gpuBmp;
-    if (FAILED(ctx5->CreateBitmap(D2D1::SizeU(out_w_v, out_h_v),
-                                    nullptr, 0, &gpuProps, &gpuBmp))) {
-        return -4;
-    }
-
-    /* 临时切 target, render 完恢复. DPI 必须一并保存/恢复 + 强制 96 — 主 context
-     * 跟显示器 scale 走 (1.5x → 144 DPI), 但我们 offscreen bitmap 是 96 DPI 的
-     * "原生像素 = DIPs" 模型, 不强制重写 DPI 会让 Scale(out_w/svgW) 解释成 DIPs
-     * 在 144 DPI 下放大 1.5x, SVG 内容溢出 bitmap 边界. */
-    Microsoft::WRL::ComPtr<ID2D1Image> oldTarget;
-    ctx5->GetTarget(&oldTarget);
-    D2D1_MATRIX_3X2_F oldXf;
-    ctx5->GetTransform(&oldXf);
-    float oldDpiX = 96.0f, oldDpiY = 96.0f;
-    ctx5->GetDpi(&oldDpiX, &oldDpiY);
-
-    ctx5->SetTarget(gpuBmp.Get());
-    ctx5->SetDpi(96.0f, 96.0f);
-    ctx5->BeginDraw();
-    ctx5->Clear(D2D1::ColorF(0, 0, 0, 0));
-
-    svgDoc_->SetViewportSize(D2D1::SizeF((float)svgW_, (float)svgH_));
-    float sx = (float)out_w_v / (float)svgW_;
-    float sy = (float)out_h_v / (float)svgH_;
-    ctx5->SetTransform(D2D1::Matrix3x2F::Scale(sx, sy));
-    ctx5->DrawSvgDocument(svgDoc_.Get());
-    /* L75: D2D 不画 <text>/<foreignObject> 文字 → DirectWrite 叠加 (同 OnDraw).
-     * 离屏 bitmap 是当前 target, 用同一 Scale 变换. 鸟瞰图/缩略图也要文字, 否则
-     * 主视图有字、minimap 没字, 不一致. */
-    if (!svgTextRuns_.empty())
-        r.DrawSvgTextRuns(svgTextRuns_, D2D1::Matrix3x2F::Scale(sx, sy));
-
-    HRESULT hr = ctx5->EndDraw();
-    ctx5->SetTarget(oldTarget.Get());
-    ctx5->SetDpi(oldDpiX, oldDpiY);
-    ctx5->SetTransform(oldXf);
-
-    if (FAILED(hr)) return -5;
-
-    /* CPU 读回: 单独建一份 CPU_READ + CANNOT_DRAW bitmap, CopyFromBitmap 拷过来,
-     * Map 拿 BGRA 行 (stride 可能 > w*4). */
-    D2D1_BITMAP_PROPERTIES1 cpuProps = gpuProps;
-    cpuProps.bitmapOptions = D2D1_BITMAP_OPTIONS_CPU_READ |
-                              D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
-
-    Microsoft::WRL::ComPtr<ID2D1Bitmap1> cpuBmp;
-    if (FAILED(ctx5->CreateBitmap(D2D1::SizeU(out_w_v, out_h_v),
-                                    nullptr, 0, &cpuProps, &cpuBmp))) {
-        return -6;
-    }
-    D2D1_POINT_2U dstPt = {0, 0};
-    D2D1_RECT_U srcRc = {0, 0, out_w_v, out_h_v};
-    if (FAILED(cpuBmp->CopyFromBitmap(&dstPt, gpuBmp.Get(), &srcRc))) {
-        return -7;
-    }
-
-    D2D1_MAPPED_RECT mapped = {};
-    if (FAILED(cpuBmp->Map(D2D1_MAP_OPTIONS_READ, &mapped))) {
-        return -8;
-    }
-    for (uint32_t y = 0; y < out_h_v; ++y) {
+    /* LunaSVG 栅格化 (CPU)。premultiplied ARGB32 (BGRA 字节序) = caller 期望的
+     * BGRA premul, 逐行拷出 (stride 可能 > w*4)。 */
+    lunasvg::Bitmap bmp = svgDoc_->renderToBitmap((int)out_w_v, (int)out_h_v,
+                                                  0x00000000u);
+    if (bmp.isNull() || !bmp.data()) return -5;
+    const uint8_t* src    = bmp.data();
+    const int      stride = bmp.stride();
+    const uint32_t bw     = (uint32_t)bmp.width();
+    const uint32_t bh     = (uint32_t)bmp.height();
+    const uint32_t cw     = (bw < out_w_v) ? bw : out_w_v;
+    const uint32_t ch     = (bh < out_h_v) ? bh : out_h_v;
+    memset(out_bgra, 0, (size_t)out_w_v * out_h_v * 4);
+    for (uint32_t y = 0; y < ch; ++y) {
         memcpy(out_bgra + (size_t)y * out_w_v * 4,
-                mapped.bits + (size_t)y * mapped.pitch,
-                (size_t)out_w_v * 4);
+               src + (size_t)y * stride,
+               (size_t)cw * 4);
     }
-    cpuBmp->Unmap();
 
     if (out_w) *out_w = out_w_v;
     if (out_h) *out_h = out_h_v;
     return 0;
+}
+
+// L173 / core-ui Phase 4: SVG 按当前显示分辨率重栅到 svgRaster_。
+// 关键: 缓存分辨率必须贴近显示分辨率 — 放大过界 (cache < 显示, 会上采糊) 或缩小
+// 过多 (cache > 显示×kReuseMax, 大倍数 downscale 直接缩会锯齿, D2D 无 mipmap 预
+// 滤波) 都要重栅。重栅渲到 显示×kSuper (轻度超采样抗锯齿 + 给邻近缩放档复用余量)。
+void GhImgViewWidget::EnsureSvgRaster(const D2D1_RECT_F& dest, Renderer& r) {
+    if (!svgDoc_ || svgW_ == 0 || svgH_ == 0) return;
+    const float drawW = dest.right - dest.left;
+    const float drawH = dest.bottom - dest.top;
+    if (drawW <= 0.f || drawH <= 0.f) return;
+
+    /* 当前显示尺寸 (设备像素), 封顶兜内存 (保 aspect)。 */
+    const uint32_t kCap = 4096;
+    uint32_t needW = (uint32_t)std::ceil(drawW);
+    uint32_t needH = (uint32_t)std::ceil(drawH);
+    if (needW > kCap || needH > kCap) {
+        const float s = (float)kCap / (float)(needW > needH ? needW : needH);
+        needW = (uint32_t)(needW * s);
+        needH = (uint32_t)(needH * s);
+    }
+    if (needW == 0) needW = 1;
+    if (needH == 0) needH = 1;
+
+    /* 复用窗口: 缓存 ∈ [显示, 显示×1.6]。下限保证不上采 (不糊), 上限把 downscale
+     * 倍数限制在 1.6× 内 (D2D 高质三次插值在此范围内无锯齿; 再大直接缩就走样)。
+     * 落窗内 → 复用; 否则 (放大过界 / 缩小过多) → 重栅到当前显示档。 */
+    if (svgRaster_
+        && svgRasterW_ >= needW && svgRasterW_ <= needW + needW * 6 / 10
+        && svgRasterH_ >= needH && svgRasterH_ <= needH + needH * 6 / 10) {
+        return;
+    }
+
+    /* 渲到 显示×1.3 (轻超采样: 渲得比显示大、缩回去 = supersample AA, 圆角更平滑;
+     * 同时给邻近缩放档留复用余量, 减少重栅频率)。封顶 kCap。 */
+    uint64_t renW = (uint64_t)needW * 13 / 10;
+    uint64_t renH = (uint64_t)needH * 13 / 10;
+    if (renW > kCap || renH > kCap) {
+        const double s = (double)kCap / (double)(renW > renH ? renW : renH);
+        renW = (uint64_t)(renW * s);
+        renH = (uint64_t)(renH * s);
+    }
+    if (renW == 0) renW = 1;
+    if (renH == 0) renH = 1;
+
+    lunasvg::Bitmap bmp = svgDoc_->renderToBitmap((int)renW, (int)renH,
+                                                  0x00000000u);
+    if (bmp.isNull() || !bmp.data()) return;
+    const uint32_t bw = (uint32_t)bmp.width();
+    const uint32_t bh = (uint32_t)bmp.height();
+    if (bw == 0 || bh == 0) return;
+
+    /* LunaSVG premultiplied ARGB32 (BGRA 字节序) = D2D premultiplied BGRA 位图,
+     * 直接拿数据建 D2D 位图 (CreateBitmap 拷贝数据, bmp 之后可析构)。 */
+    auto* rt = r.RT();
+    if (!rt) return;
+    const D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+        96.0f, 96.0f);
+    Microsoft::WRL::ComPtr<ID2D1Bitmap> bitmap;
+    if (FAILED(rt->CreateBitmap(D2D1::SizeU(bw, bh), bmp.data(),
+                                (UINT32)bmp.stride(), &props, &bitmap))) {
+        return;
+    }
+    svgRaster_  = std::move(bitmap);
+    svgRasterW_ = bw;
+    svgRasterH_ = bh;
+}
+
+// 起 (或更新) 一个后台栅格化请求。非阻塞: 后台线程渲 LunaSVG → BGRA 存进 slot
+// → InvalidateRect 唤醒 UI 线程 (下次 OnDraw 由 ConsumeSvgRasterResult_ 换上)。
+// 线程只碰 slot + 自己持有的 doc/hwnd (shared_ptr 保活), 不碰 this → 析构/换图安全。
+// 渲染期间又改缩放 (want 变) → 渲完再渲最新档 (合并到最后一次), inFlight 保证单线程。
+void GhImgViewWidget::RequestSvgRasterAsync_(uint32_t renW, uint32_t renH,
+                                             unsigned long uiThreadId) {
+    auto slot = svgSlot_;
+    auto doc  = svgDoc_;
+    if (!slot || !doc || renW == 0 || renH == 0) return;
+    slot->wantW.store(renW);
+    slot->wantH.store(renH);
+    bool expected = false;
+    if (!slot->inFlight.compare_exchange_strong(expected, true))
+        return;   /* 已有后台线程在渲, 它渲完会看 want 再渲最新 */
+
+    std::thread([slot, doc, uiThreadId]() {
+        for (;;) {
+            const uint32_t w = slot->wantW.load();
+            const uint32_t h = slot->wantH.load();
+            lunasvg::Bitmap bmp = doc->renderToBitmap((int)w, (int)h, 0x00000000u);
+            if (!bmp.isNull() && bmp.data()) {
+                const uint32_t bw = static_cast<uint32_t>(bmp.width());
+                const uint32_t bh = static_cast<uint32_t>(bmp.height());
+                const int stride  = bmp.stride();
+                const uint8_t* src = bmp.data();
+                std::vector<uint8_t> buf(static_cast<size_t>(bw) * bh * 4);
+                for (uint32_t y = 0; y < bh; ++y)
+                    memcpy(buf.data() + static_cast<size_t>(y) * bw * 4,
+                           src + static_cast<size_t>(y) * stride,
+                           static_cast<size_t>(bw) * 4);
+                {
+                    std::lock_guard<std::mutex> lk(slot->mu);
+                    slot->bgra.swap(buf);
+                    slot->w = bw; slot->h = bh; slot->ready = true;
+                }
+                /* 跨线程唤醒 UI 重绘 (InvalidateRect 线程安全; 同
+                 * InvalidateAllWindows 的按线程枚举窗口模式)。 */
+                EnumThreadWindows(uiThreadId, [](HWND hwnd, LPARAM) -> BOOL {
+                    wchar_t cls[64];
+                    GetClassNameW(hwnd, cls, 64);
+                    if (wcscmp(cls, L"UiCore_Window") == 0)
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                    return TRUE;
+                }, 0);
+            }
+            /* 期间又改了缩放 → 渲最新; 否则收工。 */
+            if (slot->wantW.load() == w && slot->wantH.load() == h) {
+                slot->inFlight.store(false);
+                break;
+            }
+        }
+    }).detach();
+}
+
+// UI 线程: 后台结果就绪则把 BGRA 建成 D2D 位图换上 svgRaster_ (D2D 单线程, 必须
+// 在 UI 线程建)。
+void GhImgViewWidget::ConsumeSvgRasterResult_(Renderer& r) {
+    if (!svgSlot_) return;
+    std::vector<uint8_t> buf;
+    uint32_t bw = 0, bh = 0;
+    {
+        std::lock_guard<std::mutex> lk(svgSlot_->mu);
+        if (!svgSlot_->ready) return;
+        buf.swap(svgSlot_->bgra);
+        bw = svgSlot_->w; bh = svgSlot_->h;
+        svgSlot_->ready = false;
+    }
+    if (bw == 0 || bh == 0 || buf.size() < static_cast<size_t>(bw) * bh * 4) return;
+    auto* rt = r.RT();
+    if (!rt) return;
+    const D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+        96.0f, 96.0f);
+    Microsoft::WRL::ComPtr<ID2D1Bitmap> bitmap;
+    if (FAILED(rt->CreateBitmap(D2D1::SizeU(bw, bh), buf.data(), bw * 4, &props, &bitmap)))
+        return;
+    svgRaster_  = std::move(bitmap);
+    svgRasterW_ = bw;
+    svgRasterH_ = bh;
 }
 
 void GhImgViewWidget::SetActiveLevel(uint32_t level) {
@@ -533,39 +633,72 @@ void GhImgViewWidget::OnDraw(Renderer& r) {
 
     r.PushClip(rect);
 
-    /* Build 70+ (L20): SVG 模式短路 — DrawSvgDocument 一次性矢量光栅化
-     * 到当前 viewport. transform 跟瓦块路径同款 (Scale + Rotate around
-     * dest center + 外层 transform). zoom/pan/rotation 全部走 dest 已经
-     * 算好的几何, 不重复一套 math. */
+    /* L173 / core-ui Phase 4: SVG 模式 — LunaSVG 按当前显示分辨率栅格化到
+     * svgRaster_ 缓存位图, 走和普通图一样的 DrawBitmap 路径 (统一)。放大过界
+     * 才重栅 (任意缩放档清晰), 平移用缓存零成本。rotation 跟瓦块路径同款: 绕
+     * dest 中心的 transform + logical dest 内 DrawBitmap。 */
     if (svgDoc_) {
-        auto* ctx5 = r.RT5();
-        if (ctx5 && svgW_ > 0 && svgH_ > 0) {
-            float drawW = dest.right - dest.left;
-            float drawH = dest.bottom - dest.top;
-            if (drawW > 0 && drawH > 0) {
-                svgDoc_->SetViewportSize(
-                    D2D1::SizeF((float)svgW_, (float)svgH_));
+        /* 后台栅格化: UI 线程只画缓存位图, 永不阻塞输入。
+         *  1) 先消费后台已渲好的结果 (若有) → 换上 svgRaster_。
+         *  2) 算当前显示需要的分辨率 + 复用窗口 [显示, 显示×1.6]。落窗内 → 直接画。
+         *  3) 出窗: 没缓存 (首帧) 同步渲一张 (load 一次性); 否则丢后台渲 (非阻塞),
+         *     渲好前继续画旧缓存 (略软), 渲完 InvalidateRect → 下帧换上。 */
+        ConsumeSvgRasterResult_(r);
 
-                D2D1_MATRIX_3X2_F old;
-                ctx5->GetTransform(&old);
-
-                float sx = drawW / (float)svgW_;
-                float sy = drawH / (float)svgH_;
+        const float drawW = dest.right - dest.left;
+        const float drawH = dest.bottom - dest.top;
+        if (drawW > 0.f && drawH > 0.f) {
+            const uint32_t kCap = 4096;
+            uint32_t needW = (uint32_t)std::ceil(drawW);
+            uint32_t needH = (uint32_t)std::ceil(drawH);
+            if (needW > kCap || needH > kCap) {
+                const float s = (float)kCap / (float)(needW > needH ? needW : needH);
+                needW = (uint32_t)(needW * s);
+                needH = (uint32_t)(needH * s);
+            }
+            if (needW == 0) needW = 1;
+            if (needH == 0) needH = 1;
+            const bool inWindow = svgRaster_
+                && svgRasterW_ >= needW && svgRasterW_ <= needW + needW * 6 / 10
+                && svgRasterH_ >= needH && svgRasterH_ <= needH + needH * 6 / 10;
+            if (!inWindow) {
+                if (!svgRaster_) {
+                    EnsureSvgRaster(dest, r);   /* 首帧同步 (load 一次性, 非缩放热路径) */
+                } else {
+                    uint64_t renW = (uint64_t)needW * 13 / 10;
+                    uint64_t renH = (uint64_t)needH * 13 / 10;
+                    if (renW > kCap || renH > kCap) {
+                        const double s = (double)kCap / (double)(renW > renH ? renW : renH);
+                        renW = (uint64_t)(renW * s);
+                        renH = (uint64_t)(renH * s);
+                    }
+                    if (renW == 0) renW = 1;
+                    if (renH == 0) renH = 1;
+                    RequestSvgRasterAsync_((uint32_t)renW, (uint32_t)renH,
+                                           GetCurrentThreadId());
+                }
+            }
+        }
+        if (svgRaster_) {
+            D2D1_MATRIX_3X2_F oldXf;
+            bool rotated = (rotation_ != 0);
+            if (rotated) {
+                auto* rt = r.RT();
+                rt->GetTransform(&oldXf);
                 float dcx = (dest.left + dest.right ) * 0.5f;
                 float dcy = (dest.top  + dest.bottom) * 0.5f;
-                auto xf =
-                    D2D1::Matrix3x2F::Scale(sx, sy) *
-                    D2D1::Matrix3x2F::Translation(dest.left, dest.top) *
-                    D2D1::Matrix3x2F::Rotation((float)rotation_,
-                                                D2D1::Point2F(dcx, dcy)) *
-                    old;
-                ctx5->SetTransform(xf);
-                ctx5->DrawSvgDocument(svgDoc_.Get());
-                /* L75: D2D 不画 <text>/<foreignObject> 文字 → DirectWrite 叠加补渲
-                 * (同一 xf 变换跟形状对齐, zoom/pan/rotation 一致). */
-                if (!svgTextRuns_.empty()) r.DrawSvgTextRuns(svgTextRuns_, xf);
-                ctx5->SetTransform(old);
+                auto xf = D2D1::Matrix3x2F::Rotation((float)rotation_,
+                                                     D2D1::Point2F(dcx, dcy)) * oldXf;
+                rt->SetTransform(xf);
             }
+            auto ps = svgRaster_->GetPixelSize();
+            float pscale = ps.width > 0
+                ? (dest.right - dest.left) / (float)ps.width : 1.0f;
+            auto interp = (!antialias_ && pscale >= 1.0f)
+                ? D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+                : PickInterp(pscale);
+            r.DrawBitmapHQ(svgRaster_.Get(), dest, 1.0f, interp);
+            if (rotated) r.RT()->SetTransform(oldXf);
         }
         r.PopClip();
         return;
@@ -667,18 +800,95 @@ void GhImgViewWidget::DrawLevel(Renderer& r, uint32_t level, const D2D1_RECT_F& 
     auto interp = (!antialias_ && scale >= 1.0f)
         ? D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR
         : PickInterp(scale);
-    for (int ty = ty0; ty < ty1; ++ty) {
-        for (int tx = tx0; tx < tx1; ++tx) {
-            auto it = tiles_.find(TileKey{level, (uint32_t)tx, (uint32_t)ty});
-            if (it == tiles_.end()) continue;
-            float x0 = destLeft + (float)(tx * (int)ts)                     * scale;
-            float y0 = destTop  + (float)(ty * (int)ts)                     * scale;
-            float x1 = destLeft + (float)(tx * (int)ts + (int)it->second.w) * scale;
-            float y1 = destTop  + (float)(ty * (int)ts + (int)it->second.h) * scale;
-            D2D1_RECT_F tileDest = {x0, y0, x1, y1};
-            r.DrawBitmapHQ(it->second.bmp.Get(), tileDest, 1.0f, interp);
+    // snap 屏幕坐标到整数【设备像素】(dest rect 是 DIP, ctx 按 dpi_scale_ 缩到设备).
+    const float dpr = dpi_scale_ > 1e-3f ? dpi_scale_ : 1.0f;
+    auto snapDev = [dpr](float v) { return std::round(v * dpr) / dpr; };
+
+    // L105: 把本级可见瓦块先 1:1 精确拼到一张【连续】离屏位图(无内部瓦块边界),
+    // 再整体 device-snap + 缩放一次上屏。非整数缩放下逐块直绘会出两类半透明缝:
+    //   ① 分数设备像素部分覆盖(相邻块共享边界总覆盖<100%, 透背景);
+    //   ② 每块独立插值在瓦块边缘钳位 → 插值梯度不连续。
+    // 拼成连续位图后, 缩放时 CUBIC/LINEAR 跨越原瓦块边界连续采样 → 两类缝全消。
+    ID2D1DeviceContext5* ctx5 = r.RT5();
+    const uint32_t bx0 = (uint32_t)tx0 * ts;
+    const uint32_t by0 = (uint32_t)ty0 * ts;
+    const uint32_t bw  = std::min(lw - bx0, (uint32_t)(tx1 - tx0) * ts);
+    const uint32_t bh  = std::min(lh - by0, (uint32_t)(ty1 - ty0) * ts);
+    constexpr uint32_t kMaxComposite = 4096;   // bbox 超此则退逐块直绘(安全阀)
+    bool composited = false;
+
+    if (ctx5 && bw > 0 && bh > 0 && bw <= kMaxComposite && bh <= kMaxComposite) {
+        if (!composite_ || compositeW_ < bw || compositeH_ < bh) {
+            uint32_t nw = std::max(bw, compositeW_);
+            uint32_t nh = std::max(bh, compositeH_);
+            D2D1_BITMAP_PROPERTIES1 bp = {};
+            bp.pixelFormat = D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                                                D2D1_ALPHA_MODE_PREMULTIPLIED);
+            bp.dpiX = 96.0f; bp.dpiY = 96.0f;
+            bp.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
+            Microsoft::WRL::ComPtr<ID2D1Bitmap1> nb;
+            if (SUCCEEDED(ctx5->CreateBitmap(D2D1::SizeU(nw, nh), nullptr, 0, &bp, &nb))) {
+                composite_ = nb; compositeW_ = nw; compositeH_ = nh;
+            } else {
+                composite_.Reset(); compositeW_ = compositeH_ = 0;
+            }
+        }
+        if (composite_) {
+            // 切离屏 target, identity transform + 96 DPI → 1:1 精确拼瓦块.
+            Microsoft::WRL::ComPtr<ID2D1Image> oldTarget;
+            ctx5->GetTarget(&oldTarget);
+            D2D1_MATRIX_3X2_F oldXf2; ctx5->GetTransform(&oldXf2);
+            float odx = 96.0f, ody = 96.0f; ctx5->GetDpi(&odx, &ody);
+
+            ctx5->SetTarget(composite_.Get());
+            ctx5->SetDpi(96.0f, 96.0f);
+            ctx5->SetTransform(D2D1::Matrix3x2F::Identity());
+            ctx5->PushAxisAlignedClip(D2D1::RectF(0.0f, 0.0f, (float)bw, (float)bh),
+                                       D2D1_ANTIALIAS_MODE_ALIASED);
+            ctx5->Clear(D2D1::ColorF(0, 0, 0, 0));   // 缺的瓦块留透明 → 缩放后透出 preview
+            for (int ty = ty0; ty < ty1; ++ty) {
+                for (int tx = tx0; tx < tx1; ++tx) {
+                    auto it = tiles_.find(TileKey{level, (uint32_t)tx, (uint32_t)ty});
+                    if (it == tiles_.end()) continue;
+                    float lx = (float)(tx * (int)ts - (int)bx0);
+                    float ly = (float)(ty * (int)ts - (int)by0);
+                    D2D1_RECT_F dr = {lx, ly, lx + (float)it->second.w, ly + (float)it->second.h};
+                    ctx5->DrawBitmap(it->second.bmp.Get(), dr, 1.0f,
+                                      D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, nullptr);
+                }
+            }
+            ctx5->PopAxisAlignedClip();
+            ctx5->SetTarget(oldTarget.Get());
+            ctx5->SetDpi(odx, ody);
+            ctx5->SetTransform(oldXf2);
+
+            // 整体上屏: 源 rect=[0,0,bw,bh], dest device-snap 外边界 + CUBIC/LINEAR 缩放.
+            float X0 = snapDev(destLeft + (float)bx0        * scale);
+            float Y0 = snapDev(destTop  + (float)by0        * scale);
+            float X1 = snapDev(destLeft + (float)(bx0 + bw) * scale);
+            float Y1 = snapDev(destTop  + (float)(by0 + bh) * scale);
+            D2D1_RECT_F dst = {X0, Y0, X1, Y1};
+            D2D1_RECT_F src = {0.0f, 0.0f, (float)bw, (float)bh};
+            ctx5->DrawBitmap(composite_.Get(), dst, 1.0f, interp, &src);
+            composited = true;
         }
     }
+
+    if (!composited) {   // fallback: 逐块直绘(snapDev 消部分覆盖缝)
+        for (int ty = ty0; ty < ty1; ++ty) {
+            for (int tx = tx0; tx < tx1; ++tx) {
+                auto it = tiles_.find(TileKey{level, (uint32_t)tx, (uint32_t)ty});
+                if (it == tiles_.end()) continue;
+                float x0 = snapDev(destLeft + (float)(tx * (int)ts)                     * scale);
+                float y0 = snapDev(destTop  + (float)(ty * (int)ts)                     * scale);
+                float x1 = snapDev(destLeft + (float)(tx * (int)ts + (int)it->second.w) * scale);
+                float y1 = snapDev(destTop  + (float)(ty * (int)ts + (int)it->second.h) * scale);
+                D2D1_RECT_F tileDest = {x0, y0, x1, y1};
+                r.DrawBitmapHQ(it->second.bmp.Get(), tileDest, 1.0f, interp);
+            }
+        }
+    }
+
 }
 
 bool GhImgViewWidget::OnMouseDown(const MouseEvent& e) {
@@ -701,8 +911,12 @@ bool GhImgViewWidget::OnMouseMove(const MouseEvent& e) {
     // 返回后下面复检 dragging_ 为假 → 不再 pan (拖出后图不被 pan 走).
     if (onMouseMoveHook) onMouseMoveHook(e);
     if (!dragging_) return true;
-    panX_ = dragPanX_ + (e.x - dragStartX_);
-    panY_ = dragPanY_ + (e.y - dragStartY_);
+    // 拖动平移按轴锁 (锁定/只读视图): 锁住的轴拖动不动。放在 hook 之后 → 宿主仍能
+    // 观察拖动手势 (如"拖出图片"), 只是被锁轴不平移; 命令式 SetPan 不受影响。
+    // 长图锁水平 (lockX,!lockY) → 左右固定居中、上下仍可拖动阅读。
+    if (panLockX_ && panLockY_) return true;   // 全锁: 无平移、无重绘 (同原 early-return)
+    if (!panLockX_) panX_ = dragPanX_ + (e.x - dragStartX_);
+    if (!panLockY_) panY_ = dragPanY_ + (e.y - dragStartY_);
     ConstrainPan();
     /* L47 follow-up: drag 期间完全不 fire NotifyViewport, drag 结束 OnMouseUp
      * 才 fire 一次精解. 之前实测节流 100ms 也不够 — drag 跨越 tile 数决定
@@ -863,6 +1077,8 @@ uint32_t GhImgViewWidget::PickAutoLevel() const {
 
 void GhImgViewWidget::SwitchLevel(uint32_t level) {
     if (level >= info_.levels) level = info_.levels - 1;
+    // L115: 切级时记下旧级, TrimToViewport_ 据此保留旧级 tile 供 OnDraw fallback 覆盖。
+    if (level != activeLevel_) prevActiveLevel_ = activeLevel_;
     activeLevel_ = level;
 }
 

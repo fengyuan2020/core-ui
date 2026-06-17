@@ -101,7 +101,12 @@ enum class ButtonType { Default, Primary };
 // path: OnDraw owns text + icon rendering, children pinned by Widget::DoLayout.
 class UI_API ButtonWidget : public HBoxWidget {
 public:
-    explicit ButtonWidget(const std::wstring& text) : text_(text) { focusable = true; }
+    explicit ButtonWidget(const std::wstring& text) : text_(text) {
+        focusable = true;
+        /* L148-4: 按钮默认手型指针 (Web 惯例) — CSS 显式 cursor 仍可覆盖
+         * (page 系统只在声明了 cursor 时才写, 不会重置此默认)。 */
+        cursor = CursorKind::Pointer;
+    }
 
     WidgetPtr FontSize(float s) override { fontSize_ = s; return shared_from_this(); }
 
@@ -726,71 +731,6 @@ private:
     uint64_t spinnerTick_ = 0;
 };
 
-// ---- Dialog (modal confirm/alert dialog) ----
-//
-// Window-level overlay widget — does NOT live in the widget tree. Use
-// `ui_dialog()` to create, `ui_dialog_show(dialog, win, ...)` to display.
-// The owning UiWindow draws it on top of everything via `activeDialog_` and
-// routes mouse/keyboard input modally. Adding it via add_child is unsupported
-// and will cause double-draw / squashed layout.
-class UI_API DialogWidget : public Widget {
-public:
-    using ResultCallback = std::function<void(bool confirmed)>;
-
-    // 0 = follow global theme (theme::Current()), 1 = force light, 2 = force dark
-    enum class ThemeMode : int { Auto = 0, Light = 1, Dark = 2 };
-
-    DialogWidget() {
-        // Marked invisible; window's overlay path drives drawing & input.
-        enabled = false;
-        visible = false;
-    }
-
-    void SetTitle(const std::wstring& t) { title_ = t; }
-    void SetMessage(const std::wstring& m) { message_ = m; }
-    void SetOkText(const std::wstring& t) { okText_ = t; }
-    void SetCancelText(const std::wstring& t) { cancelText_ = t; }
-    void SetShowCancel(bool show) { showCancel_ = show; }
-    void SetCallback(ResultCallback cb) { callback_ = std::move(cb); }
-    void SetThemeMode(ThemeMode m) { themeMode_ = m; }
-    ThemeMode GetThemeMode() const { return themeMode_; }
-
-    void Show(const std::wstring& title, const std::wstring& message, ResultCallback cb);
-    void Hide();
-    bool IsActive() const { return active_; }
-
-    void OnDraw(Renderer& r) override;
-    bool OnMouseMove(const MouseEvent& e) override;
-    bool OnMouseDown(const MouseEvent& e) override;
-    bool OnMouseUp(const MouseEvent& e) override;
-    bool OnMouseWheel(const MouseEvent& e) override;
-    bool OnKeyDown(int vk) override;
-    D2D1_SIZE_F SizeHint() const override;
-
-private:
-    D2D1_RECT_F BtnRect(int idx) const;  // 0=ok, 1=cancel
-    int HitBtn(float x, float y) const;  // -1=none
-    const theme::Colors& EffectiveColors() const;
-
-    std::wstring title_;
-    std::wstring message_;
-    std::wstring okText_ = L"确定";
-    std::wstring cancelText_ = L"取消";
-    bool showCancel_ = true;
-    bool active_ = false;
-    ThemeMode themeMode_ = ThemeMode::Auto;
-    ResultCallback callback_;
-
-    int hoveredBtn_ = -1;
-    int pressedBtn_ = -1;
-public:
-    std::function<void()> onHide_;  // called when dialog hides itself
-private:
-
-    // layout cache (computed in OnDraw)
-    mutable D2D1_RECT_F panelRect_ = {};
-};
-
 // ---- ImageView (zoomable, pannable image canvas) ----
 class UI_API ImageViewWidget : public Widget {
 public:
@@ -997,7 +937,7 @@ class UI_API TitleBarWidget : public Widget {
 public:
     explicit TitleBarWidget(const std::wstring& title = L"");
 
-    void SetTitle(const std::wstring& t) { title_ = t; }
+    void SetTitle(const std::wstring& t) { title_ = t; ui::RequestLayout(); }
     const std::wstring& Title() const { return title_; }
 
     // User-added widgets go into the "custom area" between title and caption buttons
@@ -1026,7 +966,7 @@ public:
 
     // Title font weight. Default: DWRITE_FONT_WEIGHT_NORMAL (400).
     // Set to DWRITE_FONT_WEIGHT_SEMI_BOLD (600) for a heavier title (pre-1.3.1 look).
-    void SetTitleWeight(int weight) { titleWeight_ = weight; }
+    void SetTitleWeight(int weight) { titleWeight_ = weight; ui::RequestLayout(); }
     int  TitleWeight() const { return titleWeight_; }
 
 private:

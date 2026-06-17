@@ -91,6 +91,8 @@ public:
     float maxW = FLT_MAX, maxH = FLT_MAX;
     bool  expanding = false;
     float flex = 1.0f;              // flex weight (only used when expanding=true)
+    float flexShrink = 1.0f;        // CSS flex-shrink: >0 shrinks when an HBox row
+                                    // overflows its width; 0 = never shrink (icons).
     float percentW = -1, percentH = -1;  // -1 = not percentage, 0-100 = % of parent
     // Percentage min/max constraints. -1 = unset. Resolved at layout time
     // against parent content size (same as percentW/percentH). Useful for
@@ -109,6 +111,13 @@ public:
 
     // ---- Absolute positioning ----
     bool positionAbsolute = false;
+    /* build 161: 布局豁免 — true 且已有有效 rect 时, 布局系统不改写本
+     * widget 的 rect (子树仍照常布局)。给"用户可拖动的浮动面板"用: 拖后
+     * 任何 relayout (反应式重建/菜单/RequestLayout) 不再把它打回 CSS
+     * 默认位。显式 ui_widget_set_rect 仍有效。仅对 positionAbsolute
+     * 组件有意义 (流式布局里钉住会破坏兄弟排布, 布局只在 absolute
+     * 分支检查本标志)。 */
+    bool layoutPinned = false;
     float posLeft = -1, posTop = -1, posRight = -1, posBottom = -1;  // -1 = not set
     // Raw CSS for sides whose value depends on parent size (% or calc()).
     // Resolved at layout time (parent rect known); empty string falls back to
@@ -415,9 +424,16 @@ protected:
 
 // ---- Layout containers ----
 
+// 默认 flex gap (VBox/HBox/Grid 共用). recomputeStyle (compiler.cpp) 在
+// hover/press/focus 重算样式时, 会先把容器 gap 重设到这个默认值, 再让 CSS 覆盖。
+// 编译时默认值与 recomputeStyle 的重设值必须是同一个常量 —— 否则 "CSS 没写
+// gap 的容器" 编译时 (默认 4) 和首次交互后 (旧代码重设成 0) 不一致, 会在首次
+// hover/click 瞬间布局跳变 (L119: toolbar 原图按钮首次点击右移 8px)。
+inline constexpr float kDefaultFlexGap = 4.0f;
+
 class UI_API VBoxWidget : public Widget {
 public:
-    float gap_ = 4.0f;
+    float gap_ = kDefaultFlexGap;
     LayoutAlign   crossAlign_ = LayoutAlign::Stretch;   // horizontal alignment of children
     LayoutJustify mainJustify_ = LayoutJustify::Start;  // vertical distribution
 
@@ -430,7 +446,7 @@ public:
 
 class UI_API HBoxWidget : public Widget {
 public:
-    float gap_ = 4.0f;
+    float gap_ = kDefaultFlexGap;
     LayoutAlign   crossAlign_ = LayoutAlign::Stretch;   // vertical alignment of children
     LayoutJustify mainJustify_ = LayoutJustify::Start;  // horizontal distribution
     // CSS flex-wrap: wrap. When true and total natural child width exceeds
@@ -462,8 +478,8 @@ public:
 class UI_API GridWidget : public Widget {
 public:
     int   cols_ = 2;
-    float rowGap_ = 4.0f;
-    float colGap_ = 4.0f;
+    float rowGap_ = kDefaultFlexGap;
+    float colGap_ = kDefaultFlexGap;
 
     // Per-child layout hint: colspan/rowspan stored on child via gridColSpan/gridRowSpan
 
@@ -500,6 +516,10 @@ inline bool& LayoutDirtyFlag() {
     static thread_local bool dirty = false;
     return dirty;
 }
-inline void RequestLayout() { LayoutDirtyFlag() = true; }
+/* 置脏 + 失效所有窗口 (催生一帧)。修复前只置旗标 — 旗标仅在 OnPaint 里
+ * 被消费, 完全空闲的窗口永远等不到那次 paint, 导致 set_title / set_text
+ * 等"纯数据变更"在无其他活动时永不上屏 (L127: 慢加载期标题提示丢失,
+ * 调试 IPC 的强制渲染一直在掩护这个缺陷)。实现在 widget.cpp (需 Context)。 */
+UI_API void RequestLayout();
 
 } // namespace ui

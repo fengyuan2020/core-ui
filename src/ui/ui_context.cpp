@@ -164,6 +164,12 @@ void Context::InvalidateAllWindows() {
     }
 }
 
+void Context::RelayoutAllWindows() {
+    for (auto& [id, win] : windows_) {
+        if (win) { win->LayoutRoot(); win->Invalidate(); }
+    }
+}
+
 void Context::UpdateAnimTimers() {
     for (auto& [id, win] : windows_) {
         if (win) win->UpdateToggleAnimTimer();

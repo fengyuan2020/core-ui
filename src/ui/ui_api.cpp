@@ -3,6 +3,7 @@
  *
  * Every extern "C" function: look up handle → cast → call C++ method.
  */
+#include "msgbox.h"
 #include "ui_context.h"
 #include "ui_window.h"
 #include "ui.h"        // pulls in all widget/control/builder headers
@@ -62,6 +63,9 @@ UI_API const char* ui_core_version_string(void) {
 }
 
 UI_API int ui_init(void) {
+    /* 启动加速: 共享 D3D11 设备后台预热 — 与 uix 编译/窗口创建并行,
+     * 首窗 CreateRenderTarget 不再付 ~39ms 设备创建 (L 启动剖析 P1)。 */
+    ui::Renderer::PrewarmSharedDeviceAsync();
     return Ctx().Init() ? 0 : -1;
 }
 
@@ -433,61 +437,62 @@ UI_API UiWidget ui_scroll_view(void) {
     return Reg(std::make_shared<ui::ScrollViewWidget>());
 }
 
-UI_API UiWidget ui_dialog(void) {
-    return Reg(std::make_shared<ui::DialogWidget>());
+// ================================================================
+// MsgBox (build 158 — 取代 in-window ui_dialog_*)
+// ================================================================
+
+UI_API int ui_msgbox(UiWindow win,
+                     const wchar_t* title, const wchar_t* message,
+                     const wchar_t* const* buttons, int button_count,
+                     int default_idx, int cancel_idx, int icon) {
+    if (!buttons || button_count < 1) return -1;
+    if (button_count > 4) button_count = 4;
+    std::vector<std::wstring> btns;
+    btns.reserve((size_t)button_count);
+    for (int i = 0; i < button_count; ++i) {
+        btns.emplace_back(buttons[i] ? buttons[i] : L"");
+    }
+    return ui::MsgBox::Show(win,
+                            title ? title : L"", message ? message : L"",
+                            btns, default_idx, cancel_idx, icon,
+                            /*check_text=*/L"", /*check_initial=*/0,
+                            /*btn_colors=*/nullptr)
+        .button;
 }
 
-// ================================================================
-// Dialog
-// ================================================================
-
-UI_API void ui_dialog_show(UiWidget dialog, UiWindow win,
-                           const wchar_t* title, const wchar_t* message,
-                           UiDialogCallback cb, void* userdata) {
-    auto* d = As<ui::DialogWidget>(dialog);
-    auto* w = Win(win);
-    if (!d || !w) return;
-    uint64_t dh = dialog;
-    d->onHide_ = [w, d]() {
-        if (w->activeDialog_ == d) w->activeDialog_ = nullptr;
+UI_API UiMsgBoxResult ui_msgbox_ex(UiWindow win, const UiMsgBoxParams* p) {
+    UiMsgBoxResult res{};
+    res.button = -1;
+    /* struct_size 护栏的正确语义: 最小必需 = 到 icon 为止的老布局; 之后的
+     * 字段按 size 分段取 — 旧编译的调用方传更小的 sizeof 仍然合法。 */
+    constexpr uint32_t kMinSize =
+        (uint32_t)(offsetof(UiMsgBoxParams, icon) + sizeof(int));
+    if (!p || p->struct_size < kMinSize ||
+        !p->buttons || p->button_count < 1) {
+        return res;
+    }
+    auto field_avail = [p](size_t end_off) {
+        return p->struct_size >= (uint32_t)end_off;
     };
-    d->Show(title ? title : L"", message ? message : L"",
-        [cb, userdata, dh](bool confirmed) {
-            if (cb) cb(dh, confirmed ? 1 : 0, userdata);
-        });
-    w->activeDialog_ = d;
-    w->LayoutRoot();
-    w->Invalidate();
-}
-
-UI_API void ui_dialog_hide(UiWidget dialog, UiWindow win) {
-    auto* d = As<ui::DialogWidget>(dialog);
-    auto* w = Win(win);
-    if (d) d->Hide();
-    if (w && w->activeDialog_ == d) w->activeDialog_ = nullptr;
-    if (w) { w->LayoutRoot(); w->Invalidate(); }
-}
-
-UI_API void ui_dialog_set_ok_text(UiWidget dialog, const wchar_t* text) {
-    auto* d = As<ui::DialogWidget>(dialog);
-    if (d && text) d->SetOkText(text);
-}
-
-UI_API void ui_dialog_set_cancel_text(UiWidget dialog, const wchar_t* text) {
-    auto* d = As<ui::DialogWidget>(dialog);
-    if (d && text) d->SetCancelText(text);
-}
-
-UI_API void ui_dialog_set_show_cancel(UiWidget dialog, int show) {
-    auto* d = As<ui::DialogWidget>(dialog);
-    if (d) d->SetShowCancel(show != 0);
-}
-
-UI_API void ui_dialog_set_theme_mode(UiWidget dialog, int mode) {
-    auto* d = As<ui::DialogWidget>(dialog);
-    if (!d) return;
-    using TM = ui::DialogWidget::ThemeMode;
-    d->SetThemeMode(mode == 1 ? TM::Light : mode == 2 ? TM::Dark : TM::Auto);
+    int n = p->button_count;
+    if (n > 4) n = 4;
+    std::vector<std::wstring> btns;
+    btns.reserve((size_t)n);
+    for (int i = 0; i < n; ++i) {
+        btns.emplace_back(p->buttons[i] ? p->buttons[i] : L"");
+    }
+    const wchar_t* check_text =
+        field_avail(offsetof(UiMsgBoxParams, check_initial) + sizeof(int))
+            ? p->check_text : nullptr;
+    const int check_initial = check_text ? p->check_initial : 0;
+    const UiColor* colors =
+        field_avail(offsetof(UiMsgBoxParams, button_colors) + sizeof(void*))
+            ? p->button_colors : nullptr;
+    return ui::MsgBox::Show(
+        win,
+        p->title ? p->title : L"", p->message ? p->message : L"",
+        btns, p->default_idx, p->cancel_idx, p->icon,
+        check_text ? check_text : L"", check_initial, colors);
 }
 
 // ================================================================
@@ -1015,6 +1020,7 @@ UI_API void ui_gh_img_view_begin(UiWidget w, UiWindow win, const UiGhImgViewInfo
     ii.tileSize    = info->tile_size ? info->tile_size : 256u;
     ii.levels      = info->levels    ? info->levels    : 1u;
     ii.pixelFormat = info->pixel_format;
+    ii.keepPreview = info->keep_preview != 0;   /* L168: 保留现有 preview 兜底层 */
     gv->Begin(ii, wn->GetRenderer());
 }
 
@@ -1040,6 +1046,16 @@ UI_API void ui_gh_img_view_set_tile(UiWidget w, UiWindow win,
 UI_API void ui_gh_img_view_clear_level(UiWidget w, uint32_t level) {
     auto* gv = As<ui::GhImgViewWidget>(w);
     if (gv) gv->ClearLevel(level);
+}
+
+UI_API void ui_gh_img_view_begin_tile_batch(UiWidget w) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (gv) gv->BeginTileBatch();
+}
+
+UI_API void ui_gh_img_view_end_tile_batch(UiWidget w) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (gv) gv->EndTileBatch();
 }
 
 UI_API void ui_gh_img_view_clear(UiWidget w) {
@@ -1110,6 +1126,15 @@ UI_API void ui_gh_img_view_set_wheel_zoom_enabled(UiWidget w, int on) {
 UI_API int ui_gh_img_view_get_wheel_zoom_enabled(UiWidget w) {
     auto* gv = As<ui::GhImgViewWidget>(w);
     return (gv && gv->WheelZoomEnabled()) ? 1 : 0;
+}
+UI_API void ui_gh_img_view_set_pan_lock(UiWidget w, int lock_x, int lock_y) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (gv) gv->SetPanLock(lock_x != 0, lock_y != 0);
+}
+UI_API void ui_gh_img_view_get_pan_lock(UiWidget w, int* out_lock_x, int* out_lock_y) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (out_lock_x) *out_lock_x = (gv && gv->PanLockX()) ? 1 : 0;
+    if (out_lock_y) *out_lock_y = (gv && gv->PanLockY()) ? 1 : 0;
 }
 
 UI_API float ui_gh_img_view_get_zoom(UiWidget w) {
@@ -1407,6 +1432,10 @@ UI_API void ui_widget_set_size(UiWidget w, float width, float height) {
     if (p) { p->fixedW = width; p->fixedH = height; MarkLayoutAndRepaint(); }
 }
 
+UI_API void ui_widget_set_layout_pinned(UiWidget w, int pinned) {
+    if (auto* p = W(w)) p->layoutPinned = pinned != 0;
+}
+
 UI_API void ui_widget_set_expand(UiWidget w, int expand) {
     auto* p = W(w);
     if (p) { p->expanding = (expand != 0); MarkLayoutAndRepaint(); }
@@ -1433,7 +1462,14 @@ UI_API void ui_widget_set_gap(UiWidget w, float gap) {
 }
 
 UI_API void ui_widget_set_visible(UiWidget w, int visible) {
-    auto* p = W(w); if (p) p->visible = (visible != 0);
+    /* L95: 改可见性会折叠/展开 flex 布局, 必须跟 set_size/set_expand/add_child
+     * 一样请求重布局+重绘 —— 否则隐藏时算出的 0×0 rect 卡住, set_visible(0→1)
+     * 后控件不显示, 要等别的 relayout(如重开窗口)才生效. 之前漏了这行. */
+    auto* p = W(w);
+    if (p && p->visible != (visible != 0)) {
+        p->visible = (visible != 0);
+        MarkLayoutAndRepaint();
+    }
 }
 
 UI_API void ui_widget_set_opacity(UiWidget w, float opacity) {
@@ -2093,6 +2129,30 @@ UI_API char* ui_debug_dump_widget(UiWidget widget) {
     return dupStr(ui::DebugDumpTree(w));
 }
 
+// 通用: 一次拿控件基础属性 (id/type/text), 精简 json。free 用 ui_debug_free。
+UI_API char* ui_widget_get_basic(UiWidget widget) {
+    auto* w = W(widget);
+    if (!w) return dupStr("null");
+    return dupStr(ui::WidgetBasicJson(w));
+}
+
+// 派生自 basic: 直接取控件文本写进 buf (utf-16, 含结尾 null)。返回文本长度
+// (不含 null); 若返回值 > cap-1 说明被截断, 调用方可据此扩容重取。无文本语义
+// 的控件返回 0 + 空串。
+UI_API int ui_widget_get_text(UiWidget widget, wchar_t* buf, int cap) {
+    auto* w = W(widget);
+    if (!w) { if (buf && cap > 0) buf[0] = L'\0'; return 0; }
+    bool has = false;
+    std::wstring t = ui::WidgetTextValue(w, &has);
+    int need = (int)t.size();
+    if (buf && cap > 0) {
+        int n = (need < cap - 1) ? need : (cap - 1);
+        for (int i = 0; i < n; ++i) buf[i] = t[(size_t)i];
+        buf[n] = L'\0';
+    }
+    return need;
+}
+
 UI_API void ui_debug_free(char* ptr) {
     free(ptr);
 }
@@ -2669,20 +2729,6 @@ UI_API void ui_window_clear_font_override(UiWindow win) {
     /* SetTextRenderMode 没法传"清除"，直接把 override 标志清掉需要加一个方法 */
     r.SetTextRenderMode(theme::GetTextRenderMode());
     wi->Invalidate();
-}
-
-// ---- Dialog ----
-
-UI_API int ui_debug_dialog_confirm(UiWindow win) {
-    auto* wi = Win(win); if (!wi) return -1;
-    auto* dlg = wi->activeDialog_; if (!dlg || !dlg->IsActive()) return -1;
-    return dlg->OnKeyDown(VK_RETURN) ? 0 : -1;
-}
-
-UI_API int ui_debug_dialog_cancel(UiWindow win) {
-    auto* wi = Win(win); if (!wi) return -1;
-    auto* dlg = wi->activeDialog_; if (!dlg || !dlg->IsActive()) return -1;
-    return dlg->OnKeyDown(VK_ESCAPE) ? 0 : -1;
 }
 
 // ---- HWND channel (Win32 PostMessage) ----

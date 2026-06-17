@@ -319,6 +319,87 @@ void CompileElement(CompilerCtx& ctx,
             if (top && cm->triggerEvent.empty()) cm->triggerEvent = "click";
 
             int autoId = 1;
+
+            /* L172: "把子节点深拷成 <div class=menuitem-row> wrapper" 的逻辑从
+             * menuitem 分支上提到这里, 让 submenu 父行也能复用 —— 子菜单父行不再
+             * 只有 :title 纯文字, 可以跟 <menuitem> 一样写 <svg>+<label> 富内容.
+             * AST 是 const 引用 (不可变契约) → 深拷而非 move. */
+            std::function<ui::uix::NodePtr(const ui::uix::Node&)> cloneNode;
+            cloneNode = [&cloneNode](const ui::uix::Node& src) -> ui::uix::NodePtr {
+                auto n = std::make_unique<ui::uix::Node>();
+                n->kind = src.kind;
+                n->line = src.line;
+                n->col  = src.col;
+                n->tag  = src.tag;
+                n->selfClosed = src.selfClosed;
+                n->text = src.text;
+                n->attrs = src.attrs;
+                for (const auto& ch : src.children) {
+                    if (ch) n->children.push_back(cloneNode(*ch));
+                }
+                return n;
+            };
+            /* menu 的结构性子节点 = submenu 的"项"/分隔, 不属于父行外观内容. */
+            auto isStructuralMenuChild = [](const ui::uix::Node& n) -> bool {
+                return n.kind == ui::uix::NodeKind::Element &&
+                       (n.tag == "menu" || n.tag == "menuitem" ||
+                        n.tag == "separator" || n.tag == "hr");
+            };
+            /* 把 node 的子节点克隆进一个 <div class="menuitem-row"> wrapper.
+             * Text / Interpolation 自动包 <label> (方便 <menuitem>文字</menuitem>);
+             * 其它元素 (svg/label/img/div/...) 原样克隆. skipStructural=true 时跳过
+             * menu/menuitem/separator/hr (submenu 父行只取"非项"子节点当外观).
+             * gotContent 回传是否克隆到任何内容节点 (submenu 据此决定是否回落 title). */
+            auto buildRowWrapper = [&](const ui::uix::Node& node,
+                                       bool skipStructural,
+                                       bool& gotContent) -> ui::uix::NodePtr {
+                gotContent = false;
+                auto wrapper = std::make_unique<ui::uix::Node>();
+                wrapper->kind = ui::uix::NodeKind::Element;
+                wrapper->tag = "div";
+                {
+                    ui::uix::Attr cls;
+                    cls.kind = ui::uix::AttrKind::Static;
+                    cls.name = "class";
+                    cls.rawValue = "menuitem-row";
+                    wrapper->attrs.push_back(cls);
+                    /* 默认 layout (flex-row / gap / padding / max-width) 走 lib
+                     * 内置 .menuitem-row CSS (page_api.cpp 在 user CSS 前 inject),
+                     * 用户可在 <style> 写同选择器覆盖. */
+                }
+                for (const auto& cptr2 : node.children) {
+                    if (!cptr2) continue;
+                    const auto& ch = *cptr2;
+                    if (skipStructural && isStructuralMenuChild(ch)) continue;
+                    if (ch.kind == ui::uix::NodeKind::Text) {
+                        bool nonWs = false;
+                        for (char c2 : ch.text) {
+                            if (c2 != ' ' && c2 != '\t' && c2 != '\n' && c2 != '\r') {
+                                nonWs = true; break;
+                            }
+                        }
+                        if (!nonWs) continue;
+                        auto labelNode = std::make_unique<ui::uix::Node>();
+                        labelNode->kind = ui::uix::NodeKind::Element;
+                        labelNode->tag = "label";
+                        labelNode->children.push_back(cloneNode(ch));
+                        wrapper->children.push_back(std::move(labelNode));
+                        gotContent = true;
+                    } else if (ch.kind == ui::uix::NodeKind::Interpolation) {
+                        auto labelNode = std::make_unique<ui::uix::Node>();
+                        labelNode->kind = ui::uix::NodeKind::Element;
+                        labelNode->tag = "label";
+                        labelNode->children.push_back(cloneNode(ch));
+                        wrapper->children.push_back(std::move(labelNode));
+                        gotContent = true;
+                    } else {  // Element (NodeKind 仅 3 种, 其余必是 Element)
+                        wrapper->children.push_back(cloneNode(ch));
+                        gotContent = true;
+                    }
+                }
+                return wrapper;
+            };
+
             for (const auto& cptr : mNode.children) {
                 if (!cptr) continue;
                 const auto& c = *cptr;
@@ -326,10 +407,12 @@ void CompileElement(CompilerCtx& ctx,
 
                 /* BREAKING (build 75): 嵌套 <menu title="..." v-if="..."> 当
                  * submenu. submenu 的 "parent 入口" 视觉跟 menuitem 同款
-                 * widget-template 渲染: 取 title (静态或 :title 反应式) 包到
-                 * 自动 <label> 子节点, 跟 <menuitem><label>title</label></menuitem>
-                 * 等价. 没有 menuitem 那么自由 (用户暂不能写 <menu><svg/>title</menu>
-                 * 形式定 submenu 入口外观, 若需要可后续扩展). */
+                 * widget-template 渲染.
+                 * L172 (build 164): 父行外观现在跟 <menuitem> 一样自由 —— 可写
+                 * <menu><svg/><label>title</label>...<menuitem/></menu> 富内容
+                 * (buildRowWrapper skip 掉 menuitem/menu/separator 子节点当外观);
+                 * 不写内容子节点时回落到 title (静态或 :title 反应式) 合成 <label>,
+                 * 跟 <menuitem><label>title</label></menuitem> 等价 (老用法不破). */
                 if (c.tag == "menu") {
                     CompiledMenuItem mi;
                     std::string titleStatic;
@@ -346,33 +429,29 @@ void CompileElement(CompilerCtx& ctx,
                                 mi.vIfExpr = a.rawValue;
                         }
                     }
-                    /* 合成 wrapper: <div class="menuitem-row"><label>{title}</label></div>
-                     * label 内放静态 text node 或 Interpolation node (反应式). */
-                    auto wrapper = std::make_unique<ui::uix::Node>();
-                    wrapper->kind = ui::uix::NodeKind::Element;
-                    wrapper->tag = "div";
-                    {
-                        ui::uix::Attr cls;
-                        cls.kind = ui::uix::AttrKind::Static;
-                        cls.name = "class";
-                        cls.rawValue = "menuitem-row";
-                        wrapper->attrs.push_back(cls);
+                    /* L172: 父行外观 — 优先用 <menu> 的"非结构性"子节点 (svg /
+                     * label / img / 文字, 即除 menuitem/menu/separator 外的) 当富
+                     * 内容, 跟 <menuitem><svg/><label/></menuitem> 同款; 没写这类
+                     * 子节点时回落到 :title/text 合成 <label> (老用法不破). */
+                    bool gotContent = false;
+                    auto wrapper = buildRowWrapper(c, /*skipStructural=*/true, gotContent);
+                    if (!gotContent) {
+                        auto labelNode = std::make_unique<ui::uix::Node>();
+                        labelNode->kind = ui::uix::NodeKind::Element;
+                        labelNode->tag = "label";
+                        if (!titleBound.empty()) {
+                            auto interp = std::make_unique<ui::uix::Node>();
+                            interp->kind = ui::uix::NodeKind::Interpolation;
+                            interp->text = titleBound;
+                            labelNode->children.push_back(std::move(interp));
+                        } else {
+                            auto textNode = std::make_unique<ui::uix::Node>();
+                            textNode->kind = ui::uix::NodeKind::Text;
+                            textNode->text = titleStatic;
+                            labelNode->children.push_back(std::move(textNode));
+                        }
+                        wrapper->children.push_back(std::move(labelNode));
                     }
-                    auto labelNode = std::make_unique<ui::uix::Node>();
-                    labelNode->kind = ui::uix::NodeKind::Element;
-                    labelNode->tag = "label";
-                    if (!titleBound.empty()) {
-                        auto interp = std::make_unique<ui::uix::Node>();
-                        interp->kind = ui::uix::NodeKind::Interpolation;
-                        interp->text = titleBound;
-                        labelNode->children.push_back(std::move(interp));
-                    } else {
-                        auto textNode = std::make_unique<ui::uix::Node>();
-                        textNode->kind = ui::uix::NodeKind::Text;
-                        textNode->text = titleStatic;
-                        labelNode->children.push_back(std::move(textNode));
-                    }
-                    wrapper->children.push_back(std::move(labelNode));
                     mi.contentRoot = std::move(wrapper);
 
                     mi.submenu = compileMenu(c, 1, false /*not top*/);
@@ -395,9 +474,16 @@ void CompileElement(CompilerCtx& ctx,
                     continue;
                 }
                 if (c.tag != "menuitem") {
-                    ctx.out->errors.push_back(
-                        "<menu> child must be <menuitem>, <separator>, or nested <menu>, got <"
-                        + c.tag + ">.");
+                    /* L172: 非 menuitem/menu/separator 的元素子节点 —
+                     *   top-level 菜单 (无父行): 笔误, 报错 (保持原行为继续拦);
+                     *   submenu 体 (top==false): 这是本 <menu> 自己的父行 entry
+                     *   content (svg/label/...), 已被上层 buildRowWrapper 消费,
+                     *   这里静默跳过, 不当 item, 不报错. */
+                    if (top) {
+                        ctx.out->errors.push_back(
+                            "<menu> child must be <menuitem>, <separator>, or nested <menu>, got <"
+                            + c.tag + ">.");
+                    }
                     continue;
                 }
 
@@ -450,65 +536,12 @@ void CompileElement(CompilerCtx& ctx,
                     }
                 }
 
-                /* 把 menuitem 的 children **深拷贝** 到一个合成 <div class="menuitem-row">
-                 * wrapper, 让 widget_factory 当普通 hbox 编译. 用 deep-clone 而
-                 * 不是 move 因为外层 mNode 是 const 引用 (AST 不可变契约). Text /
-                 * Interpolation 子节点自动包到 <label> 里 (方便 <menuitem>文字</menuitem>
-                 * 这种简单写法直接 work). 元素节点 (svg / label / div / button / ...)
-                 * 原样 clone 进 wrapper. */
-                std::function<ui::uix::NodePtr(const ui::uix::Node&)> cloneNode;
-                cloneNode = [&cloneNode](const ui::uix::Node& src) -> ui::uix::NodePtr {
-                    auto n = std::make_unique<ui::uix::Node>();
-                    n->kind = src.kind;
-                    n->line = src.line;
-                    n->col  = src.col;
-                    n->tag  = src.tag;
-                    n->selfClosed = src.selfClosed;
-                    n->text = src.text;
-                    n->attrs = src.attrs;
-                    for (const auto& ch : src.children) {
-                        if (ch) n->children.push_back(cloneNode(*ch));
-                    }
-                    return n;
-                };
-                auto wrapper = std::make_unique<ui::uix::Node>();
-                wrapper->kind = ui::uix::NodeKind::Element;
-                wrapper->tag = "div";
-                {
-                    ui::uix::Attr cls;
-                    cls.kind = ui::uix::AttrKind::Static;
-                    cls.name = "class";
-                    cls.rawValue = "menuitem-row";
-                    wrapper->attrs.push_back(cls);
-                    /* 默认 layout (flex-row / gap / padding / max-width) 走 lib
-                     * 内置 .menuitem-row CSS (page_api.cpp 在 user CSS 前 inject),
-                     * 用户可在 <style> 写同选择器覆盖. */
-                }
-                for (const auto& cptr2 : c.children) {
-                    if (!cptr2) continue;
-                    if (cptr2->kind == ui::uix::NodeKind::Text) {
-                        bool nonWs = false;
-                        for (char ch : cptr2->text) {
-                            if (ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r') {
-                                nonWs = true; break;
-                            }
-                        }
-                        if (!nonWs) continue;
-                        auto labelNode = std::make_unique<ui::uix::Node>();
-                        labelNode->kind = ui::uix::NodeKind::Element;
-                        labelNode->tag = "label";
-                        labelNode->children.push_back(cloneNode(*cptr2));
-                        wrapper->children.push_back(std::move(labelNode));
-                    } else if (cptr2->kind == ui::uix::NodeKind::Interpolation) {
-                        auto labelNode = std::make_unique<ui::uix::Node>();
-                        labelNode->kind = ui::uix::NodeKind::Element;
-                        labelNode->tag = "label";
-                        labelNode->children.push_back(cloneNode(*cptr2));
-                        wrapper->children.push_back(std::move(labelNode));
-                    } else {
-                        wrapper->children.push_back(cloneNode(*cptr2));
-                    }
-                }
+                /* L172: menuitem 行内容 — 复用上提的 buildRowWrapper
+                 * (skipStructural=false, 克隆全部子节点). Text/Interpolation 自动
+                 * 包 <label>, 元素原样 clone. 跟 submenu 父行共用同一份逻辑,
+                 * 不再内联重复 cloneNode + 克隆循环. */
+                bool miGotContent = false;
+                auto wrapper = buildRowWrapper(c, /*skipStructural=*/false, miGotContent);
                 mi.contentRoot = std::move(wrapper);
 
                 if (mi.itemId == 0) mi.itemId = autoId++;
@@ -596,12 +629,17 @@ void CompileElement(CompilerCtx& ctx,
             // gap/justify-content/align-items rule actually clears the value
             // (Apply* functions only set on s.Has(prop)). Container type
             // (VBox vs HBox) is locked at factory time and can't change here.
+            // gap 必须重设到 kDefaultFlexGap (= 编译时默认), 不能重设成 0 ——
+            // 否则 "CSS 没写 gap" 的容器编译时是默认 4、首次交互后却变 0, 布局
+            // 在首次 hover/click 瞬间跳变 (L119: toolbar 原图按钮首次点击右移
+            // 8px)。MainJustify/CrossAlign 重设值本就 = 各自默认 (Start/Stretch),
+            // 无此问题。
             if (auto* vb = dynamic_cast<VBoxWidget*>(rawW)) {
-                vb->Gap(0);
+                vb->Gap(kDefaultFlexGap);
                 vb->MainJustify(LayoutJustify::Start);
                 vb->CrossAlign(LayoutAlign::Stretch);
             } else if (auto* hb = dynamic_cast<HBoxWidget*>(rawW)) {
-                hb->Gap(0);
+                hb->Gap(kDefaultFlexGap);
                 hb->MainJustify(LayoutJustify::Start);
                 hb->CrossAlign(LayoutAlign::Stretch);
                 hb->FlexWrap(false);

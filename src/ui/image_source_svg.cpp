@@ -133,6 +133,11 @@ CreateSvgSourceFromFile(const std::wstring& path, Renderer& r) {
     std::string xml = LoadSvgWithInlinedStyles(path);
     if (xml.empty()) return nullptr;
 
+    /* L121: <text>/<foreignObject> → <path> 字形轮廓内联回 DOM, 让 D2D 按文档
+     * 顺序统一渲染 (z 序正确). 转换后已无 <text>, 原生路径不再需要 DirectWrite
+     * 叠加, fallback 的 ParseSvgIcon 也直接把文字当形状画 (一并修好). */
+    xml = r.SvgInlineTextAsPaths(xml);
+
     // 先试原生路径（Win10 1607+）
     if (auto* ctx5 = r.RT5()) {
         ComPtr<IStream> stream;
@@ -167,9 +172,18 @@ CreateSvgSourceFromFile(const std::wstring& path, Renderer& r) {
                             D2D1_SVG_ATTRIBUTE_POD_TYPE_LENGTH, &lh, sizeof(lh)))
                         && lh.value > 0) h = (int)lh.value;
                 }
-                /* L75: D2D 画形状; 文字另外解析出来 (D2D 拿不到), DirectWrite 叠加. */
+                /* L170: 覆写 root width/height = viewBox (w/h)。原 width/height
+                 * 若是物理单位 (mm/cm/in) D2D 按固有尺寸渲染, 跟 Draw 基于 w/h
+                 * 的 scale 不一致 → 内容缩放错位。统一成 viewBox 数值消歧义。 */
+                if (root) {
+                    const D2D1_SVG_LENGTH ow{(float)w, D2D1_SVG_LENGTH_UNITS_NUMBER};
+                    const D2D1_SVG_LENGTH oh{(float)h, D2D1_SVG_LENGTH_UNITS_NUMBER};
+                    root->SetAttributeValue(L"width",  ow);
+                    root->SetAttributeValue(L"height", oh);
+                }
+                /* L121: 文字已内联成 <path>, D2D 一把全画 → 无需 textRuns 叠加. */
                 return std::make_unique<SvgSourceNative>(
-                    doc, w, h, r.ParseSvgTextRuns(xml));
+                    doc, w, h, std::vector<SvgTextRun>{});
             }
         }
     }

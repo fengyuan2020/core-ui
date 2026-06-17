@@ -99,6 +99,14 @@ public:
     // Skip VSync for next Present (used during resize for immediate feedback)
     bool skipVSync = false;
 
+    // L177: Skip the swapChain Present for the next EndDraw — still flushes the
+    // D2D draw to the back buffer, just doesn't flip to DWM. For painting a
+    // hidden / not-yet-shown window: DWM doesn't composite it so the flip would
+    // block in some GPU drivers (AMD), yet the draw must still happen so widgets
+    // settle and stop re-invalidating (else a WM_PAINT flood). Auto-reset each
+    // EndDraw.
+    bool skipPresent = false;
+
     void Clear(const D2D1_COLOR_F& color);
     void FillRect(const D2D1_RECT_F& rect, const D2D1_COLOR_F& color);
     void FillRoundedRect(const D2D1_RECT_F& rect, float rx, float ry, const D2D1_COLOR_F& color);
@@ -199,6 +207,12 @@ public:
     void DrawSvgTextRuns(const std::vector<SvgTextRun>& runs,
                          const D2D1_MATRIX_3X2_F& baseXf);
 
+    /* L121: 把 SVG 里的 <text>/<foreignObject> 用 DirectWrite 字形轮廓转成等价
+     * <path>, 原地替换回 DOM, 让 D2D DrawSvgDocument 按文档顺序统一渲染 ——
+     * 文字与形状回到同一条有序管线, z 序天然正确 (修复堆叠卡片文字溢出 / 被遮挡
+     * 文字反浮到最上层). 返回改写后的 SVG xml; 无 <text> 或无 DWrite 时原样返回. */
+    std::string SvgInlineTextAsPaths(const std::string& svgContent);
+
     ID2D1DeviceContext* RT() { return ctx_.Get(); }
     /* ID2D1DeviceContext5（支持 CreateSvgDocument / DrawSvgDocument）。
      * Windows 10 1607 以下返回 nullptr，调用方应做 null 检查并降级。
@@ -294,6 +308,16 @@ private:
     static ComPtr<ID2D1Device>   s_d2dDevice;
     static int                   s_deviceRefCount;
     bool EnsureSharedDevice();
+
+public:
+    /* 启动加速: 后台线程预创建共享 D3D11 设备 (D3D11CreateDevice 占首窗
+     * RT 创建 ~39ms 且 free-threaded 可跨线程移交)。ui_init 时调一次,
+     * EnsureSharedDevice 到点收割 — 窗口创建期间 (~60ms) 设备已并行建好,
+     * 首窗 RT 创建从 ~39ms 降到 ~3ms。D2D 设备仍在 UI 线程创建
+     * (single-threaded factory 约束)。幂等, 多次调用无害。 */
+    static void PrewarmSharedDeviceAsync();
+
+private:
 
     // 每窗口独立资源
     ComPtr<ID2D1DeviceContext>  ctx_;

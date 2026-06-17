@@ -67,6 +67,12 @@ public:
     UiWindowImpl* FindWindowByWidget(class Widget* w);
     void RemoveWindow(uint64_t id);
     void InvalidateAllWindows();
+    // Re-run layout (LayoutRoot) + repaint on every window. Use after a bulk
+    // change that alters widgets' intrinsic sizes but goes through a path that
+    // only repaints — e.g. PageState::SetLocale swaps every $t() label's text,
+    // which changes their measured widths; without a relayout the labels keep
+    // their previously-laid-out rects and longer translations wrap/overflow.
+    void RelayoutAllWindows();
     // Re-evaluates per-window animation timers (toggle/checkbox/etc.). Needed
     // whenever a binding application or external setter flips a widget into
     // an animating state outside an event handler — without this, the timer

@@ -219,20 +219,62 @@ UI_API void     ui_toast_ex(UiWindow win, const wchar_t* text, int duration_ms,
                             int position, int icon, int anim);
 
 /* ------------------------------------------------------------------ */
-/* Dialog (modal confirm / alert)                                     */
+/* MsgBox (独立窗口模态询问框, build 158)                              */
 /* ------------------------------------------------------------------ */
-typedef void (*UiDialogCallback)(UiWidget dialog, int confirmed, void* userdata);
+/* BREAKING (build 158): in-window 覆盖层式 ui_dialog_* 移除, 由独立窗口
+ * 的 ui_msgbox 取代 — 像系统 MessageBox 的使用手感: 同步阻塞、任意
+ * 1..4 个按钮、键盘语义 (Enter=默认 / Esc=取消 / Tab 切焦点)、主题
+ * 跟随、居中于宿主、按宿主 DPI。 */
 
-UI_API void ui_dialog_show(UiWidget dialog, UiWindow win,
-                           const wchar_t* title, const wchar_t* message,
-                           UiDialogCallback cb, void* userdata);
-UI_API void ui_dialog_hide(UiWidget dialog, UiWindow win);
-UI_API void ui_dialog_set_ok_text(UiWidget dialog, const wchar_t* text);
-UI_API void ui_dialog_set_cancel_text(UiWidget dialog, const wchar_t* text);
-UI_API void ui_dialog_set_show_cancel(UiWidget dialog, int show);
-/* Per-dialog theme override. mode: 0 = follow global theme (default),
- * 1 = force light, 2 = force dark. */
-UI_API void ui_dialog_set_theme_mode(UiWidget dialog, int mode);
+enum {
+    UI_MSGBOX_ICON_NONE     = 0,
+    UI_MSGBOX_ICON_INFO     = 1,
+    UI_MSGBOX_ICON_WARNING  = 2,
+    UI_MSGBOX_ICON_ERROR    = 3,
+    UI_MSGBOX_ICON_QUESTION = 4,
+};
+
+/* 模态询问框 — 阻塞到用户选择, 返回点击的按钮索引。
+ *   buttons/button_count: 1..4 个按钮文案 (从左到右排列, 整体右对齐)
+ *   default_idx: Enter 触发 + accent 主按钮高亮
+ *   cancel_idx:  Esc / Alt+F4 / 系统关闭 返回此索引; -1 = 不可取消
+ * 模态期间宿主窗口被禁用, 返回前恢复并交还前台。 */
+UI_API int ui_msgbox(UiWindow win,
+                     const wchar_t* title, const wchar_t* message,
+                     const wchar_t* const* buttons, int button_count,
+                     int default_idx, int cancel_idx, int icon);
+
+/* 完整形态 (build 159) — params in / result out 成对结构, 两端加字段都
+ * 不动签名 (params 走 struct_size 护栏, result 走 _reserved 余量)。
+ * ui_msgbox 是本接口的便捷皮。 */
+typedef struct UiMsgBoxParams {
+    uint32_t struct_size;          /* = sizeof(UiMsgBoxParams) */
+    const wchar_t* title;
+    const wchar_t* message;
+    const wchar_t* const* buttons; /* 1..4 个 */
+    int button_count;
+    int default_idx;               /* Enter 触发 + accent 主按钮 */
+    int cancel_idx;                /* Esc/关闭; -1 = 不可取消 */
+    int icon;                      /* UI_MSGBOX_ICON_* */
+    /* 勾选框 (系统 TaskDialog verification checkbox 同位): NULL = 不显示。
+     * 放按钮行上方、与消息文本左对齐。 */
+    const wchar_t* check_text;
+    int check_initial;
+    /* 按钮自定义色 (build 160): NULL = 全默认。数组长度 = button_count,
+     * alpha=0 的项 = 该按钮默认样式。有色按钮 = 实底 + 按亮度自动黑白字
+     * + 自动 hover/press 反馈 (危险操作红等)。
+     * struct_size 护栏: 旧编译的调用方 (不含本字段的 sizeof) 仍合法 —
+     * 实现按 struct_size 判定字段可用性。 */
+    const UiColor* button_colors;
+} UiMsgBoxParams;
+
+typedef struct UiMsgBoxResult {
+    int button;        /* 被点按钮索引 (Esc/关闭 = cancel_idx) */
+    int checked;       /* 勾选框终态 0/1 (无勾选框 = check_initial 原样) */
+    int _reserved[2];  /* ABI 余量 — 加结果维度不破返回布局 */
+} UiMsgBoxResult;
+
+UI_API UiMsgBoxResult ui_msgbox_ex(UiWindow win, const UiMsgBoxParams* params);
 
 /* 不透明句柄 — 指向被点击菜单项 (id + 全部静态属性). 仅在回调期间有效;
  * 出回调即失效, 宿主需要的值要当场拷走。 */
@@ -443,7 +485,11 @@ typedef struct UiGhImgViewInfo {
     uint32_t tile_size;       /* 256 */
     uint32_t levels;          /* 1 = 单级；N = pyramid N 级 */
     uint32_t pixel_format;    /* 0 = BGRA8 premul（v1 仅此） */
-    uint32_t reserved[3];     /* 必须置零，留给 v2 字段（HDR fp16 等） */
+    uint32_t keep_preview;    /* 原 reserved[0]: 1 = 切金字塔(begin)时保留现有 preview
+                                 兜底层不清空 — 宿主已先 set_preview 一张清晰低清图,
+                                 换金字塔结构时让它继续兜底, 消除"清晰预览→低清垫底→
+                                 清晰"的闪烁 (L168)。默认 0 = 旧行为 (begin 清 preview)。*/
+    uint32_t reserved[2];     /* 必须置零，留给 v2 字段（HDR fp16 等） */
 } UiGhImgViewInfo;
 
 typedef struct UiGhImgViewport {
@@ -468,6 +514,13 @@ UI_API void     ui_gh_img_view_set_tile(UiWidget w, UiWindow win,
                                          uint32_t stride);
 UI_API void     ui_gh_img_view_clear_level(UiWidget w, uint32_t level);
 UI_API void     ui_gh_img_view_clear(UiWidget w);
+
+/* L115: tile 批量提交. begin 后多次 ui_gh_img_view_set_tile 不逐个触发重绘,
+ * end 时一次重绘. 宿主切金字塔级时把整级可见 tile 攒齐、一次 batch 提交, 配合
+ * lib 内部"切级保留旧级"(OnDraw 多级 fallback), 消除放大切级的逐 tile 波浪刷新.
+ * begin/end 必须成对; end 触发一次 invalidate. */
+UI_API void     ui_gh_img_view_begin_tile_batch(UiWidget w);
+UI_API void     ui_gh_img_view_end_tile_batch(UiWidget w);
 
 /* Build 70+ (L20): SVG 矢量源. 喂一个 .svg 文件, widget 进入 SVG 模式 —
  * 跳过瓦块逻辑, OnDraw 直接 DrawSvgDocument (ID2D1DeviceContext5 原生光栅化).
@@ -513,6 +566,12 @@ UI_API int      ui_gh_img_view_get_antialias(UiWidget w);
  * 缩放 API (set_zoom / set_zoom_around 等) 不受此开关影响. */
 UI_API void     ui_gh_img_view_set_wheel_zoom_enabled(UiWidget w, int on);
 UI_API int      ui_gh_img_view_get_wheel_zoom_enabled(UiWidget w);
+/* 内部鼠标拖动平移按轴锁. lock_x/lock_y=1 时该轴拖动不平移 (默认两轴 0=自由)。
+ * 用于"锁定/只读"视图: 如长图锁水平 set_pan_lock(w,1,0) → 左右固定居中、上下仍
+ * 可拖动阅读。命令式 set_pan 不受影响; 拖动期间 ui_widget_on_mouse_move hook 仍
+ * fire (宿主"拖出图片"等手势照常)。 */
+UI_API void     ui_gh_img_view_set_pan_lock(UiWidget w, int lock_x, int lock_y);
+UI_API void     ui_gh_img_view_get_pan_lock(UiWidget w, int* out_lock_x, int* out_lock_y);
 
 UI_API float    ui_gh_img_view_get_zoom(UiWidget w);
 UI_API void     ui_gh_img_view_set_zoom(UiWidget w, float zoom);
@@ -600,6 +659,11 @@ UI_API void ui_widget_set_id(UiWidget w, const char* id);
 UI_API void ui_widget_set_width(UiWidget w, float width);
 UI_API void ui_widget_set_height(UiWidget w, float height);
 UI_API void ui_widget_set_size(UiWidget w, float width, float height);
+/* build 161: 布局豁免 — pinned=1 且 widget 已有有效 rect 时, relayout 不
+ * 改写其位置 (子树仍布局)。给可拖动浮动面板用 (拖后不被反应式重建/菜单
+ * 等触发的 relayout 打回 CSS 默认位)。仅对 position:absolute 组件生效;
+ * 显式 ui_widget_set_rect 仍有效。 */
+UI_API void ui_widget_set_layout_pinned(UiWidget w, int pinned);
 UI_API void ui_widget_set_expand(UiWidget w, int expand);
 UI_API void ui_widget_set_padding(UiWidget w, float left, float top, float right, float bottom);
 UI_API void ui_widget_set_padding_uniform(UiWidget w, float p);
@@ -614,6 +678,16 @@ UI_API int    ui_widget_get_visible(UiWidget w);
 UI_API int    ui_widget_get_enabled(UiWidget w);
 UI_API UiRect ui_widget_get_rect(UiWidget w);
 UI_API void   ui_widget_set_rect(UiWidget w, UiRect rect);
+
+/* 通用基础属性查询。
+ * ui_widget_get_basic: 返回精简 json {"id","type","text"} (比 ui_debug_dump_widget
+ *   轻 — 无 rect/metrics/children), 给业务一次拿控件名称/类型/值。free 用 ui_debug_free。
+ * ui_widget_get_text: 派生自 basic, 直接取控件文本写进 buf (utf-16, 含结尾 null),
+ *   返回文本长度 (不含 null; 若 > cap-1 表示被截断, 可据此扩容重取)。
+ * 覆盖所有文本控件: Label/Button/Input/Combo/TextArea/Toggle/Radio/Check/Nav/
+ * Overlay/TitleBar; 无文本语义的控件 get_text 返回 0、basic 的 "text" 为 null。 */
+UI_API char* ui_widget_get_basic(UiWidget w);
+UI_API int   ui_widget_get_text(UiWidget w, wchar_t* buf, int cap);
 
 /* ------------------------------------------------------------------ */
 /* Label                                                              */
@@ -1108,8 +1182,6 @@ UI_API void             ui_window_set_text_render_mode(UiWindow win, UiTextRende
 UI_API void             ui_window_clear_font_override(UiWindow win);   /* 清除所有 font/mode 覆盖 */
 
 /* ---- Dialog / Toast ---- */
-UI_API int   ui_debug_dialog_confirm(UiWindow win);
-UI_API int   ui_debug_dialog_cancel(UiWindow win);
 
 /* ---- HWND 通道：通过 Win32 消息循环派发（异步，需 pump） ---- */
 UI_API int   ui_debug_post_click(UiWindow win, float x, float y);

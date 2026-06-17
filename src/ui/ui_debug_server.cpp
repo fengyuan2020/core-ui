@@ -580,14 +580,6 @@ std::string BuiltinDispatch(UiWindow win, const std::string& cmd,
         return okJson();
     }
 
-    // --- dialog ---
-    if (cmd == "dialog_confirm") {
-        return ui_debug_dialog_confirm(win) == 0 ? okJson() : errJson("no active dialog");
-    }
-    if (cmd == "dialog_cancel") {
-        return ui_debug_dialog_cancel(win) == 0 ? okJson() : errJson("no active dialog");
-    }
-
     // --- HWND channel (PostMessage) ---
     if (cmd == "post_click") {
         if (arg(1).empty()) return errJson("usage: post_click <x> <y>");

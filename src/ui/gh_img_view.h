@@ -23,8 +23,16 @@
 #include <functional>
 #include <cstdint>
 #include <string>
+#include <memory>
+
+// L173 / core-ui Phase 4: SVG 矢量源改用 LunaSVG (统一引擎)。前向声明, 完整定义
+// 只在 gh_img_view.cpp include <lunasvg.h> (避免把 LunaSVG 拖进所有 TU)。
+namespace lunasvg { class Document; }
 
 namespace ui {
+
+// L173 Phase 4: 后台 SVG 栅格化的跨线程结果槽 (定义在 gh_img_view.cpp)。
+struct SvgRenderSlot;
 
 class UI_API GhImgViewWidget : public Widget {
 public:
@@ -38,6 +46,7 @@ public:
         uint32_t tileSize    = 256;
         uint32_t levels      = 1;       // 1 = 单级；N = pyramid N 级（顶级 = 0）
         uint32_t pixelFormat = 0;       // 0 = BGRA8 premul（v1 仅此一种）
+        bool     keepPreview = false;   // L168: true=Begin 不清 preview 兜底层
     };
 
     // 宣告图像数据形状。调用后清空所有已喂瓦块/preview，进入"等数据"状态。
@@ -101,12 +110,24 @@ public:
     // (hook 在 OnMouseWheel 分发开头无条件 fire, 不受此开关影响).
     void     SetWheelZoomEnabled(bool on) { wheelZoomEnabled_ = on; }
     bool     WheelZoomEnabled() const     { return wheelZoomEnabled_; }
+    // PanLock: 内部鼠标拖动平移按轴锁. lockX/lockY = true 时该轴拖动不平移
+    // (默认两轴都 false = 自由拖动)。用于"锁定/只读"视图: 如长图锁水平
+    // (lockX=1,lockY=0) → 左右固定居中、上下仍可拖动阅读。命令式 SetPan 不受
+    // 影响; onMouseMoveHook 仍在拖动期间 fire (宿主"拖出图片"等手势照常)。
+    void     SetPanLock(bool lockX, bool lockY) { panLockX_ = lockX; panLockY_ = lockY; }
+    bool     PanLockX() const             { return panLockX_; }
+    bool     PanLockY() const             { return panLockY_; }
 
     // ---- level 选择 ----
     void     SetAutoLevel(bool on)   { autoLevel_ = on; }
     bool     AutoLevel() const       { return autoLevel_; }
     void     SetActiveLevel(uint32_t level);
     uint32_t ActiveLevel() const     { return activeLevel_; }
+
+    // L115: tile 批量提交 — Begin 后多次 SetTile 不逐个 invalidate, End 一次刷。
+    // 配合切级保留旧级 (TrimToViewport_), 消除放大切级时的逐 tile 波浪刷新。
+    void     BeginTileBatch() { tileBatch_ = true; }
+    void     EndTileBatch();
 
     // ---- 视口 ----
     float Zoom() const               { return zoom_; }
@@ -175,7 +196,13 @@ private:
     bool     autoLevel_ = true;
     bool     antialias_ = true;        // 放大平滑 (默认); false = NEAREST 像素清晰
     bool     wheelZoomEnabled_ = true; // 内部滚轮缩放 (默认); false 让宿主接管
+    bool     panLockX_ = false;        // 拖动平移按轴锁 (默认两轴自由); true = 该轴拖动不动
+    bool     panLockY_ = false;
     uint32_t activeLevel_ = 0;
+    // L115: 上一个 active level — 切级时 TrimToViewport_ 保留它的 tile, 让 OnDraw
+    // 多级 fallback 用旧级清晰图覆盖新级未到达的 tile (切级清晰→更清晰, 无波浪/无空白)。
+    uint32_t prevActiveLevel_ = UINT32_MAX;
+    bool     tileBatch_ = false;   // L115: Begin/EndTileBatch 间抑制逐 tile invalidate
 
     float zoom_ = 1.0f;
     float panX_ = 0, panY_ = 0;
@@ -222,6 +249,11 @@ private:
     Microsoft::WRL::ComPtr<ID2D1Bitmap> preview_;
     uint32_t previewW_ = 0, previewH_ = 0;
 
+    // L105: 缓存的离屏合成位图 (TARGET). DrawLevel 把本级可见瓦块 1:1 拼进它(无内部
+    // 瓦块边界)再整体缩放上屏, 消除非整数缩放下的瓦块接缝。按需重建(只增不减)。
+    Microsoft::WRL::ComPtr<ID2D1Bitmap1> composite_;
+    uint32_t compositeW_ = 0, compositeH_ = 0;
+
     // L48: NotifyViewport 内调, 清掉 tiles_ 中不在 viewport 范围内的 tile
     // + 非 active level 的 tile. 每个被清的 tile fire 一次 onTileEvicted,
     // caller 同步自己端 pushed_tiles_ erase. 内存稳定 = viewport tile × 256KB,
@@ -230,15 +262,32 @@ private:
                           uint32_t visible_tx0, uint32_t visible_tx1,
                           uint32_t visible_ty0, uint32_t visible_ty1);
 
-    /* Build 70+ (L20): SVG 矢量源. 非空时进入 SVG 模式, OnDraw 走
-     * DrawSvgDocument 不再画瓦块. svgW_/svgH_ 是 SVG natural size, 跟
-     * info_.fullWidth/Height 同步. */
-    Microsoft::WRL::ComPtr<ID2D1SvgDocument> svgDoc_;
+    /* L173 / core-ui Phase 4: SVG 矢量源改用 LunaSVG (统一引擎, 与 gh-img-decode
+     * 同款; 支持 filter/feDropShadow/text/mask 等 D2D ID2D1SvgDocument 子集外能力)。
+     * 非空时进入 SVG 模式, OnDraw 用 LunaSVG 按当前显示分辨率栅格化到 svgRaster_
+     * 缓存位图再 DrawBitmap (替原 D2D DrawSvgDocument 矢量直绘)。svgW_/svgH_ =
+     * SVG natural size, 跟 info_.fullWidth/Height 同步。 */
+    std::shared_ptr<lunasvg::Document> svgDoc_;   /* shared: 后台栅格化线程安全持有 */
     uint32_t svgW_ = 0;
     uint32_t svgH_ = 0;
-    /* L75: D2D ID2D1SvgDocument 不渲染 <text>/<foreignObject> 文字 (shapes-only) →
-     * core-ui 自己解析出来, OnDraw 里 DrawSvgDocument 之后 DirectWrite 叠加补渲. */
-    std::vector<SvgTextRun> svgTextRuns_;
+    /* 栅格化缓存位图 (UI 线程持有/绘制)。svgRasterW_/H_ = 已渲分辨率; 缩放未超过
+     * 复用窗口时直接 downscale 显示 (仍清晰)。 */
+    Microsoft::WRL::ComPtr<ID2D1Bitmap> svgRaster_;
+    uint32_t svgRasterW_ = 0;
+    uint32_t svgRasterH_ = 0;
+
+    /* 后台栅格化 (L173 Phase 4): 缩放重渲丢后台线程, UI 线程只画缓存 → 永不阻塞
+     * 输入。后台渲完锁 slot 存 BGRA + InvalidateRect 唤醒, 下次 OnDraw 换上
+     * svgRaster_。slot 用 shared_ptr 跨线程共享生命周期 (widget 析构 / 换图也不
+     * 悬空)。渲染期间又改缩放 → slot.want 更新, 线程渲完自动再渲最新档 (合并)。 */
+    std::shared_ptr<SvgRenderSlot> svgSlot_;
+    // 同步渲一张到 svgRaster_ (仅首帧/还没缓存时 — load 时一次性, 不在缩放热路径)。
+    void EnsureSvgRaster(const D2D1_RECT_F& dest, Renderer& r);
+    // 起/更新一个后台渲染请求 (非阻塞)。uiThreadId = UI 线程 id, 后台渲完用
+    // EnumThreadWindows 跨线程 InvalidateRect 唤醒 (同 InvalidateAllWindows 模式)。
+    void RequestSvgRasterAsync_(uint32_t renW, uint32_t renH, unsigned long uiThreadId);
+    // 后台结果就绪时, 在 UI 线程把 BGRA 建成 D2D 位图换上 svgRaster_。
+    void ConsumeSvgRasterResult_(Renderer& r);
 
     // ---- 渲染辅助 ----
     void     DrawLevel(Renderer& r, uint32_t level, const D2D1_RECT_F& dest);

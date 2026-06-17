@@ -301,6 +301,10 @@ bool CompileAndAttachPage(PageEntry& e, const std::string& rawText) {
 }
 .menuitem-row label {
   font-size: 13px;
+  /* 菜单项单行 (L100): 配合 HBoxWidget flex-shrink (build 141), 超长 label 被
+   * 收缩到行宽后走单行 ellipsis "abc…", 而非默认软换行折成多行、撑高 item
+   * 溢出压到相邻项。需要多行菜单项的调用方用户 CSS 覆盖 white-space: normal。 */
+  white-space: nowrap;
 }
 )";
         auto def = ui::css::ParseStylesheet(kLibMenuDefaultsCSS);

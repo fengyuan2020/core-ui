@@ -3,6 +3,13 @@
 #include "event.h"
 #include "theme.h"
 #include "ui_context.h"
+
+namespace ui {
+void RequestLayout() {
+    LayoutDirtyFlag() = true;
+    GetContext().InvalidateAllWindows();
+}
+}  // namespace ui
 #include "css/value.h"
 
 #include <d2d1_1.h>
@@ -383,6 +390,11 @@ void Widget::DoLayout() {
         if (child->percentMaxH >= 0) child->maxH   = ch * child->percentMaxH / 100.0f;
 
         if (child->positionAbsolute) {
+            if (child->layoutPinned &&
+                child->rect.right - child->rect.left > 0) {
+                child->DoLayout();   /* build 161: 钉住 — rect 不改写 */
+                continue;
+            }
             auto hint = child->SizeHint();
             float w = child->fixedW > 0 ? child->fixedW : (hint.width > 0 ? hint.width : cw);
             float h = child->fixedH > 0 ? child->fixedH : (hint.height > 0 ? hint.height : 24.0f);
@@ -666,6 +678,11 @@ void VBoxWidget::DoLayout() {
 
     // Layout absolute-positioned children
     for (auto* child : absChildren) {
+        if (child->layoutPinned &&
+            child->rect.right - child->rect.left > 0) {
+            child->DoLayout();   /* build 161: 钉住 — rect 不改写 */
+            continue;
+        }
         auto hint = child->SizeHint();
         float w = child->fixedW > 0 ? child->fixedW : (hint.width > 0 ? hint.width : cw);
         float h = child->fixedH > 0 ? child->fixedH : (hint.height > 0 ? hint.height : 24.0f);
@@ -769,6 +786,39 @@ void HBoxWidget::DoLayout() {
         contentW += widths[i] + vis[i]->marginL + vis[i]->marginR;
     contentW += gapTotal;
 
+    // CSS flex-shrink: when natural content exceeds the row, shrink shrinkable
+    // children (flexShrink > 0) proportionally to flexShrink × width, down to
+    // minW (default 0). Lets a fixed-width row (e.g. a menu item) ellipsis its
+    // label instead of overflowing the card; icons opt out via flex-shrink:0 /
+    // flex:none. Iterate a few passes so children that bottom out at minW hand
+    // their remaining shrink demand to the others (matches CSS distribution).
+    float overflow = contentW - totalW;
+    if (overflow > 0.5f) {
+        for (int pass = 0; pass < 4 && overflow > 0.5f; pass++) {
+            float weightSum = 0;
+            for (size_t i = 0; i < vis.size(); i++)
+                if (vis[i]->flexShrink > 0 && widths[i] > vis[i]->minW)
+                    weightSum += vis[i]->flexShrink * widths[i];
+            if (weightSum <= 0) break;
+            float shrunk = 0;
+            for (size_t i = 0; i < vis.size(); i++) {
+                auto* child = vis[i];
+                if (child->flexShrink <= 0 || widths[i] <= child->minW) continue;
+                float want = overflow * (child->flexShrink * widths[i]) / weightSum;
+                float neww = std::max(child->minW, widths[i] - want);
+                shrunk += widths[i] - neww;
+                widths[i] = neww;
+            }
+            overflow -= shrunk;
+            if (shrunk < 0.5f) break;
+        }
+        // Recompute so justify below works off the shrunk total.
+        contentW = 0;
+        for (size_t i = 0; i < vis.size(); i++)
+            contentW += widths[i] + vis[i]->marginL + vis[i]->marginR;
+        contentW += gapTotal;
+    }
+
     // Main-axis start position + gap override for justify
     float x = cx;
     float extraGap = 0;
@@ -834,6 +884,11 @@ void HBoxWidget::DoLayout() {
 
     // Layout absolute-positioned children
     for (auto* child : absChildren) {
+        if (child->layoutPinned &&
+            child->rect.right - child->rect.left > 0) {
+            child->DoLayout();   /* build 161: 钉住 — rect 不改写 */
+            continue;
+        }
         auto hint = child->SizeHint();
         float w = child->fixedW > 0 ? child->fixedW : (hint.width > 0 ? hint.width : totalW);
         float h = child->fixedH > 0 ? child->fixedH : (hint.height > 0 ? hint.height : ch);
@@ -990,6 +1045,11 @@ void HBoxWidget::DoLayoutWrap() {
 
     // Absolute children (same as no-wrap path).
     for (auto* child : absChildren) {
+        if (child->layoutPinned &&
+            child->rect.right - child->rect.left > 0) {
+            child->DoLayout();   /* build 161: 钉住 — rect 不改写 */
+            continue;
+        }
         auto hint = child->SizeHint();
         float w = child->fixedW > 0 ? child->fixedW : (hint.width > 0 ? hint.width : totalW);
         float h = child->fixedH > 0 ? child->fixedH : (hint.height > 0 ? hint.height : ch);

@@ -23,7 +23,6 @@
 
 namespace ui {
 
-class DialogWidget;  // forward declaration
 
 class UI_API UiWindowImpl {
 public:
@@ -37,6 +36,10 @@ public:
                 HWND ownerHwnd = nullptr);  /* Build 65+ (L14) */
     void Show();
     void ShowImmediate();  /* 跳过开场动画 */
+    /* PrepareRT 已完成 frame 确立 (premax 的 SW_SHOWMAXIMIZED 或普通分支的
+     * SWP_FRAMECHANGED) — ShowImmediate 跳过重复的 SetWindowPos(FRAMECHANGED)
+     * (~10ms DWM 事务)。未走 prepare 的独立调用方仍执行, 行为不变。 */
+    bool framePrepared_ = false;
     void SetIconFromPixels(const uint8_t* rgba, int w, int h);
     void PrepareRT();      /* 预创建渲染目标 */
     void Hide();
@@ -79,12 +82,14 @@ public:
     // icon: 0=none, 1=success(green✓), 2=error(red✕), 3=warning(yellow⚠)
     // anim: 0=slide(默认, 旧行为), 1=fade(纯渐入渐出, y 不变)
     void ShowToast(const std::wstring& text, int durationMs = 2000, int position = 0, int icon = 0, int anim = 0);
-    void DrawToast(Renderer& r);
+    /* Build 165+ (L172 follow-up): toast 改成独立 DirectComposition 透明叠加窗
+     * (照 ContextMenu 弹窗). 淡入淡出只重渲这个小窗, 不碰主窗 D2D RT → 大图下
+     * 丝滑. PaintToast 把绘制逻辑画到 toast 窗 (0,0) 原点; ToastWndProc 在 toast
+     * 窗自己的 WM_TIMER 上推进 phase. 旧的主窗 DrawToast / 主窗 WM_TIMER 路径已删. */
 
     static bool RegisterWindowClass();
 
     // Dialog (public for C API access)
-    DialogWidget* activeDialog_ = nullptr;
     void LayoutRoot();
     WidgetPtr Root() const { return root_; }
     bool skipOpenAnimation_ = false;
@@ -122,10 +127,6 @@ private:
     void UpdateCaretBlinkTimer();
     void StartWindowOpenAnimation();
     void StartWindowCloseAnimation();
-
-    // Window drag cache
-    void CreateDragCache();
-    void ReleaseDragCache();
 
     HWND        hwnd_ = nullptr;
     HICON       hIcon_ = nullptr;
@@ -171,6 +172,20 @@ private:
      * 进度卡顿. ShowToast 时记一次 GetTickCount64, tick handler 用 now-shown 算
      * phase + slide. */
     uint64_t toastShownTick_ = 0;
+    /* Build 165+ (L172 follow-up): toast 独立叠加窗. */
+    HWND     toastHwnd_ = nullptr;        // 透明 DComp 叠加窗 (owner = hwnd_)
+    Renderer toastRenderer_;              // 该窗专属 composition-mode RT
+    bool     toastTimePeriodSet_ = false; // timeBeginPeriod(1) 已生效? (配对 timeEndPeriod)
+    /* 这次 toast 的几何 (DIP) + 屏幕落位 (物理像素), ShowToast 算一次缓存,
+     * PaintToast / ToastWndProc 复用 (避免 settle 期反复重算). */
+    float    toastBoxW_ = 0.0f, toastBoxH_ = 0.0f;   // 框尺寸 (DIP)
+    int      toastScreenX_ = 0;                       // 窗口左上 X (物理像素, 全程不变)
+    int      toastScreenTargetY_ = 0;                 // 目标 Y (物理像素, FADE 钉死, SLIDE 终点)
+    int      toastSlideRangePx_ = 0;                  // SLIDE: hideOffset 像素幅度 (带符号)
+    void     PaintToast();                            // 画到 toast 窗 (0,0) 原点
+    void     DestroyToast();                          // 销毁叠加窗 + KillTimer + timeEndPeriod 配对
+    static bool s_toastClassRegistered_;
+    static LRESULT CALLBACK ToastWndProc(HWND, UINT, WPARAM, LPARAM);
 
     bool        startupRevealPending_ = false;
     bool        startupRevealPosted_ = false;
@@ -191,12 +206,6 @@ private:
     bool        windowClosing_ = false;
     bool        isMoving_ = false;   // 窗口正在移动/调整大小
     bool        isResizing_ = false; // 本次 sizemove 是 resize（非纯移动）
-
-    // Window drag cache (避免拖动时掉帧)
-    Microsoft::WRL::ComPtr<ID2D1Bitmap> dragCacheBitmap_;
-    float       dragCacheDpi_ = 96.0f;
-    float       dragCacheWidth_ = 0.0f;
-    float       dragCacheHeight_ = 0.0f;
 
     float       windowAnimProgress_ = 0.0f;
     LARGE_INTEGER windowAnimStartTick_ = {};   // 动画起始时间（高精度）

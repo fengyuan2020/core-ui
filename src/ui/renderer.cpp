@@ -1,4 +1,8 @@
 #include "renderer.h"
+
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include "theme.h"
 #include <dcomp.h>
 #pragma comment(lib, "dcomp.lib")
@@ -6,6 +10,7 @@
 #include <map>
 #include <string>
 #include <memory>
+#include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -104,10 +109,11 @@ bool Renderer::Init(ID2D1Factory1* factory, IDWriteFactory* dwFactory, IWICImagi
     return true;
 }
 
-bool Renderer::EnsureSharedDevice() {
-    if (s_d3dDevice && s_d2dDevice) return true;
+namespace {
 
-    /* 全局只创建一次 D3D11 设备（最慢的步骤） */
+/* 共享 D3D11 设备创建 (HW → WARP 回退)。free-threaded API, 可在任意线程跑。 */
+Microsoft::WRL::ComPtr<ID3D11Device> CreateSharedD3DDevice() {
+    Microsoft::WRL::ComPtr<ID3D11Device> dev;
     UINT creationFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS;
     D3D_FEATURE_LEVEL featureLevels[] = {
         D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
@@ -115,18 +121,64 @@ bool Renderer::EnsureSharedDevice() {
     };
     HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
                                     creationFlags, featureLevels, _countof(featureLevels),
-                                    D3D11_SDK_VERSION, s_d3dDevice.GetAddressOf(),
+                                    D3D11_SDK_VERSION, dev.GetAddressOf(),
                                     nullptr, nullptr);
     if (FAILED(hr)) {
         hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr,
                                 creationFlags, featureLevels, _countof(featureLevels),
-                                D3D11_SDK_VERSION, s_d3dDevice.GetAddressOf(),
+                                D3D11_SDK_VERSION, dev.GetAddressOf(),
                                 nullptr, nullptr);
-        if (FAILED(hr)) return false;
+        if (FAILED(hr)) dev.Reset();
+    }
+    return dev;
+}
+
+/* 预热状态 (跨线程移交用)。g_prewarmStarted 后 EnsureSharedDevice 必须等
+ * 结果 (cv), 不能与预热线程并发重复创建。 */
+std::mutex                            g_prewarmMu;
+std::condition_variable               g_prewarmCv;
+Microsoft::WRL::ComPtr<ID3D11Device>  g_prewarmDevice;
+bool                                  g_prewarmStarted = false;
+bool                                  g_prewarmDone    = false;
+
+}  // namespace
+
+void Renderer::PrewarmSharedDeviceAsync() {
+    {
+        std::lock_guard<std::mutex> lk(g_prewarmMu);
+        if (g_prewarmStarted || s_d3dDevice) return;
+        g_prewarmStarted = true;
+    }
+    std::thread([] {
+        auto dev = CreateSharedD3DDevice();
+        {
+            std::lock_guard<std::mutex> lk(g_prewarmMu);
+            g_prewarmDevice = std::move(dev);
+            g_prewarmDone   = true;
+        }
+        g_prewarmCv.notify_all();
+    }).detach();
+}
+
+bool Renderer::EnsureSharedDevice() {
+    if (s_d3dDevice && s_d2dDevice) return true;
+
+    if (!s_d3dDevice) {
+        /* 收割预热结果; 未预热则原地创建 (老路径)。预热失败 (极端: 无 HW
+         * 无 WARP) 时这里再试一次原地建, 行为与旧版一致。 */
+        {
+            std::unique_lock<std::mutex> lk(g_prewarmMu);
+            if (g_prewarmStarted) {
+                g_prewarmCv.wait(lk, [] { return g_prewarmDone; });
+                s_d3dDevice = std::move(g_prewarmDevice);
+            }
+        }
+        if (!s_d3dDevice) s_d3dDevice = CreateSharedD3DDevice();
+        if (!s_d3dDevice) return false;
     }
 
     ComPtr<IDXGIDevice> dxgiDevice;
-    hr = s_d3dDevice.As(&dxgiDevice);
+    HRESULT hr = s_d3dDevice.As(&dxgiDevice);
     if (FAILED(hr)) return false;
 
     hr = factory_->CreateDevice(dxgiDevice.Get(), s_d2dDevice.GetAddressOf());
@@ -351,12 +403,15 @@ void Renderer::BeginDraw() {
 
 HRESULT Renderer::EndDraw() {
     HRESULT hr = ctx_->EndDraw();
-    if (swapChain_) {
+    /* L177: skipPresent → 只 flush D2D 绘制 (上面 ctx_->EndDraw 已做), 不 flip 到
+     * DWM。给"绘制隐藏窗但不上屏"用 (避免 DWM 未合成窗的 Present 在 AMD 死锁)。 */
+    if (swapChain_ && !skipPresent) {
         DXGI_PRESENT_PARAMETERS params = {};
         UINT syncInterval = skipVSync ? 0 : 1;
         swapChain_->Present1(syncInterval, 0, &params);
-        skipVSync = false;
     }
+    skipVSync = false;
+    skipPresent = false;
     return hr;
 }
 
@@ -2193,7 +2248,454 @@ std::vector<SvgTextRun> Renderer::ParseSvgTextRuns(const std::string& svgContent
     return svg_detail::ExtractTextRuns(svgContent);
 }
 
+// ===== L121: SVG <text> → <path> 字形轮廓内联 (修复文字 z 序) =====
+namespace {
+
+/* GetGlyphRunOutline 把字形轮廓写进这个 sink, 序列化成 SVG path-data 串.
+ * 字形轮廓坐标系与 D2D 一致 (y 向下, baseline 为 0); 每段加上 (ox_,oy_) =
+ * 该 glyph run 的 baseline 原点, 得到 layout 局部空间坐标. 栈对象, 不真正
+ * 管理 COM 生命周期. */
+class SvgGlyphPathSink final : public ID2D1SimplifiedGeometrySink {
+public:
+    std::string& data() { return d_; }
+    void setOffset(float x, float y) { ox_ = x; oy_ = y; }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** ppv) override {
+        if (iid == __uuidof(IUnknown) || iid == __uuidof(ID2D1SimplifiedGeometrySink)) {
+            *ppv = static_cast<ID2D1SimplifiedGeometrySink*>(this);
+            return S_OK;
+        }
+        *ppv = nullptr; return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef()  override { return 2; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+
+    void STDMETHODCALLTYPE SetFillMode(D2D1_FILL_MODE) override {}
+    void STDMETHODCALLTYPE SetSegmentFlags(D2D1_PATH_SEGMENT) override {}
+    void STDMETHODCALLTYPE BeginFigure(D2D1_POINT_2F p, D2D1_FIGURE_BEGIN) override {
+        d_ += 'M'; num(p.x + ox_); d_ += ' '; num(p.y + oy_);
+    }
+    void STDMETHODCALLTYPE AddLines(const D2D1_POINT_2F* pts, UINT32 n) override {
+        for (UINT32 i = 0; i < n; ++i) {
+            d_ += 'L'; num(pts[i].x + ox_); d_ += ' '; num(pts[i].y + oy_);
+        }
+    }
+    void STDMETHODCALLTYPE AddBeziers(const D2D1_BEZIER_SEGMENT* s, UINT32 n) override {
+        for (UINT32 i = 0; i < n; ++i) {
+            d_ += 'C';
+            num(s[i].point1.x + ox_); d_ += ' '; num(s[i].point1.y + oy_); d_ += ' ';
+            num(s[i].point2.x + ox_); d_ += ' '; num(s[i].point2.y + oy_); d_ += ' ';
+            num(s[i].point3.x + ox_); d_ += ' '; num(s[i].point3.y + oy_);
+        }
+    }
+    void STDMETHODCALLTYPE EndFigure(D2D1_FIGURE_END) override { d_ += 'Z'; }
+    HRESULT STDMETHODCALLTYPE Close() override { return S_OK; }
+
+private:
+    void num(float v) {
+        char buf[40];
+        int n = snprintf(buf, sizeof(buf), "%.2f", (double)v);
+        if (n <= 0) return;
+        int e = n;                       // 去末尾 0 / 小数点, 压缩体积
+        bool dot = false;
+        for (int i = 0; i < n; ++i) if (buf[i] == '.') { dot = true; break; }
+        if (dot) {
+            while (e > 0 && buf[e-1] == '0') --e;
+            if (e > 0 && buf[e-1] == '.') --e;
+        }
+        d_.append(buf, (size_t)e);
+    }
+    std::string d_;
+    float ox_ = 0.0f, oy_ = 0.0f;
+};
+
+/* 自定义 text renderer: 把 layout 的每个 glyph run 通过 GetGlyphRunOutline
+ * 灌进 SvgGlyphPathSink (复用 IDWriteTextLayout 的 shaping + 字体回退, 数学
+ * 符号 / 中英混排都靠 DWrite 自动处理). */
+class SvgGlyphOutlineRenderer final : public IDWriteTextRenderer {
+public:
+    explicit SvgGlyphOutlineRenderer(SvgGlyphPathSink* sink) : sink_(sink) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** ppv) override {
+        if (iid == __uuidof(IUnknown) || iid == __uuidof(IDWritePixelSnapping) ||
+            iid == __uuidof(IDWriteTextRenderer)) {
+            *ppv = static_cast<IDWriteTextRenderer*>(this);
+            return S_OK;
+        }
+        *ppv = nullptr; return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef()  override { return 2; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+
+    HRESULT STDMETHODCALLTYPE IsPixelSnappingDisabled(void*, BOOL* o) override {
+        *o = TRUE; return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetCurrentTransform(void*, DWRITE_MATRIX* m) override {
+        *m = DWRITE_MATRIX{1, 0, 0, 1, 0, 0}; return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetPixelsPerDip(void*, FLOAT* p) override {
+        *p = 1.0f; return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DrawGlyphRun(
+            void*, FLOAT bx, FLOAT by, DWRITE_MEASURING_MODE,
+            const DWRITE_GLYPH_RUN* run, const DWRITE_GLYPH_RUN_DESCRIPTION*,
+            IUnknown*) override {
+        if (!run || !run->fontFace || run->glyphCount == 0) return S_OK;
+        sink_->setOffset(bx, by);
+        run->fontFace->GetGlyphRunOutline(
+            run->fontEmSize, run->glyphIndices, run->glyphAdvances,
+            run->glyphOffsets, run->glyphCount, run->isSideways,
+            (run->bidiLevel & 1), sink_);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DrawUnderline(void*, FLOAT, FLOAT,
+            const DWRITE_UNDERLINE*, IUnknown*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE DrawStrikethrough(void*, FLOAT, FLOAT,
+            const DWRITE_STRIKETHROUGH*, IUnknown*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE DrawInlineObject(void*, FLOAT, FLOAT,
+            IDWriteInlineObject*, BOOL, BOOL, IUnknown*) override { return S_OK; }
+
+private:
+    SvgGlyphPathSink* sink_;
+};
+
+// 把已布局好的 layout 渲染成 SVG path-data; 原点 (ox,oy) 同 DrawSvgTextRuns.
+static std::string RenderLayoutToSvgPath(IDWriteTextLayout* layout, float ox, float oy) {
+    if (!layout) return {};
+    SvgGlyphPathSink sink;
+    SvgGlyphOutlineRenderer renderer(&sink);
+    if (FAILED(layout->Draw(nullptr, &renderer, ox, oy))) return {};
+    return std::move(sink.data());
+}
+
+// 把属性值里的 " 和 & 转义, 安全写进生成的 <path ...> 属性 (fill/transform 串).
+static std::string XmlAttrEscape(const std::string& s) {
+    std::string o; o.reserve(s.size());
+    for (char c : s) {
+        if (c == '"') o += "&quot;";
+        else if (c == '&') o += "&amp;";
+        else if (c == '<') o += "&lt;";
+        else o += c;
+    }
+    return o;
+}
+
+} // namespace
+
+std::string Renderer::SvgInlineTextAsPaths(const std::string& svg) {
+    if (svg.empty() || !dwFactory_) return svg;
+    using svg_detail::extractAttrFromTag;
+    using svg_detail::CssProp;
+    using svg_detail::ResolveFontFamily;
+    using svg_detail::ParseFontWeight;
+    using svg_detail::ExtractInnerText;
+    using svg_detail::AppendDecoded;
+    using svg_detail::Utf8ToWide;
+
+    /* 沿 <g> 链继承的"文字呈现属性"(只继承 font/fill, 不碰 transform/opacity ——
+     * 那两样留给 DOM 作用在生成的 <path> 祖先上, 避免双重应用). */
+    struct GFont {
+        float fontSize = 0.0f;                                   // 0 = 未设
+        std::wstring family; bool familySet = false;
+        DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL; bool weightSet = false;
+        DWRITE_FONT_STYLE  fstyle = DWRITE_FONT_STYLE_NORMAL;  bool styleSet  = false;  // L122: italic
+        std::string fill; bool fillSet = false;                  // url()/#hex/named, "" = 未设
+    };
+    auto applyFont = [&](GFont& st, const std::string& tag, const std::string& style) {
+        std::string s;
+        if ((s = extractAttrFromTag(tag, "fill")).empty()) s = CssProp(style, "fill");
+        if (s.empty()) s = CssProp(style, "color");
+        if (!s.empty()) { st.fill = s; st.fillSet = true; }
+        if ((s = extractAttrFromTag(tag, "font-size")).empty()) s = CssProp(style, "font-size");
+        if (!s.empty()) { float v = (float)atof(s.c_str()); if (v > 0) st.fontSize = v; }
+        if ((s = extractAttrFromTag(tag, "font-family")).empty()) s = CssProp(style, "font-family");
+        if (!s.empty()) { st.family = ResolveFontFamily(s); st.familySet = true; }
+        if ((s = extractAttrFromTag(tag, "font-weight")).empty()) s = CssProp(style, "font-weight");
+        if (!s.empty()) { st.weight = ParseFontWeight(s); st.weightSet = true; }
+        if ((s = extractAttrFromTag(tag, "font-style")).empty()) s = CssProp(style, "font-style");
+        if (!s.empty()) {
+            st.fstyle = (s.find("italic")  != std::string::npos) ? DWRITE_FONT_STYLE_ITALIC
+                      : (s.find("oblique") != std::string::npos) ? DWRITE_FONT_STYLE_OBLIQUE
+                      :                                            DWRITE_FONT_STYLE_NORMAL;
+            st.styleSet = true;
+        }
+    };
+
+    /* 把一段文本渲染成 SVG path-data。svgX/svgY = SVG 用户坐标 (svgY 为 baseline),
+     * anchor: 0=start 1=middle 2=end; block=围绕(svgX,svgY)居中(foreignObject)。
+     * *outAdv 回填布局自然宽 (供 tspan 无显式 x 时接续)。每次新建 format (转换在
+     * load 时一次性跑, 不必缓存), 带 font-style + 字体回退。 */
+    auto renderRun = [&](const std::wstring& txt, float fontSize, const wchar_t* family,
+                         DWRITE_FONT_WEIGHT weight, DWRITE_FONT_STYLE fstyle,
+                         float svgX, float svgY, int anchor, bool block, float maxW,
+                         float* outAdv) -> std::string {
+        if (outAdv) *outAdv = 0.0f;
+        if (txt.empty()) return {};
+        const wchar_t* fam = family ? family : DefaultFontFamily();
+        if (!fam) fam = L"Segoe UI";
+        ComPtr<IDWriteTextFormat> fmt;
+        if (FAILED(dwFactory_->CreateTextFormat(fam, nullptr, weight, fstyle,
+                DWRITE_FONT_STRETCH_NORMAL, fontSize, ResolveLocaleName(),
+                fmt.GetAddressOf())) || !fmt)
+            return {};
+        if (fontFallback_) {
+            ComPtr<IDWriteTextFormat3> f3;
+            if (SUCCEEDED(fmt.As(&f3)) && f3) f3->SetFontFallback(fontFallback_.Get());
+        }
+        float layoutMaxW = maxW > 1.0f ? maxW : 100000.0f;
+        ComPtr<IDWriteTextLayout> layout;
+        if (FAILED(dwFactory_->CreateTextLayout(txt.c_str(), (UINT32)txt.size(),
+                fmt.Get(), layoutMaxW, 100000.0f, &layout)) || !layout)
+            return {};
+        layout->SetWordWrapping(maxW > 1.0f ? DWRITE_WORD_WRAPPING_WRAP
+                                            : DWRITE_WORD_WRAPPING_NO_WRAP);
+        DWRITE_TEXT_METRICS tm{};
+        layout->GetMetrics(&tm);
+        if (block || anchor != 0) {
+            layout->SetMaxWidth(tm.width + 1.0f);
+            layout->SetTextAlignment(anchor == 2 ? DWRITE_TEXT_ALIGNMENT_TRAILING
+                                                 : DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
+        float ox = svgX, oy = svgY;
+        if (block) {
+            ox = svgX - tm.width  / 2.0f;
+            oy = svgY - tm.height / 2.0f;
+        } else {
+            if (anchor == 1)      ox = svgX - tm.width / 2.0f;
+            else if (anchor == 2) ox = svgX - tm.width;
+            DWRITE_LINE_METRICS lm{}; UINT32 lc = 0;
+            if (SUCCEEDED(layout->GetLineMetrics(&lm, 1, &lc)) && lc >= 1)
+                oy = svgY - lm.baseline;
+        }
+        if (outAdv) *outAdv = tm.width;
+        return RenderLayoutToSvgPath(layout.Get(), ox, oy);
+    };
+
+    auto buildPath = [&](const std::string& d, const std::string& fillStr,
+                         const std::string& opacityStr, const std::string& fillOpacityStr,
+                         const std::string& xfStr) -> std::string {
+        std::string p = "<path d=\""; p += d;
+        p += "\" fill=\"" + XmlAttrEscape(fillStr) + "\" fill-rule=\"nonzero\"";
+        if (!opacityStr.empty())     p += " opacity=\"" + XmlAttrEscape(opacityStr) + "\"";
+        if (!fillOpacityStr.empty()) p += " fill-opacity=\"" + XmlAttrEscape(fillOpacityStr) + "\"";
+        if (!xfStr.empty())          p += " transform=\"" + XmlAttrEscape(xfStr) + "\"";
+        p += "/>";
+        return p;
+    };
+
+    std::vector<GFont> stack;
+    GFont cur;
+    struct Repl { size_t start, end; std::string text; };
+    std::vector<Repl> repls;
+
+    size_t pos = 0;
+    while (pos < svg.size()) {
+        size_t lt = svg.find('<', pos);
+        if (lt == std::string::npos) break;
+
+        if (svg.compare(lt, 4, "</g>") == 0) {
+            if (!stack.empty()) { cur = stack.back(); stack.pop_back(); }
+            pos = lt + 4; continue;
+        }
+        if (svg.compare(lt, 3, "<g ") == 0 || svg.compare(lt, 3, "<g>") == 0 ||
+            svg.compare(lt, 3, "<g\t") == 0 || svg.compare(lt, 3, "<g\n") == 0) {
+            size_t te = svg.find('>', lt);
+            if (te == std::string::npos) break;
+            std::string tag = svg.substr(lt, te - lt + 1);
+            stack.push_back(cur);
+            applyFont(cur, tag, extractAttrFromTag(tag, "style"));
+            if (te > 0 && svg[te-1] == '/') {            // 自闭合 <g/> 立即出栈
+                if (!stack.empty()) { cur = stack.back(); stack.pop_back(); }
+            }
+            pos = te + 1; continue;
+        }
+
+        bool isText = svg.compare(lt, 5, "<text") == 0 &&
+                      (svg[lt+5]==' '||svg[lt+5]=='>'||svg[lt+5]=='\t'||svg[lt+5]=='\n');
+        bool isFO   = svg.compare(lt, 14, "<foreignObject") == 0;
+        if (!isText && !isFO) { pos = lt + 1; continue; }
+
+        size_t te = svg.find('>', lt);
+        if (te == std::string::npos) break;
+        std::string tag = svg.substr(lt, te - lt + 1);
+        bool selfClose = (te > 0 && svg[te-1] == '/');
+        const char* closeTag = isText ? "</text>" : "</foreignObject>";
+        size_t closeLen = isText ? 7 : 16;
+        size_t close = selfClose ? te : svg.find(closeTag, te);
+        size_t contentEnd = (close == std::string::npos) ? svg.size() : close;
+        size_t elemEnd    = (close == std::string::npos) ? svg.size() : close + closeLen;
+        pos = elemEnd;
+
+        // ---- text 级属性 (tspan 缺省时继承) ----
+        GFont ts = cur;
+        std::string style = extractAttrFromTag(tag, "style");
+        applyFont(ts, tag, style);
+        float tFontSize = ts.fontSize > 0 ? ts.fontSize : 16.0f;
+        const wchar_t* tFam = (ts.familySet && !ts.family.empty()) ? ts.family.c_str() : nullptr;
+        DWRITE_FONT_WEIGHT tWeight = ts.weightSet ? ts.weight : DWRITE_FONT_WEIGHT_NORMAL;
+        DWRITE_FONT_STYLE  tStyle  = ts.styleSet  ? ts.fstyle : DWRITE_FONT_STYLE_NORMAL;
+        std::string tFill = (ts.fillSet && !ts.fill.empty()) ? ts.fill : std::string("#000000");
+
+        float tx = (float)atof(extractAttrFromTag(tag, "x").c_str());
+        float ty = (float)atof(extractAttrFromTag(tag, "y").c_str());
+        std::string xfStr          = extractAttrFromTag(tag, "transform");
+        std::string opacityStr     = extractAttrFromTag(tag, "opacity");
+        std::string fillOpacityStr = extractAttrFromTag(tag, "fill-opacity");
+
+        int  anchor = 0;
+        bool block  = false;
+        float maxW  = 0.0f;
+        if (isFO) {
+            block = true; anchor = 1;
+            float w = (float)atof(extractAttrFromTag(tag, "width").c_str());
+            float h = (float)atof(extractAttrFromTag(tag, "height").c_str());
+            tx += w / 2.0f; ty += h / 2.0f;
+            if (w > 1.0f) maxW = w;
+        } else {
+            std::string a = extractAttrFromTag(tag, "text-anchor");
+            if (a.empty()) a = CssProp(style, "text-anchor");
+            if (a == "middle") anchor = 1; else if (a == "end") anchor = 2;
+        }
+
+        // ---- 是否含 <tspan> 子元素 ----
+        size_t firstTspan = selfClose ? std::string::npos : svg.find("<tspan", te);
+        bool hasTspan = (firstTspan != std::string::npos && firstTspan < contentEnd);
+
+        if (!hasTspan) {
+            // 纯文本: 整段一次渲染
+            std::wstring text = selfClose ? std::wstring()
+                                          : ExtractInnerText(svg, te + 1, contentEnd);
+            if (text.empty()) continue;
+            std::string d = renderRun(text, tFontSize, tFam, tWeight, tStyle,
+                                      tx, ty, anchor, block, maxW, nullptr);
+            if (d.empty()) continue;
+            repls.push_back({lt, elemEnd, buildPath(d, tFill, opacityStr, fillOpacityStr, xfStr)});
+            continue;
+        }
+
+        /* L122: 含 <tspan> —— 每个 tspan 当"带定位的子 run"。逐 tspan 用自带
+         * x/y(绝对) + dx/dy(相对) 定位, 字体/style/fill 自带优先否则继承 text 级;
+         * 只取 tspan 自身文本(不含 tspan 间的换行/缩进空白 → 修掉"每字一行"竖排
+         * bug)。按 fill 分组累积成 <path>(保留首见顺序), 原地内联保 z 序。
+         * text-anchor 在多 tspan 场景按 start 处理(matplotlib 用法)。 */
+        std::vector<std::pair<std::string,std::string>> byFill;   // fill -> 累积 d
+        auto addD = [&](const std::string& fill, const std::string& d) {
+            for (auto& kv : byFill) if (kv.first == fill) { kv.second += d; return; }
+            byFill.push_back({fill, d});
+        };
+        float penX = tx, penY = ty;
+        size_t tp = te + 1;
+        while (tp < contentEnd) {
+            size_t lt2 = svg.find("<tspan", tp);
+            if (lt2 == std::string::npos || lt2 >= contentEnd) break;
+            size_t tgEnd = svg.find('>', lt2);
+            if (tgEnd == std::string::npos || tgEnd >= contentEnd) break;
+            std::string ttag = svg.substr(lt2, tgEnd - lt2 + 1);
+            bool tSelf = (tgEnd > 0 && svg[tgEnd-1] == '/');
+            size_t tClose = tSelf ? tgEnd : svg.find("</tspan>", tgEnd);
+            size_t tCEnd  = (tClose == std::string::npos) ? contentEnd : tClose;
+
+            GFont es = ts;                              // 继承 text 级 + tspan 覆盖
+            std::string tstyle = extractAttrFromTag(ttag, "style");
+            applyFont(es, ttag, tstyle);
+            float fs = es.fontSize > 0 ? es.fontSize : tFontSize;
+            const wchar_t* fam = (es.familySet && !es.family.empty()) ? es.family.c_str() : tFam;
+            DWRITE_FONT_WEIGHT wt = es.weightSet ? es.weight : tWeight;
+            DWRITE_FONT_STYLE  st2 = es.styleSet  ? es.fstyle : tStyle;
+            std::string fill = (es.fillSet && !es.fill.empty()) ? es.fill : tFill;
+
+            std::string sx = extractAttrFromTag(ttag, "x"),  sy = extractAttrFromTag(ttag, "y");
+            std::string sdx = extractAttrFromTag(ttag, "dx"), sdy = extractAttrFromTag(ttag, "dy");
+            if (!sx.empty())  penX = (float)atof(sx.c_str());
+            if (!sy.empty())  penY = (float)atof(sy.c_str());
+            if (!sdx.empty()) penX += (float)atof(sdx.c_str());
+            if (!sdy.empty()) penY += (float)atof(sdy.c_str());
+
+            std::wstring txt;
+            if (!tSelf) {
+                std::string raw; AppendDecoded(raw, svg.substr(tgEnd + 1, tCEnd - (tgEnd + 1)));
+                std::string norm; bool sp = false, started = false;   // 折叠空白 + trim
+                for (char c : raw) {
+                    if (c==' '||c=='\t'||c=='\n'||c=='\r') { if (started) sp = true; }
+                    else { if (sp) { norm += ' '; sp = false; } norm += c; started = true; }
+                }
+                txt = Utf8ToWide(norm);
+            }
+            float adv = 0.0f;
+            if (!txt.empty()) {
+                std::string d = renderRun(txt, fs, fam, wt, st2, penX, penY, 0, false, 0, &adv);
+                if (!d.empty()) addD(fill, d);
+            }
+            penX += adv;                                // 无下个显式 x 时接续
+            tp = tSelf ? tgEnd + 1 : (tClose == std::string::npos ? contentEnd : tClose + 8);
+        }
+        if (byFill.empty()) continue;
+        std::string allPaths;
+        for (auto& kv : byFill)
+            allPaths += buildPath(kv.second, kv.first, opacityStr, fillOpacityStr, xfStr);
+        repls.push_back({lt, elemEnd, std::move(allPaths)});
+    }
+
+    if (repls.empty()) return svg;
+    std::string out = svg;
+    for (auto it = repls.rbegin(); it != repls.rend(); ++it)   // 从后往前替换, 保持偏移有效
+        out.replace(it->start, it->end - it->start, it->text);
+    return out;
+}
+
 // L75: DirectWrite 渲染 SVG 文字 run. baseXf = SVG user-space → 屏幕 (跟形状同一个).
+// L87: 按文字 bbox 建 SVG 渐变 brush. bx/by/bw/bh = 局部绘制空间的文字框,
+// opacity 乘进每个 stop alpha. nullptr = 无 stop / 建失败 (调用方回退纯色).
+static ComPtr<ID2D1Brush> MakeSvgTextGradientBrush(
+        ID2D1RenderTarget* rt, const SvgTextGradient& g,
+        float bx, float by, float bw, float bh, float opacity) {
+    if (!rt || g.stops.empty()) return nullptr;
+
+    std::vector<D2D1_GRADIENT_STOP> ds;
+    ds.reserve(g.stops.size());
+    for (const auto& s : g.stops) {
+        D2D1_GRADIENT_STOP gs;
+        gs.position = s.offset;
+        gs.color = s.color;
+        gs.color.a *= opacity;
+        ds.push_back(gs);
+    }
+    ComPtr<ID2D1GradientStopCollection> coll;
+    rt->CreateGradientStopCollection(ds.data(), (UINT32)ds.size(),
+                                     D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP,
+                                     coll.GetAddressOf());
+    if (!coll) return nullptr;
+
+    /* 渐变坐标 → 文字局部空间:
+     *   objectBoundingBox(默认): 先过 gradientTransform, 再 scale(bw,bh)·translate(bx,by)
+     *   userSpaceOnUse: 坐标已是用户空间(=文字局部), 仅过 gradientTransform */
+    D2D1_MATRIX_3X2_F M = g.transform;
+    if (!g.userSpace) {
+        M = g.transform * D2D1::Matrix3x2F::Scale(bw, bh)
+                        * D2D1::Matrix3x2F::Translation(bx, by);
+    }
+    auto P = [&](float x, float y) -> D2D1_POINT_2F {
+        return { x * M._11 + y * M._21 + M._31,
+                 x * M._12 + y * M._22 + M._32 };
+    };
+
+    if (!g.radial) {
+        D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES props = { P(g.x1, g.y1), P(g.x2, g.y2) };
+        ComPtr<ID2D1LinearGradientBrush> b;
+        rt->CreateLinearGradientBrush(props, coll.Get(), b.GetAddressOf());
+        return b;
+    }
+    D2D1_POINT_2F c  = P(g.cx, g.cy);
+    D2D1_POINT_2F ex = P(g.cx + g.r, g.cy);
+    D2D1_POINT_2F ey = P(g.cx, g.cy + g.r);
+    float rx = std::sqrt((ex.x-c.x)*(ex.x-c.x) + (ex.y-c.y)*(ex.y-c.y));
+    float ry = std::sqrt((ey.x-c.x)*(ey.x-c.x) + (ey.y-c.y)*(ey.y-c.y));
+    D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES props = { c, {0,0}, rx, ry };
+    ComPtr<ID2D1RadialGradientBrush> b;
+    rt->CreateRadialGradientBrush(props, coll.Get(), b.GetAddressOf());
+    return b;
+}
+
 void Renderer::DrawSvgTextRuns(const std::vector<SvgTextRun>& runs,
                                 const D2D1_MATRIX_3X2_F& baseXf) {
     if (runs.empty() || !ctx_ || !dwFactory_) return;
@@ -2205,7 +2707,7 @@ void Renderer::DrawSvgTextRuns(const std::vector<SvgTextRun>& runs,
         if (run.text.empty()) continue;
         const wchar_t* fam = run.fontFamily.empty() ? theme::kFontFamily
                                                      : run.fontFamily.c_str();
-        auto fmt = GetTextFormat(run.fontSize, fam);
+        auto fmt = GetTextFormat(run.fontSize, fam, run.fontWeight);
         if (!fmt) continue;
 
         float maxW = run.maxWidth > 1.0f ? run.maxWidth : 100000.0f;
@@ -2243,7 +2745,16 @@ void Renderer::DrawSvgTextRuns(const std::vector<SvgTextRun>& runs,
         }
 
         ctx_->SetTransform(run.transform * baseXf);
-        auto brush = GetBrush(run.color);
+        ComPtr<ID2D1Brush> brush;
+        if (run.hasGradient) {
+            brush = MakeSvgTextGradientBrush(ctx_.Get(), run.gradient,
+                                             ox, oy, tm.width, tm.height, run.opacity);
+        }
+        if (!brush) {
+            D2D1_COLOR_F c = run.color;
+            c.a *= run.opacity;           // L87: 继承 opacity 乘进纯色 alpha
+            brush = GetBrush(c);
+        }
         if (brush) ctx_->DrawTextLayout(D2D1::Point2F(ox, oy), layout.Get(), brush.Get());
     }
 

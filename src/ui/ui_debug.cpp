@@ -79,7 +79,6 @@ static const char* widgetTypeName(Widget* w) {
     if (dynamic_cast<TabControlWidget*>(w))  return "TabControl";
     if (dynamic_cast<ScrollViewWidget*>(w))  return "ScrollView";
     if (dynamic_cast<ImageViewWidget*>(w))   return "ImageView";
-    if (dynamic_cast<DialogWidget*>(w))      return "Dialog";
     if (dynamic_cast<OverlayWidget*>(w))     return "Overlay";
     if (dynamic_cast<MenuBarWidget*>(w))     return "MenuBar";
     if (dynamic_cast<SplitterWidget*>(w))    return "Splitter";
@@ -98,6 +97,40 @@ static const char* widgetTypeName(Widget* w) {
     if (dynamic_cast<VBoxWidget*>(w))        return "VBox";
     if (dynamic_cast<HBoxWidget*>(w))        return "HBox";
     return "Widget";
+}
+
+// ---- 通用基础属性 (供 C API ui_widget_get_text / ui_widget_get_basic 复用) ----
+// 任意"文本控件"的文本值 — 复用各 controls 现有 getter (跟 DebugDumpTree 的 text
+// dump 同一组)。无文本语义的控件返回空串 + (has ? *has=false : 忽略)。
+std::wstring WidgetTextValue(Widget* w, bool* has) {
+    if (has) *has = true;
+    if (auto* p = dynamic_cast<LabelWidget*>(w))       return p->Text();
+    if (auto* p = dynamic_cast<ButtonWidget*>(w))      return p->Text();
+    if (auto* p = dynamic_cast<CheckBoxWidget*>(w))    return p->Text();
+    if (auto* p = dynamic_cast<RadioButtonWidget*>(w)) return p->Text();
+    if (auto* p = dynamic_cast<ToggleWidget*>(w))      return p->Text();
+    if (auto* p = dynamic_cast<ComboBoxWidget*>(w))    return p->SelectedText();
+    if (auto* p = dynamic_cast<TextInputWidget*>(w))   return p->Text();
+    if (auto* p = dynamic_cast<TextAreaWidget*>(w))    return p->Text();
+    if (auto* p = dynamic_cast<NavItemWidget*>(w))     return p->Text();
+    if (auto* p = dynamic_cast<OverlayWidget*>(w))     return p->Text();
+    if (auto* p = dynamic_cast<TitleBarWidget*>(w))    return p->Title();
+    if (has) *has = false;
+    return L"";
+}
+
+// 精简基础属性 json: {"id","type","text"} — 比 DebugDumpTree 轻 (无 rect /
+// textMetrics / children), 给业务一次拿标签名称(id)/类型/值(text)。
+std::string WidgetBasicJson(Widget* w) {
+    if (!w) return "null";
+    bool hasText = false;
+    std::wstring text = WidgetTextValue(w, &hasText);
+    std::string out = "{";
+    out += "\"id\": "    + jsonStr(w->id);
+    out += ", \"type\": " + jsonStr(std::string(widgetTypeName(w)));
+    out += ", \"text\": " + (hasText ? jsonStr(text) : std::string("null"));
+    out += "}";
+    return out;
 }
 
 // ---- Text measurement helper ----
@@ -170,9 +203,6 @@ static void appendTypeProps(std::ostringstream& ss, Widget* w, int d, Renderer* 
     }
     else if (auto* tb = dynamic_cast<TitleBarWidget*>(w)) {
         ss << ",\n" << ind << "\"title\": " << jsonStr(tb->Title());
-    }
-    else if (auto* dlg = dynamic_cast<DialogWidget*>(w)) {
-        ss << ",\n" << ind << "\"active\": " << (dlg->IsActive() ? "true" : "false");
     }
     else if (auto* ov = dynamic_cast<OverlayWidget*>(w)) {
         ss << ",\n" << ind << "\"active\": " << (ov->IsActive() ? "true" : "false");

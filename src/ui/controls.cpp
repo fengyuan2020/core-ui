@@ -290,7 +290,13 @@ void ButtonWidget::OnDraw(Renderer& r) {
             finalBg.r *= 0.92f; finalBg.g *= 0.92f; finalBg.b *= 0.92f;
         }
         r.FillRoundedRect(rect, cr, cr, finalBg);
-        textColor = theme::kBtnText();
+        /* 自定义底色的文字按底色相对亮度自动选黑白 — 深色底 (危险红等)
+         * 不再出现暗色主题黑字/亮色主题黑字贴深底的可读性问题。跟
+         * ui_theme_set_accent 的 accentText 同一规则。 */
+        const float lum = 0.299f * bgColor.r + 0.587f * bgColor.g +
+                          0.114f * bgColor.b;
+        textColor = lum > 0.6f ? D2D1_COLOR_F{0, 0, 0, 1}
+                               : D2D1_COLOR_F{1, 1, 1, 1};
     } else if (type_ == ButtonType::Primary) {
         // ---- Primary (Accent) Button: WinUI 3 FilledButton ----
         // AccentFillColor: Default / Secondary(hover) / Tertiary(press) / Disabled
@@ -2751,202 +2757,6 @@ D2D1_SIZE_F OverlayWidget::SizeHint() const {
 
 // ---- Dialog ----
 
-void DialogWidget::Show(const std::wstring& title, const std::wstring& message, ResultCallback cb) {
-    title_ = title;
-    message_ = message;
-    callback_ = std::move(cb);
-    active_ = true;
-    enabled = true;
-    visible = true;
-    hoveredBtn_ = -1;
-    pressedBtn_ = -1;
-}
-
-void DialogWidget::Hide() {
-    active_ = false;
-    enabled = false;
-    visible = false;
-    hoveredBtn_ = -1;
-    pressedBtn_ = -1;
-    if (onHide_) onHide_();
-}
-
-D2D1_RECT_F DialogWidget::BtnRect(int idx) const {
-    float btnW = 80.0f, btnH = 30.0f, gap = 12.0f;
-    float btnY = panelRect_.bottom - 16.0f - btnH;
-
-    if (!showCancel_) {
-        // single centered button
-        float cx = (panelRect_.left + panelRect_.right) * 0.5f;
-        return {cx - btnW * 0.5f, btnY, cx + btnW * 0.5f, btnY + btnH};
-    }
-
-    float totalW = btnW * 2 + gap;
-    float startX = (panelRect_.left + panelRect_.right) * 0.5f - totalW * 0.5f;
-    if (idx == 1) startX += btnW + gap;  // cancel is on the right
-    return {startX, btnY, startX + btnW, btnY + btnH};
-}
-
-int DialogWidget::HitBtn(float x, float y) const {
-    for (int i = 0; i < (showCancel_ ? 2 : 1); i++) {
-        auto r = BtnRect(i);
-        if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom)
-            return i;
-    }
-    return -1;
-}
-
-const theme::Colors& DialogWidget::EffectiveColors() const {
-    // Cached static instances to avoid rebuilding the Colors struct each frame.
-    static const theme::Colors light = theme::MakeLight();
-    static const theme::Colors dark  = theme::MakeDark();
-    switch (themeMode_) {
-        case ThemeMode::Light: return light;
-        case ThemeMode::Dark:  return dark;
-        default:               return theme::Current();
-    }
-}
-
-void DialogWidget::OnDraw(Renderer& r) {
-    if (!active_) return;
-
-    const auto& c = EffectiveColors();
-
-    // full-screen mask. `rect` is set by UiWindowImpl::OnPaint to the full
-    // client area before this is called — the dialog never lives in the tree.
-    r.FillRect(rect, {0.0f, 0.0f, 0.0f, 0.40f});
-
-    /* ---- 自适应高度 -----------------------------------------------------
-       原来 panelH 写死 170, message 调 DrawText 默认 wordWrap=false → 长文
-       字直接 ellipsis 截掉. 现在按 message wrap 后的实际高度撑 panel,
-       上限 = window 高度的 85% 防止超出可视区. */
-    constexpr float panelW       = 320.0f;
-    constexpr float padX         = 24.0f;
-    constexpr float titleTop     = 18.0f;
-    constexpr float titleH       = 22.0f;
-    constexpr float titleToMsg   = 12.0f;
-    constexpr float msgToBtn     = 14.0f;
-    constexpr float btnH         = 30.0f;
-    constexpr float bottomPad    = 16.0f;
-    constexpr float headerH      = titleTop + titleH + titleToMsg;     // 52
-    constexpr float footerH      = msgToBtn + btnH + bottomPad;        // 60
-    constexpr float minMsgH      = 24.0f;
-
-    float msgMaxW   = panelW - 2 * padX;
-    float winH      = rect.bottom - rect.top;
-    float maxPanelH = winH * 0.85f;
-    float maxMsgH   = std::max(minMsgH, maxPanelH - headerH - footerH);
-
-    float msgH = minMsgH;
-    if (!message_.empty()) {
-        auto layout = r.CreateTextLayout(message_, msgMaxW, maxMsgH,
-                                         theme::kFontSizeNormal, /*wrap=*/true);
-        if (layout) {
-            DWRITE_TEXT_METRICS m{};
-            layout->GetMetrics(&m);
-            msgH = std::max(minMsgH, std::min(m.height, maxMsgH));
-        }
-    }
-    float panelH = headerH + msgH + footerH;
-
-    float cx = (rect.left + rect.right) * 0.5f;
-    float cy = (rect.top + rect.bottom) * 0.5f;
-    panelRect_ = {cx - panelW * 0.5f, cy - panelH * 0.5f,
-                  cx + panelW * 0.5f, cy + panelH * 0.5f};
-
-    // panel background
-    D2D1_COLOR_F panelBg = c.toolbarBg;
-    panelBg.a = 0.98f;
-    r.FillRoundedRect(panelRect_, 8.0f, 8.0f, panelBg);
-    r.DrawRoundedRect(panelRect_, 8.0f, 8.0f, c.divider, 0.8f);
-
-    // title
-    D2D1_RECT_F titleRect = {panelRect_.left + 20.0f, panelRect_.top + titleTop,
-                              panelRect_.right - 20.0f, panelRect_.top + titleTop + titleH};
-    r.DrawText(title_, titleRect, c.btnText, theme::kFontSizeTitle,
-               DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_FONT_WEIGHT_BOLD);
-
-    // message — wrap=true, 高度由 msgH 撑出来
-    D2D1_RECT_F msgRect = {panelRect_.left + padX, panelRect_.top + headerH,
-                            panelRect_.right - padX, panelRect_.top + headerH + msgH};
-    r.DrawText(message_, msgRect, c.btnText, theme::kFontSizeNormal,
-               DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_FONT_WEIGHT_NORMAL,
-               DWRITE_PARAGRAPH_ALIGNMENT_CENTER, /*wordWrap=*/true);
-
-    // buttons
-    for (int i = 0; i < (showCancel_ ? 2 : 1); i++) {
-        auto br = BtnRect(i);
-        D2D1_COLOR_F btnBg;
-        if (i == 0) {
-            // OK button — accent fill
-            btnBg = (hoveredBtn_ == 0) ? c.accentHover : c.accent;
-            if (pressedBtn_ == 0) btnBg.a = 0.8f;
-        } else {
-            // Cancel button — subtle
-            btnBg = c.divider;
-            if (hoveredBtn_ == 1) btnBg.a = std::min(btnBg.a + 0.15f, 1.0f);
-            if (pressedBtn_ == 1) btnBg.a = std::min(btnBg.a + 0.25f, 1.0f);
-        }
-        r.FillRoundedRect(br, 5.0f, 5.0f, btnBg);
-
-        const std::wstring& label = (i == 0) ? okText_ : cancelText_;
-        // Accent button uses foregroundOnBrand (always near-white in both
-        // themes, by Fluent design); cancel inherits theme btn text color.
-        D2D1_COLOR_F textColor = (i == 0) ? c.foregroundOnBrand : c.btnText;
-        r.DrawText(label, br, textColor, theme::kFontSizeNormal, DWRITE_TEXT_ALIGNMENT_CENTER);
-    }
-}
-
-bool DialogWidget::OnMouseMove(const MouseEvent& e) {
-    if (!active_) return false;
-    hoveredBtn_ = HitBtn(e.x, e.y);
-    return true;
-}
-
-bool DialogWidget::OnMouseDown(const MouseEvent& e) {
-    if (!active_) return false;
-    pressedBtn_ = HitBtn(e.x, e.y);
-    return true;
-}
-
-bool DialogWidget::OnMouseUp(const MouseEvent& e) {
-    if (!active_) return false;
-    int hit = HitBtn(e.x, e.y);
-    if (hit >= 0 && hit == pressedBtn_) {
-        bool confirmed = (hit == 0);
-        auto cb = std::move(callback_);
-        Hide();
-        if (cb) cb(confirmed);
-    }
-    pressedBtn_ = -1;
-    return true;
-}
-
-bool DialogWidget::OnMouseWheel(const MouseEvent&) {
-    return active_;
-}
-
-bool DialogWidget::OnKeyDown(int vk) {
-    if (!active_) return false;
-    if (vk == VK_RETURN) {
-        auto cb = std::move(callback_);
-        Hide();
-        if (cb) cb(true);
-        return true;
-    }
-    if (vk == VK_ESCAPE) {
-        auto cb = std::move(callback_);
-        Hide();
-        if (cb) cb(false);
-        return true;
-    }
-    return true;  // block all keys
-}
-
-D2D1_SIZE_F DialogWidget::SizeHint() const {
-    return {fixedW > 0 ? fixedW : 0.0f, fixedH > 0 ? fixedH : 0.0f};
-}
-
 // ---- ImageView ----
 
 static std::unordered_map<UINT_PTR, ImageViewWidget*> g_animTimerMap;
@@ -3761,7 +3571,9 @@ void ImageViewWidget::DrawCropOverlay(Renderer& r) {
 // ---- IconButton ----
 
 IconButtonWidget::IconButtonWidget(const std::string& svgContent, bool ghost)
-    : svgContent_(svgContent), ghost_(ghost) {}
+    : svgContent_(svgContent), ghost_(ghost) {
+    /* L148-4: 图标按钮默认手型 (跟 ButtonWidget 一致)。 */
+    cursor = CursorKind::Pointer;}
 
 void IconButtonWidget::SetSvg(const std::string& svgContent) {
     svgContent_ = svgContent;

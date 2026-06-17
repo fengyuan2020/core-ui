@@ -841,15 +841,34 @@ void ApplyFlexItemStyle(Widget& w, const ui::css::ComputedStyle& s) {
         } catch (...) {}
     }
     if (s.Has("flex")) {
-        // Shorthand: "1" or "1 1 auto"
-        auto pv = ui::css::ParseValue(s.Get("flex"));
-        for (const auto& c : pv.components) {
-            if (c.kind == ui::css::ComponentKind::Number) {
-                w.expanding = true;
-                w.flex = static_cast<float>(c.number);
-                break;
+        // Shorthand: "none" | "<grow>" | "<grow> <shrink>" | "<grow> <shrink> <basis>".
+        // 1st number → flex-grow (expanding), 2nd number → flex-shrink. "none" = 0 0.
+        const std::string& fv = s.Get("flex");
+        if (fv == "none") {
+            w.expanding = false; w.flex = 0.0f; w.flexShrink = 0.0f;
+        } else {
+            auto pv = ui::css::ParseValue(fv);
+            int numIdx = 0;
+            for (const auto& c : pv.components) {
+                if (c.kind != ui::css::ComponentKind::Number) continue;
+                float n = static_cast<float>(c.number);
+                if (numIdx == 0) {
+                    if (n > 0) { w.expanding = true; w.flex = n; }
+                    else       { w.expanding = false; }
+                } else if (numIdx == 1) {
+                    w.flexShrink = (n < 0 ? 0.0f : n);
+                }
+                numIdx++;
             }
         }
+    }
+    // Longhand flex-shrink wins over the shorthand (the cascade already resolved
+    // the final per-property value, so just apply it last).
+    if (s.Has("flex-shrink")) {
+        try {
+            float sh = std::stof(s.Get("flex-shrink"));
+            w.flexShrink = (sh < 0 ? 0.0f : sh);
+        } catch (...) {}
     }
 }
 

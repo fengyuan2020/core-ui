@@ -269,6 +269,16 @@ void PageState::SetLocale(const std::string& locale) {
         for (auto& c : w->Children()) retranslate(c.get());
     };
     if (page_.root) retranslate(page_.root.get());
+
+    // Locale change rewrote every $t() label's text via ApplyBindingToWidget,
+    // which only repaints (InvalidateAllWindows) — it does NOT relayout. A label
+    // measured in the old locale keeps that rect, so a wider translation (e.g.
+    // zh "拖入图片到这里" → en "Drop an image here") wraps/overflows inside the
+    // stale width. Do ONE relayout after the bulk text swap so every label
+    // re-measures (LabelWidget::SizeHint is live) and re-fits — independent of
+    // whether the window is foreground / gets a later paint. One pass, not
+    // per-binding, keeps a 50-label locale switch from doing 50 full relayouts.
+    ui::GetContext().RelayoutAllWindows();
 }
 
 // ---- Lifecycle hooks --------------------------------------------------
@@ -643,6 +653,15 @@ void PageState::WireSubtreeMenus(const std::vector<CompiledMenu>& subMenus,
                 for (const auto& t : rclickList) {
                     if (!t.triggerElement || !t.menu) continue;
                     if (!t.triggerElement->Contains(x, y)) continue;
+                    /* L90: 跳过不可见 trigger (自身或祖先 visible=false) — 隐藏
+                     * widget (如 borderless 隐藏的 minimap) rect 仍 Contains,
+                     * 不跳会抢右键菜单, 小窗时盖住大半画布. */
+                    {
+                        bool t_vis = true;
+                        for (Widget* p = t.triggerElement; p; p = p->Parent())
+                            if (!p->visible) { t_vis = false; break; }
+                        if (!t_vis) continue;
+                    }
                     int depth = 0;
                     for (Widget* p = t.triggerElement->Parent();
                          p; p = p->Parent()) {
@@ -975,6 +994,15 @@ void PageState::AttachWindow(uint64_t winHandle) {
             for (const auto& t : rclickList) {
                 if (!t.triggerElement || !t.menu) continue;
                 if (!t.triggerElement->Contains(x, y)) continue;
+                /* L90: 跳过不可见 trigger (自身或祖先 visible=false) — 隐藏
+                 * widget (如 borderless 隐藏的 minimap) rect 仍 Contains,
+                 * 不跳会抢右键菜单, 小窗时盖住大半画布. */
+                {
+                    bool t_vis = true;
+                    for (Widget* p = t.triggerElement; p; p = p->Parent())
+                        if (!p->visible) { t_vis = false; break; }
+                    if (!t_vis) continue;
+                }
                 int depth = 0;
                 for (Widget* p = t.triggerElement->Parent();
                      p; p = p->Parent()) {

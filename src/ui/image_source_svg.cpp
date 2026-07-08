@@ -17,9 +17,10 @@ namespace ui {
 
 class SvgSourceNative : public IImageSource {
 public:
-    SvgSourceNative(ComPtr<ID2D1SvgDocument> doc, int w, int h,
+    SvgSourceNative(ComPtr<ID2D1SvgDocument> doc, std::string xml, int w, int h,
                     std::vector<SvgTextRun> textRuns)
-        : doc_(std::move(doc)), w_(w), h_(h), textRuns_(std::move(textRuns)) {}
+        : doc_(std::move(doc)), xml_(std::move(xml)),
+          w_(w), h_(h), textRuns_(std::move(textRuns)) {}
 
     int  Width()  const override { return w_; }
     int  Height() const override { return h_; }
@@ -29,9 +30,6 @@ public:
     const char* TypeName() const override { return "SvgSourceNative"; }
 
     void Draw(Renderer& r, const ImageDrawContext& ctx) override {
-        auto* ctx5 = r.RT5();
-        if (!ctx5 || !doc_) return;
-
         float drawW = ctx.dest.right  - ctx.dest.left;
         float drawH = ctx.dest.bottom - ctx.dest.top;
         if (drawW <= 0 || drawH <= 0 || w_ <= 0 || h_ <= 0) return;
@@ -42,11 +40,6 @@ public:
          *
          * viewport 设为 SVG 原生宽高（w_, h_），transform 里做 scale 到 drawW/drawH。
          */
-        doc_->SetViewportSize(D2D1::SizeF((float)w_, (float)h_));
-
-        D2D1_MATRIX_3X2_F old;
-        ctx5->GetTransform(&old);
-
         float sx = drawW / (float)w_;
         float sy = drawH / (float)h_;
         float cx = (ctx.dest.left + ctx.dest.right) / 2.0f;
@@ -62,19 +55,28 @@ public:
             D2D1::Matrix3x2F::Scale(sx, sy) *
             D2D1::Matrix3x2F::Translation(ctx.dest.left, ctx.dest.top) *
             D2D1::Matrix3x2F::Rotation((float)ctx.rotation,
-                                        D2D1::Point2F(cx, cy)) *
-            old;
-        ctx5->SetTransform(xf);
+                                        D2D1::Point2F(cx, cy));
+        r.RecordSvgDocument(xml_, (float)w_, (float)h_, xf);
 
+        auto* ctx5 = r.RT5();
+        if (!ctx5 || !doc_) return;
+
+        D2D1_MATRIX_3X2_F old;
+        ctx5->GetTransform(&old);
+        D2D1_MATRIX_3X2_F drawXf = xf * old;
+        ctx5->SetTransform(drawXf);
+
+        doc_->SetViewportSize(D2D1::SizeF((float)w_, (float)h_));
         ctx5->DrawSvgDocument(doc_.Get());
         /* L75: D2D ID2D1SvgDocument 不渲染 <text>/<foreignObject> 文字 (shapes-only)
          * → DirectWrite 叠加补渲, 用同一个 xf 变换跟形状对齐. */
-        if (!textRuns_.empty()) r.DrawSvgTextRuns(textRuns_, xf);
+        if (!textRuns_.empty()) r.DrawSvgTextRuns(textRuns_, drawXf);
         ctx5->SetTransform(old);
     }
 
 private:
     ComPtr<ID2D1SvgDocument> doc_;
+    std::string xml_;
     int w_, h_;
     std::vector<SvgTextRun> textRuns_;   // L75: D2D 不画文字, 这里 DirectWrite 叠加
 };
@@ -183,7 +185,7 @@ CreateSvgSourceFromFile(const std::wstring& path, Renderer& r) {
                 }
                 /* L121: 文字已内联成 <path>, D2D 一把全画 → 无需 textRuns 叠加. */
                 return std::make_unique<SvgSourceNative>(
-                    doc, w, h, std::vector<SvgTextRun>{});
+                    doc, std::move(xml), w, h, std::vector<SvgTextRun>{});
             }
         }
     }

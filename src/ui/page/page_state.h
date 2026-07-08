@@ -117,6 +117,7 @@ private:
     void WireQuickJSModelWrite(Widget* target, const std::string& propName);
     void WireQuickJSEvent(Widget* target, const std::string& evName,
                            const std::string& sourceJs);
+    void DispatchQuickJSResize(int width, int height);
     void ApplyBindingToWidget(Widget* w, const std::string& property,
                                const ui::expr::Value& v);
 
@@ -195,8 +196,7 @@ private:
     void PopulateMenu(ContextMenu* menu, const CompiledMenu& cm,
                        const std::vector<std::pair<std::string, JSValue>>& locals);
     void PopulateMenuItem(ContextMenu* menu, const CompiledMenuItem& mi,
-                           const std::vector<std::pair<std::string, JSValue>>& locals,
-                           ui::Renderer* renderer);
+                           const std::vector<std::pair<std::string, JSValue>>& locals);
     /* Eval bound expr against jsState_ + optional loop-scope locals.
      * 调用方 JS_FreeValue 返回值. 失败/无 JS state 返 JS_UNDEFINED. */
     JSValue EvalBoundExpr(const std::string& rawExpr,
@@ -208,6 +208,9 @@ private:
                           bool defaultVal);
     std::string EvalString(const std::string& expr,
                             const std::vector<std::pair<std::string, JSValue>>& locals);
+    bool        EvalMenuBackdropBlur(const std::string& expr,
+                                      const std::vector<std::pair<std::string, JSValue>>& locals,
+                                      float& out);
 
     std::vector<std::shared_ptr<ContextMenu>> menus_;
     std::unordered_map<std::string, ContextMenu*> menuById_;

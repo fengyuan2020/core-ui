@@ -49,9 +49,22 @@ export default {
       // ---- Events page ----
       lastEvent: "(none)",
       eventCount: 0,
+      menuTransparent: true,
+      menuBlur: 22,
 
       // ---- Settings page ----
-      dark: false
+      dark: false,
+      overlayMode: "select",
+
+      // ---- Animation stress page ----
+      stressSwitch: false,
+      stressCheck: true,
+      stressRadioA: true,
+      stressRadioB: false,
+      stressSlider: 35,
+      stressProgress: 25,
+      stressWide: false,
+      stressTall: false
     };
   },
 
@@ -72,6 +85,7 @@ export default {
     nav(p) { this.page = p; },
 
     setLang(loc) { this.requestedLocale = loc; },
+    setOverlayMode(mode) { this.overlayMode = mode; },
 
     // Reactive
     inc()   { this.count++; },
@@ -111,7 +125,22 @@ export default {
     onMouseUp($e)   { this.probe("mouseup",   $e); },
     onWheel($e)     { this.probe("wheel",     $e); },
     onFocus()       { this.probe("focus",     null); },
-    onBlur()        { this.probe("blur",      null); }
+    onBlur()        { this.probe("blur",      null); },
+
+    // Animation stress
+    stressFlip() {
+      this.stressSwitch = !this.stressSwitch;
+      this.stressCheck = !this.stressCheck;
+      this.stressRadioA = !this.stressRadioA;
+      this.stressRadioB = !this.stressRadioB;
+      this.stressSlider = this.stressSlider > 50 ? 12 : 88;
+      this.stressProgress = this.stressProgress > 50 ? 18 : 92;
+      this.stressWide = !this.stressWide;
+      this.stressTall = !this.stressTall;
+    },
+    stressBurst() {
+      for (var i = 0; i < 17; i++) this.stressFlip();
+    }
   }
 }
 </script>
@@ -181,9 +210,14 @@ export default {
   .badge.warn { background: #eab308; color: #1f2937; }
   .badge.err  { background: #ef4444; }
 
-  .evbox    { padding: 28px; background: #fef3c7; border-radius: 6px;
-              color: #78350f; font-size: 13px; cursor: pointer;
-              min-height: 60px; align-items: center; }
+  .evbox    { padding: 28px; border-radius: 6px;
+              background-color: #0f172a;
+              background-image: linear-gradient(135deg,
+                #ef4444 0%, #f97316 18%, #eab308 34%, #22c55e 50%,
+                #06b6d4 66%, #3b82f6 82%, #a855f7 100%);
+              box-shadow: inset 0 0 0 1px rgba(255,255,255,0.32);
+              color: #ffffff; font-size: 13px; font-weight: 600; cursor: pointer;
+              min-height: 96px; align-items: center; }
   .evlog    { padding: 8px 12px; background: var(--bg-2); border-radius: 4px;
               font-size: 12px; color: var(--fg); }
 
@@ -191,11 +225,32 @@ export default {
   .pbar     { flex-direction: row; height: 8; border-radius: 4;
               background: var(--bg-3); }
   .pfill    { background: var(--accent); border-radius: 4; }
+  .overlay-stage { height: 360px; overflow: hidden; border-radius: 6px;
+                   background: #101827; box-shadow: 0 18px 42px 0 rgba(15,23,42,0.22); }
+  .overlay-gh { position: absolute; left: 0; top: 0; width: 100%; height: 360px;
+                background: #101827; cursor: grab; }
+  .overlay-toolbar { position: absolute; left: 24px; top: 24px; width: 88%; height: 58px;
+                     flex-direction: row; align-items: center; gap: 8px; padding: 0 12px;
+                     border-radius: 6px; backdrop-filter: blur(16px);
+                     background: rgba(255,255,255,0.36);
+                     border: 1px solid rgba(255,255,255,0.78);
+                     box-shadow: 0 12px 30px 0 rgba(15,23,42,0.22); }
+  .overlay-title { font-size: 13px; font-weight: 700; color: #0f172a; }
+  .overlay-tool { width: 66px; height: 34px; border-radius: 5px;
+                  align-items: center; justify-content: center;
+                  background: #ffffff; color: #0f172a;
+                  font-size: 12px; text-align: center; }
+  .overlay-tool.on { background: #2563eb; color: #ffffff; }
+  .overlay-spacer { flex: 1; }
+  .overlay-meter { width: 86px; height: 8px; border-radius: 4px; background: #cbd5e1; }
+  .overlay-meter-fill { width: 56px; height: 8px; border-radius: 4px; background: #2563eb; }
+  .stress-box { background: var(--accent); border-radius: 6px; padding: 8px;
+                color: #ffffff; transition: width 180ms ease-out, height 180ms ease-out; }
 </style>
 
 <template>
 <div class="shell">
-  <TitleBar title="Core UI .uix Demo"/>
+  <TitleBar class="titlebar" title="Core UI .uix Demo"/>
 
   <div class="body">
 
@@ -288,6 +343,22 @@ export default {
           <path fill="currentColor" d="M12 3a9 9 0 100 18 1.5 1.5 0 001.5-1.5c0-.39-.15-.74-.39-1A1.5 1.5 0 0114.25 16h1.77A4.98 4.98 0 0021 11c0-4.42-4.03-8-9-8zm-5.5 9a1.5 1.5 0 110-3 1.5 1.5 0 010 3zm3-4a1.5 1.5 0 110-3 1.5 1.5 0 010 3zm5 0a1.5 1.5 0 110-3 1.5 1.5 0 010 3zm4.5 4a1.5 1.5 0 110-3 1.5 1.5 0 010 3z"/>
         </svg>
         <label class="nav-text">{{ $t('nav_style') }}</label>
+      </div>
+
+      <div class="nav" :class="page=='overlay' ? 'on' : ''" @click="nav('overlay')">
+        <div class="nav-bar"/>
+        <svg class="nav-icon" width="20" height="20" viewBox="0 0 24 24">
+          <path fill="currentColor" d="M4 5h16v10H4V5zm2 2v6h12V7H6zm-2 10h16v2H4v-2z"/>
+        </svg>
+        <label class="nav-text">{{ $t('nav_overlay') }}</label>
+      </div>
+
+      <div class="nav" :class="page=='stress' ? 'on' : ''" @click="nav('stress')">
+        <div class="nav-bar"/>
+        <svg class="nav-icon" width="20" height="20" viewBox="0 0 24 24">
+          <path fill="currentColor" d="M13 2L4 14h7l-1 8 9-12h-7l1-8z"/>
+        </svg>
+        <label class="nav-text">动画压力</label>
       </div>
 
       <div class="nav-spacer"/>
@@ -490,6 +561,14 @@ export default {
         <label class="desc">{{ $t('events_desc') }}</label>
         <div class="sep"/>
         <div class="panel">
+          <label class="h2">右键菜单材质</label>
+          <div class="row">
+            <toggle id="menuTransparentSwitch" v-model="menuTransparent"/>
+            <label class="lbl">半透明菜单</label>
+          </div>
+          <label class="lbl">模糊程度 = {{ menuBlur }}px</label>
+          <input id="menuBlurSlider" type="range" min="0" max="36" v-model="menuBlur"/>
+          <div class="sep"/>
           <div class="row">
             <button @click="onClick">click</button>
             <button @dblclick="onDblClick">dblclick</button>
@@ -504,7 +583,7 @@ export default {
 
           <!-- build 75/130 (L73) BREAKING 后的菜单语法：@click 事件 + 文本包 <label>。
                旧写法 onclick="..." + 裸文本运行时建不出菜单项（弹出空矩形）。 -->
-          <menu trigger="#evboxRoot" event="rclick">
+          <menu id="eventsContext" trigger="#evboxRoot" event="rclick">
             <menuitem id="1" @click="onClick" shortcut="Ctrl+C">
               <svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M9 9h10v10H9zM5 5h10v2H7v8H5z"/></svg>
               <label>复制</label>
@@ -588,6 +667,60 @@ export default {
             {{ $t('style_fade') }} (count = {{ count }}, {{ count > 5 ? $t('style_faded') : $t('style_normal') }})
           </label>
           <button @click="inc">count++</button>
+        </div>
+      </div>
+
+      <!-- ===== 透明工具条 ===== -->
+      <div v-if="page=='overlay'">
+        <label class="h1">{{ $t('overlay_title') }}</label>
+        <label class="desc">{{ $t('overlay_desc') }}</label>
+        <div class="sep"/>
+        <div class="overlay-stage">
+          <gh_img id="overlayGh" class="overlay-gh"/>
+          <div class="overlay-toolbar">
+            <label class="overlay-title">{{ $t('overlay_toolbar') }}</label>
+            <button id="overlaySelect"
+                    :class="overlayMode == 'select' ? 'overlay-tool on' : 'overlay-tool'"
+                    @click="setOverlayMode('select')">{{ $t('overlay_select') }}</button>
+            <button id="overlayCrop"
+                    :class="overlayMode == 'crop' ? 'overlay-tool on' : 'overlay-tool'"
+                    @click="setOverlayMode('crop')">{{ $t('overlay_crop') }}</button>
+            <button id="overlayMark"
+                    :class="overlayMode == 'mark' ? 'overlay-tool on' : 'overlay-tool'"
+                    @click="setOverlayMode('mark')">{{ $t('overlay_mark') }}</button>
+            <div class="overlay-spacer"/>
+            <div class="overlay-meter">
+              <div class="overlay-meter-fill"/>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== 动画压力 ===== -->
+      <div v-if="page=='stress'">
+        <label class="h1">动画压力</label>
+        <label class="desc">快速切换状态控件、进度条、滑块和属性 transition，用于观察 frame trace。</label>
+        <div class="sep"/>
+        <div class="panel">
+          <div class="row">
+            <button @click="stressFlip">Flip once</button>
+            <button class="danger" @click="stressBurst">Burst x17</button>
+          </div>
+          <div class="row"><toggle v-model="stressSwitch"/><label class="lbl">Toggle retarget</label></div>
+          <div class="row"><input type="checkbox" v-model="stressCheck"/><label class="lbl">Checkbox retarget</label></div>
+          <div class="row">
+            <input type="radio" name="stressRadio" v-model="stressRadioA"/><label class="lbl">Radio A</label>
+            <input type="radio" name="stressRadio" v-model="stressRadioB"/><label class="lbl">Radio B</label>
+          </div>
+          <label class="lbl">Slider = {{ stressSlider }}</label>
+          <input type="range" min="0" max="100" v-model="stressSlider"/>
+          <label class="lbl">Progress = {{ stressProgress }}%</label>
+          <progressbar min="0" max="100" :value="stressProgress"/>
+          <div class="stress-box"
+               :width="stressWide ? 360 : 120"
+               :height="stressTall ? 88 : 36">
+            transition box
+          </div>
         </div>
       </div>
 

@@ -13,6 +13,7 @@
 #include "../css/value.h"
 
 #include <functional>
+#include <cctype>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -20,6 +21,104 @@
 namespace ui::page {
 
 namespace {
+
+D2D1_COLOR_F ToD2DColor(const ui::css::Color& c) {
+    return D2D1_COLOR_F{c.r, c.g, c.b, c.a};
+}
+
+bool ParseMenuBlur(const std::string& value, float& out) {
+    auto pv = ui::css::ParseValue(value);
+    if (!pv.ok) return false;
+    auto compToPx = [](const ui::css::Component& c, float& px) -> bool {
+        if (c.kind == ui::css::ComponentKind::Number) {
+            px = static_cast<float>(c.number);
+            return true;
+        }
+        if (c.kind == ui::css::ComponentKind::Length) {
+            double v = 0.0;
+            if (ui::css::ResolveLengthPx(c.length, 0, 14, 14, 1920, 1080, v)) {
+                px = static_cast<float>(v);
+                return true;
+            }
+        }
+        if (c.kind == ui::css::ComponentKind::Ident && c.ident == "auto") {
+            px = -1.0f;
+            return true;
+        }
+        if (c.kind == ui::css::ComponentKind::Ident && (c.ident == "none" || c.ident == "off")) {
+            px = 0.0f;
+            return true;
+        }
+        return false;
+    };
+    for (const auto& c : pv.components) {
+        if (c.kind == ui::css::ComponentKind::Function && c.ident == "blur" &&
+            !c.args.empty()) {
+            return compToPx(c.args[0], out);
+        }
+        if (compToPx(c, out)) return true;
+    }
+    return false;
+}
+
+bool ParseMenuBool(const std::string& value, bool& out) {
+    auto lower = value;
+    for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lower == "1" || lower == "true" || lower == "yes" || lower == "on") {
+        out = true;
+        return true;
+    }
+    if (lower == "0" || lower == "false" || lower == "no" || lower == "off" ||
+        lower == "none") {
+        out = false;
+        return true;
+    }
+    return false;
+}
+
+void ApplyMenuMaterialDecl(CompiledMenu& menu, const std::string& name, const std::string& value) {
+    if (name == "frosted-material" || name == "frostedMaterial" ||
+        name == "material" || name == "menu-material") {
+        bool enabled = false;
+        if (ParseMenuBool(value, enabled)) {
+            menu.frostedMaterial = enabled;
+            menu.hasFrostedMaterial = true;
+        }
+        return;
+    }
+    if (name == "bg-color" || name == "bgColor" ||
+        name == "background" || name == "background-color") {
+        ui::css::Color c;
+        if (ui::css::ParseColor(value, c)) {
+            menu.bgColor = ToD2DColor(c);
+            menu.hasBgColor = true;
+        }
+        return;
+    }
+    if (name == "backdrop-blur" || name == "backdropBlur" ||
+        name == "backdrop-filter" || name == "backdropFilter") {
+        float blur = -1.0f;
+        if (ParseMenuBlur(value, blur)) {
+            menu.backdropBlur = blur;
+            menu.hasBackdropBlur = true;
+        }
+    }
+}
+
+bool IsMenuBackdropBlurAttr(const std::string& name) {
+    return name == "backdrop-blur" || name == "backdropBlur" ||
+           name == "backdrop-filter" || name == "backdropFilter";
+}
+
+bool IsMenuFrostedMaterialAttr(const std::string& name) {
+    return name == "frosted-material" || name == "frostedMaterial" ||
+           name == "material" || name == "menu-material";
+}
+
+bool IsMenuBgColorAttr(const std::string& name) {
+    return name == "bg-color" || name == "bgColor" ||
+           name == "background" || name == "background-color";
+}
 
 // Build a MatchNode from the HTML element's static attrs, plus its parent.
 ui::css::MatchNode BuildMatchNode(const ui::uix::Node& n, const ui::css::MatchNode* parent) {
@@ -300,20 +399,49 @@ void CompileElement(CompilerCtx& ctx,
 
         /* 递归编译: 顶层 <menu> 进 ctx.out->menus; 嵌套 <menu text="..."> 作为
            submenu 通过 lambda 共享 ctx (id/handler 收集都用得到). */
-        std::function<CompiledMenuPtr(const ui::uix::Node&, int /*autoId*/, bool /*top*/)>
+        std::function<CompiledMenuPtr(const ui::uix::Node&, int /*autoId*/, bool /*top*/,
+                                      const std::string& /*inheritedRowClass*/,
+                                      bool /*inheritedShareWidth*/)>
             compileMenu;
-        compileMenu = [&](const ui::uix::Node& mNode, int /*startId*/, bool top) -> CompiledMenuPtr {
+        compileMenu = [&](const ui::uix::Node& mNode, int /*startId*/, bool top,
+                          const std::string& inheritedRowClass,
+                          bool inheritedShareWidth) -> CompiledMenuPtr {
             auto cm = std::make_shared<CompiledMenu>();
+            cm->rowClass = inheritedRowClass;
+            cm->shareWidthWithSubmenus = inheritedShareWidth;
             for (const auto& a : mNode.attrs) {
                 if (a.kind == ui::uix::AttrKind::Static) {
                     if (a.name == "id") cm->id = a.rawValue;
                     else if (a.name == "trigger") cm->triggerSelector = a.rawValue;
                     else if (a.name == "event")   cm->triggerEvent    = a.rawValue;
+                    else if (a.name == "row-class" || a.name == "rowClass") cm->rowClass = a.rawValue;
+                    else if (a.name == "share-width" || a.name == "shareWidth" ||
+                             a.name == "same-width" || a.name == "sameWidth") {
+                        bool enabled = true;
+                        if (ParseMenuBool(a.rawValue, enabled)) {
+                            cm->shareWidthWithSubmenus = enabled;
+                        }
+                    }
+                    else if (a.name == "style") {
+                        for (const auto& d : ui::css::ParseInlineStyle(a.rawValue)) {
+                            ApplyMenuMaterialDecl(*cm, d.property, d.value);
+                        }
+                    } else {
+                        ApplyMenuMaterialDecl(*cm, a.name, a.rawValue);
+                    }
                 } else if (a.kind == ui::uix::AttrKind::Directive) {
                     /* <menu v-if / v-show>: 整体条件渲染, show 不出来时
                      * PopulateMenu skip 不 build items. v-show 在 menu 语境
                      * 等价 v-if (popup 模型没"占位但不显" 概念, 见 build 73 CHANGELOG). */
                     if (a.name == "if" || a.name == "show") cm->vIfExpr = a.rawValue;
+                } else if (a.kind == ui::uix::AttrKind::Bind) {
+                    if (IsMenuFrostedMaterialAttr(a.name)) {
+                        cm->boundFrostedMaterialExpr = a.rawValue;
+                    } else if (IsMenuBgColorAttr(a.name)) {
+                        cm->boundBgColorExpr = a.rawValue;
+                    } else if (IsMenuBackdropBlurAttr(a.name)) {
+                        cm->boundBackdropBlurExpr = a.rawValue;
+                    }
                 }
             }
             if (top && cm->triggerEvent.empty()) cm->triggerEvent = "click";
@@ -361,11 +489,15 @@ void CompileElement(CompilerCtx& ctx,
                     ui::uix::Attr cls;
                     cls.kind = ui::uix::AttrKind::Static;
                     cls.name = "class";
-                    cls.rawValue = "menuitem-row";
+                    cls.rawValue = cm->rowClass.empty()
+                        ? "menuitem-row"
+                        : "menuitem-row " + cm->rowClass;
                     wrapper->attrs.push_back(cls);
                     /* 默认 layout (flex-row / gap / padding / max-width) 走 lib
                      * 内置 .menuitem-row CSS (page_api.cpp 在 user CSS 前 inject),
-                     * 用户可在 <style> 写同选择器覆盖. */
+                     * 用户可在 <style> 写同选择器覆盖. row-class 额外给某棵
+                     * menu/submenu 的行 wrapper 追加 class, 让调用方可只改一棵
+                     * 菜单树的宽度而不影响其它菜单。 */
                 }
                 for (const auto& cptr2 : node.children) {
                     if (!cptr2) continue;
@@ -454,7 +586,9 @@ void CompileElement(CompilerCtx& ctx,
                     }
                     mi.contentRoot = std::move(wrapper);
 
-                    mi.submenu = compileMenu(c, 1, false /*not top*/);
+                    mi.submenu = compileMenu(c, 1, false /*not top*/,
+                                             cm->rowClass,
+                                             cm->shareWidthWithSubmenus);
                     if (mi.itemId == 0) mi.itemId = autoId++;
                     cm->items.push_back(std::move(mi));
                     continue;
@@ -550,7 +684,7 @@ void CompileElement(CompilerCtx& ctx,
             return cm;
         };
 
-        auto top = compileMenu(node, 1, true);
+        auto top = compileMenu(node, 1, true, std::string{}, true);
         if (top) ctx.out->menus.push_back(std::move(*top));
         return;  // 不创建 widget, 不递归 children
     }
@@ -590,7 +724,20 @@ void CompileElement(CompilerCtx& ctx,
         auto inlineDeclsCopy = inlineDecls;
         const ui::css::Stylesheet* sheetPtr = &ctx.sheet;
         Widget* rawW = w.get();
-        w->recomputeStyle = [sheetPtr, varsRef, inlineDeclsCopy, rawW](uint32_t bits) {
+        const bool basePositionAbsolute = w->positionAbsolute;
+        const float basePosLeft = w->posLeft;
+        const float basePosTop = w->posTop;
+        const float basePosRight = w->posRight;
+        const float basePosBottom = w->posBottom;
+        const std::string basePosLeftRaw = w->posLeftRaw;
+        const std::string basePosTopRaw = w->posTopRaw;
+        const std::string basePosRightRaw = w->posRightRaw;
+        const std::string basePosBottomRaw = w->posBottomRaw;
+        w->recomputeStyle = [sheetPtr, varsRef, inlineDeclsCopy, rawW,
+                             basePositionAbsolute,
+                             basePosLeft, basePosTop, basePosRight, basePosBottom,
+                             basePosLeftRaw, basePosTopRaw,
+                             basePosRightRaw, basePosBottomRaw](uint32_t bits) {
             // Build an ancestor chain from the widget tree.
             std::vector<ui::css::MatchNode> chain;
             for (Widget* p = rawW->Parent(); p; p = p->Parent()) {
@@ -625,6 +772,15 @@ void CompileElement(CompilerCtx& ctx,
             rawW->transformX = 0.0f;
             rawW->transformY = 0.0f;
             rawW->overflowHidden = false;
+            rawW->positionAbsolute = basePositionAbsolute;
+            rawW->posLeft = basePosLeft;
+            rawW->posTop = basePosTop;
+            rawW->posRight = basePosRight;
+            rawW->posBottom = basePosBottom;
+            rawW->posLeftRaw = basePosLeftRaw;
+            rawW->posTopRaw = basePosTopRaw;
+            rawW->posRightRaw = basePosRightRaw;
+            rawW->posBottomRaw = basePosBottomRaw;
             // Reset flex-container fields so a class toggle that removes a
             // gap/justify-content/align-items rule actually clears the value
             // (Apply* functions only set on s.Has(prop)). Container type
@@ -648,6 +804,7 @@ void CompileElement(CompilerCtx& ctx,
             rawW->expanding = false;
             rawW->flex = 1.0f;
             ApplyCommonStyle(*rawW, s);
+            rawW->ApplyDynamicPositionOverrides();
             ApplyFlexContainerStyle(*rawW, s);
             ApplyFlexItemStyle(*rawW, s);
             // SVG-specific reactive hook: re-run the CSS-to-shape pipeline

@@ -5,6 +5,7 @@
 #undef small
 #endif
 #include "../controls.h"
+#include "../gh_img_view.h"
 #include "../css/value.h"
 #include "svg_widget.h"
 
@@ -71,6 +72,10 @@ float ResolvePx(const std::string& v, float parentSize = 0.0f) {
         }
     }
     return 0.0f;
+}
+
+bool ParseBoolAttr(const std::string& s) {
+    return s == "true" || s == "1" || s == "yes";
 }
 
 // Parse a "top right bottom left" CSS shorthand (1-4 values). Returns 4 lengths in px.
@@ -574,6 +579,36 @@ void ApplyCommonStyle(Widget& w, const ui::css::ComputedStyle& s) {
         }
     }
 
+    auto parseBlur = [&](const std::string& raw) -> float {
+        if (raw.empty() || raw == "none") return 0.0f;
+        auto pv = ui::css::ParseValue(raw);
+        auto compToPx = [&](const ui::css::Component& c) -> float {
+            if (c.kind == ui::css::ComponentKind::Length) {
+                double px = 0.0;
+                if (ui::css::ResolveLengthPx(c.length, 0, 14, 14, 1920, 1080, px))
+                    return static_cast<float>(px);
+            } else if (c.kind == ui::css::ComponentKind::Number) {
+                return static_cast<float>(c.number);
+            }
+            return 0.0f;
+        };
+        for (const auto& c : pv.components) {
+            if (c.kind == ui::css::ComponentKind::Function && c.ident == "blur" &&
+                !c.args.empty()) {
+                return compToPx(c.args[0]);
+            }
+            float px = compToPx(c);
+            if (px > 0.0f) return px;
+        }
+        return 0.0f;
+    };
+    if (s.Has("backdrop-filter")) {
+        w.backdropBlur = parseBlur(s.Get("backdrop-filter"));
+    }
+    if (s.Has("backdrop-blur")) {
+        w.backdropBlur = parseBlur(s.Get("backdrop-blur"));
+    }
+
     // ---- Style overrides that map into Widget::CssOverride so built-in
     //      controls (TextInput, Slider, CheckBox, etc.) can read them in their
     //      OnDraw and break away from theme defaults.
@@ -962,6 +997,10 @@ WidgetPtr ConstructByTag(const std::string& tag, const std::string& text,
     if (tag == "ScrollView" || tag == "scroll-view") {
         return std::make_shared<ScrollViewWidget>();
     }
+    if (tag == "gh_img_view" || tag == "gh-img-view" ||
+        tag == "gh_img" || tag == "gh-img") {
+        return std::make_shared<GhImgViewWidget>();
+    }
     if (tag == "Toggle" || tag == "toggle") {
         auto tg = std::make_shared<ToggleWidget>(wtext);
         tg->cursor = ui::CursorKind::Pointer;
@@ -1232,6 +1271,9 @@ WidgetPtr BuildWidget(const ui::uix::Node& node, const ui::css::ComputedStyle& s
     for (const auto& a : node.attrs) {
         if (a.kind == ui::uix::AttrKind::Static) {
             if (a.name == "id") w->id = a.rawValue;
+            else if (a.name == "hitTransparent" || a.name == "hit-transparent") {
+                w->hitTransparent = ParseBoolAttr(a.rawValue);
+            }
             // For text-like widgets: value attribute for input, alt for img, etc. — skipped in v0
         }
     }

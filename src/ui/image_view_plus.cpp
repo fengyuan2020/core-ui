@@ -1,5 +1,6 @@
 #include "image_view_plus.h"
 #include "event.h"
+#include "resource_store.h"
 #include "theme.h"
 #include <algorithm>
 #include <unordered_map>
@@ -25,6 +26,9 @@ ImageViewPlusWidget::ImageViewPlusWidget() {
 
 ImageViewPlusWidget::~ImageViewPlusWidget() {
     StopAnimation();
+    if (checkerTileResourceKey_.IsValid()) {
+        GlobalResourceStore().Remove(checkerTileResourceKey_);
+    }
     if (loadingTimerId_) {
         KillTimer(nullptr, loadingTimerId_);
         g_loadingMap.erase(loadingTimerId_);
@@ -70,10 +74,6 @@ void ImageViewPlusWidget::SetSource(std::unique_ptr<IImageSource> src) {
         StartAnimation();
     }
     InvalidateAllWindows();
-}
-
-void ImageViewPlusWidget::SetBitmap(ComPtr<ID2D1Bitmap> bmp) {
-    SetSource(IImageSource::CreateFromBitmap(std::move(bmp)));
 }
 
 void ImageViewPlusWidget::SetPixels(const void* pixels, int w, int h, int stride, Renderer& r) {
@@ -150,7 +150,23 @@ D2D1_RECT_F ImageViewPlusWidget::ComputeDestRect() const {
 
 void ImageViewPlusWidget::EnsureCheckerboardTile(Renderer& r) {
     int curTheme = (int)theme::CurrentMode();
-    if (checkerTile_ && checkerTheme_ == curTheme) return;
+    if (checkerTileResourceKey_.IsValid() && checkerTheme_ == curTheme) {
+        if (!checkerTile_) {
+            auto res = GlobalResourceStore().Acquire(checkerTileResourceKey_);
+            if (res && res->bytes) {
+                checkerTile_ = r.CreateBitmapFromPixels(
+                    res->bytes->data(), res->width, res->height, res->stride);
+            }
+        }
+        return;
+    }
+
+    if (checkerTileResourceKey_.IsValid()) {
+        GlobalResourceStore().Remove(checkerTileResourceKey_);
+        checkerTileResourceKey_ = {};
+    }
+    checkerTile_.Reset();
+
     const int sz = 16;
     uint8_t pixels[sz * sz * 4];
     uint32_t c1, c2;
@@ -167,13 +183,28 @@ void ImageViewPlusWidget::EnsureCheckerboardTile(Renderer& r) {
             uint32_t c = ((ix + iy) % 2 == 0) ? c1 : c2;
             memcpy(pixels + (y * sz + x) * 4, &c, 4);
         }
-    checkerTile_ = r.CreateBitmapFromPixels(pixels, sz, sz, 0);
+
+    const uint64_t nextGeneration = checkerTileGeneration_ + 1;
+    ResourceKey resourceKey = GlobalResourceStore().AddImage(
+        ResourceKind::Bitmap, nextGeneration, sz, sz, sz * 4,
+        PixelFormat::BgraPremul, pixels, true);
+    if (!resourceKey.IsValid()) return;
+
+    checkerTileResourceKey_ = resourceKey;
+    checkerTileGeneration_ = nextGeneration;
+    auto res = GlobalResourceStore().Acquire(checkerTileResourceKey_);
+    if (res && res->bytes) {
+        checkerTile_ = r.CreateBitmapFromPixels(
+            res->bytes->data(), res->width, res->height, res->stride);
+    }
     checkerTheme_ = curTheme;
 }
 
 void ImageViewPlusWidget::DrawCheckerboard(Renderer& r, const D2D1_RECT_F& area) {
     EnsureCheckerboardTile(r);
-    if (checkerTile_) r.FillRectWithBitmap(checkerTile_.Get(), area);
+    if (checkerTile_ || checkerTileResourceKey_.IsValid()) {
+        r.FillRectWithImagePattern(checkerTileResourceKey_, checkerTile_.Get(), area);
+    }
 }
 
 // ========= OnDraw 主流程 =========

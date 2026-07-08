@@ -267,6 +267,7 @@ methods: {
 **视觉**：
 - `opacity`、`visibility`、`overflow`、`cursor`
 - `box-shadow: X Y blur spread color`（分层圆角矩形渲染）
+- `backdrop-filter: blur(Npx)` / `backdrop-blur: Npx`（取当前控件背后已绘制内容做实时圆角背景模糊；子控件不参与模糊）
 - `transform: translate(Xpx, Ypx) rotate(deg) scale(x, y)`
 - `transition: prop duration easing`（`opacity`、`background-color`、`width`、
   `height` 等可动画属性走 `Animations().Animate`）
@@ -1203,6 +1204,8 @@ export default {
 | `trigger="#elemId"` | 自动挂到该元素的 click / rclick |
 | `event="click" \| "rclick"` | trigger 事件类型，默认 `click` |
 | `text="..."` | 仅嵌套 `<menu>` 当 submenu 时用，作为父项的显示文字 |
+| `row-class="..."` | 追加到自动生成的 `.menuitem-row` wrapper；子菜单默认继承，用于只调整某棵菜单树的行宽/样式 |
+| `share-width="false"` | 关闭默认的父子菜单同宽传播，让子菜单按自身内容宽度收缩 |
 
 `<menu>` 在 `<template>` 单根元素约束下必须放在根 `<div>` 里。
 
@@ -1268,7 +1271,8 @@ Pipe 命令同名：`screenshot_menu <path>`。配合 `click <id>` / `rclick_at 
 
 | 维度 | Light | Dark | 备注 |
 |---|---|---|---|
-| 卡片背景 | `#FFFFFF` | `#2C2C2C` | `ui_menu_set_bg_color` 可以单菜单覆盖 |
+| 卡片背景 | `#FFFFFF` | `#2C2C2C` | `ui_menu_set_bg_color` 可以单菜单覆盖，alpha 控制半透明 tint |
+| Backdrop blur | 自动半径 | 自动半径 | `ui_menu_set_backdrop_blur(menu, radius)` 控制；`<0` 默认，`0` 关闭，`>0` 指定 DIP 半径 |
 | 文字色 | `theme.btnText`（#141414）| 白色 | per-item `style="color"` 优先 |
 | 快捷键文本 | `theme.foreground3` | 同 | 12 px |
 | 分隔线 | `theme.dividerSubtle` | 同 | 跨容器宽度 |
@@ -1294,6 +1298,7 @@ ui_menu_add_separator(m);
 ui_menu_add_submenu(m, L"最近", subMenu);
 ui_menu_set_enabled(m, 1, 0);             // 禁用某项
 ui_menu_set_bg_color(m, (UiColor){.r=...});  // 强制覆盖卡片背景
+ui_menu_set_backdrop_blur(m, 18.0f);      // 背景磨砂强度；0 关闭，负数恢复默认
 ui_menu_show(win, m, x, y);               // 弹出（DIP 坐标，相对窗口 client）
 ui_window_on_menu(win, on_click, ud);     // 全窗口共用回调，按 id 派发
 ui_menu_destroy(m);                        // 不再使用时

@@ -219,6 +219,7 @@ CSS 子集 + 选择器 + cascade。常用属性：
 | 颜色 | `background` / `background-color` / `color` |
 | 边框 | `border-radius` / `border` (还不全) |
 | 阴影 | `box-shadow` (含 inset) |
+| 背景模糊 | `backdrop-filter: blur(Npx)` / `backdrop-blur: Npx` |
 | 渐变 | `background: linear-gradient(...)` / `radial-gradient(...)` |
 | 文本 | `font-size` / `font-weight` / `text-align` |
 | 变换 | `transform: rotate() scale() translate()` |

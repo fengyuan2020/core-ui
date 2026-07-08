@@ -10,13 +10,55 @@
   #endif
 #endif
 
+#include "easing.h"
 #include "widget.h"
-#include "controls.h"
 #include <vector>
 #include <functional>
 #include <cstdint>
 
 namespace ui {
+
+struct UI_API AnimationSpec {
+    float durationMs = 200.0f;
+    EasingFunction easing = EasingFunction::EaseOutCubic;
+};
+
+class UI_API AnimatedFloat {
+public:
+    AnimatedFloat(float value = 0.0f,
+                  float durationMs = 200.0f,
+                  EasingFunction easing = EasingFunction::EaseOutCubic)
+        : current_(value),
+          target_(value),
+          start_(value),
+          spec_{durationMs, easing} {}
+
+    float Current() const { return current_; }
+    float Target() const { return target_; }
+    bool IsActive() const { return active_; }
+    bool Active() const { return IsActive(); }
+
+    void SetImmediate(float value);
+    void Retarget(float value);
+    void Retarget(float value, const AnimationSpec& spec);
+    void SetTarget(float value) { Retarget(value); }
+    void SetIdleTarget(float value);
+    float Sample(uint64_t now);
+    float SampleFrame(uint64_t now) { return Sample(now); }
+
+    void SetDuration(float durationMs) { spec_.durationMs = durationMs; }
+    float Duration() const { return spec_.durationMs; }
+    void SetEasing(EasingFunction easing) { spec_.easing = easing; }
+    EasingFunction Easing() const { return spec_.easing; }
+
+private:
+    float current_ = 0.0f;
+    float target_ = 0.0f;
+    float start_ = 0.0f;
+    AnimationSpec spec_{};
+    uint64_t startTick_ = 0;
+    bool active_ = false;
+};
 
 // Animatable property types
 enum class AnimProperty {
@@ -49,7 +91,9 @@ public:
 
     void Start();
     void Tick(uint64_t now);
+    float ValueAt(uint64_t now) const;
     void Apply(float t);
+    void ApplyValue(float value);
 };
 
 class UI_API AnimationManager {
@@ -70,12 +114,10 @@ public:
     void Cancel(Widget* target);
 
     bool HasActive() const;
+    size_t Count() const { return anims_.size(); }
 
 private:
     std::vector<Animation> anims_;
 };
-
-// Global animation manager
-UI_API AnimationManager& Animations();
 
 } // namespace ui

@@ -114,6 +114,17 @@ struct CompiledMenu {
     std::string  id;                    // <menu id="X"> ; 可空
     std::string  triggerSelector;       // "#btnId" → 该元素 click/rclick 自动 show menu
     std::string  triggerEvent;          // "click" (默认) | "rclick"
+    std::string  rowClass;              // extra class appended to generated .menuitem-row
+    bool         shareWidthWithSubmenus = true; // keep submenu tree at least parent width
+    bool         hasBgColor = false;
+    D2D1_COLOR_F bgColor = {};
+    std::string  boundBgColorExpr;      // :background / :background-color / :bg-color / :bgColor
+    bool         hasFrostedMaterial = false;
+    bool         frostedMaterial = false;
+    std::string  boundFrostedMaterialExpr; // :frosted-material / :material — 求 bool
+    bool         hasBackdropBlur = false;
+    float        backdropBlur = -1.0f;
+    std::string  boundBackdropBlurExpr; // :backdrop-blur / :backdrop-filter — 求 number 或 blur(...)
     std::vector<CompiledMenuItem> items;
     /* Phase E (L17 / build 73): 整个 menu / submenu 的 v-if / v-show. 求 false
      * 时 PopulateMenu 整体 skip 不 build items, ShowMenu 触发也是空菜单. */

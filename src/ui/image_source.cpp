@@ -6,7 +6,6 @@ namespace ui {
 
 // 各派生类的外部构造函数（在对应 cpp 实现）
 std::unique_ptr<IImageSource> CreateBitmapSourceFromFile(const std::wstring& path, Renderer& r);
-std::unique_ptr<IImageSource> CreateBitmapSourceFromBitmap(ComPtr<ID2D1Bitmap> bmp);
 std::unique_ptr<IImageSource> CreateBitmapSourceFromPixels(const void* px, int w, int h, int stride, Renderer& r);
 
 std::unique_ptr<IImageSource> CreateGifSourceFromFile(const std::wstring& path, Renderer& r);
@@ -39,11 +38,6 @@ IImageSource::CreateFromFile(const std::wstring& path, Renderer& r) {
 
     // 其它：静态位图（WIC 支持的一切）
     return CreateBitmapSourceFromFile(path, r);
-}
-
-std::unique_ptr<IImageSource>
-IImageSource::CreateFromBitmap(ComPtr<ID2D1Bitmap> bmp) {
-    return CreateBitmapSourceFromBitmap(std::move(bmp));
 }
 
 std::unique_ptr<IImageSource>

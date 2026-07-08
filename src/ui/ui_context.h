@@ -18,6 +18,7 @@
 #include <memory>
 #include <cstdint>
 
+#include "animation_host.h"
 #include "handle_table.h"
 #include "context_menu.h"
 
@@ -78,6 +79,9 @@ public:
     // an animating state outside an event handler — without this, the timer
     // never starts and the animation flag is set but nobody ticks it.
     void UpdateAnimTimers();
+    void RegisterAnimatingWidget(
+        class Widget* w,
+        AnimationInvalidation invalidation = AnimationInvalidation::Paint);
     bool HasWindows() const { return !windows_.empty(); }
 
     // Called by Widget destructor so windows can null out any cached

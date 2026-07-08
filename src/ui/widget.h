@@ -123,6 +123,17 @@ public:
     // Resolved at layout time (parent rect known); empty string falls back to
     // the eager pos*Left/etc above. Lets `top: calc(50% - 20px)` work.
     std::string posLeftRaw, posTopRaw, posRightRaw, posBottomRaw;
+    // Reactive absolute-position overrides from .uix bindings such as
+    // `:left="x"`. They are re-applied after style recomputation so hover /
+    // class changes do not reset script-driven popover placement back to the
+    // static CSS baseline.
+    bool dynamicPosLeftSet = false, dynamicPosTopSet = false;
+    bool dynamicPosRightSet = false, dynamicPosBottomSet = false;
+    float dynamicPosLeft = -1, dynamicPosTop = -1;
+    float dynamicPosRight = -1, dynamicPosBottom = -1;
+    std::string dynamicPosLeftRaw, dynamicPosTopRaw;
+    std::string dynamicPosRightRaw, dynamicPosBottomRaw;
+    void ApplyDynamicPositionOverrides();
 
     // ---- Padding (inner space) ----
     float padL = 0, padT = 0, padR = 0, padB = 0;
@@ -194,6 +205,7 @@ public:
     // ---- Background ----
     D2D1_COLOR_F bgColor = {0, 0, 0, 0};
     std::function<D2D1_COLOR_F()> bgColorFn;  // dynamic color (e.g. theme-aware)
+    float backdropBlur = 0.0f;                 // CSS backdrop-filter: blur(...)
 
     // CSS gradient background. A single CSS rule may produce multiple layers
     // (comma-separated linear-gradient(...), linear-gradient(...), ...). Each

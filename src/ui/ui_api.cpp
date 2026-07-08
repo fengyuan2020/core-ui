@@ -4,6 +4,8 @@
  * Every extern "C" function: look up handle → cast → call C++ method.
  */
 #include "msgbox.h"
+#include "draw_api_context.h"
+#include "display_list.h"
 #include "ui_context.h"
 #include "ui_window.h"
 #include "ui.h"        // pulls in all widget/control/builder headers
@@ -15,6 +17,7 @@
 #include "../../include/ui_core.h"
 
 #include <windows.h>
+#include <atomic>
 #include <string>
 
 // ---- Conversion helpers ----
@@ -150,7 +153,7 @@ UI_API UiWindow ui_window_create(const UiWindowConfig* config) {
     }
 
     uint64_t id = Ctx().RegisterWindow(std::move(win));
-    Ctx().GetWindow(id)->windowId = id;
+    Ctx().GetWindow(id)->RegisterRenderWindow(id);
     return id;
 }
 
@@ -166,7 +169,12 @@ UI_API void ui_window_show(UiWindow win) {
 
 UI_API void ui_window_show_immediate(UiWindow win) {
     auto* w = Win(win);
-    if (w) w->ShowImmediate();
+    if (w) w->ShowImmediate(true);
+}
+
+UI_API void ui_window_show_immediate_no_activate(UiWindow win) {
+    auto* w = Win(win);
+    if (w) w->ShowImmediate(false);
 }
 
 UI_API void ui_window_prepare_rt(UiWindow win) {
@@ -191,9 +199,24 @@ UI_API void ui_window_set_title(UiWindow win, const wchar_t* title) {
     if (w && title) w->SetTitle(title);
 }
 
+UI_API void ui_window_set_resizable(UiWindow win, int resizable) {
+    auto* w = Win(win);
+    if (w) w->SetResizable(resizable != 0);
+}
+
 UI_API void ui_window_invalidate(UiWindow win) {
     auto* w = Win(win);
     if (w) w->Invalidate();
+}
+
+UI_API void ui_window_begin_canvas_visual_transaction(UiWindow win) {
+    auto* w = Win(win);
+    if (w) w->BeginCanvasVisualTransaction();
+}
+
+UI_API void ui_window_end_canvas_visual_transaction(UiWindow win) {
+    auto* w = Win(win);
+    if (w) w->EndCanvasVisualTransaction();
 }
 
 UI_API void ui_window_focus_widget(UiWindow win, UiWidget widget) {
@@ -226,6 +249,16 @@ UI_API void ui_window_on_close(UiWindow win, UiWindowCloseCallback cb, void* use
     if (!cb) { w->onClose = nullptr; return; }
     uint64_t id = win;
     w->onClose = [cb, userdata, id]() { cb(id, userdata); };
+}
+
+UI_API void ui_window_on_close_request(UiWindow win, UiWindowCloseRequestCallback cb, void* userdata) {
+    auto* w = Win(win);
+    if (!w) return;
+    if (!cb) { w->onCloseRequest = nullptr; return; }
+    uint64_t id = win;
+    w->onCloseRequest = [cb, userdata, id]() {
+        return cb(id, userdata) != 0;
+    };
 }
 
 UI_API void ui_window_on_resize(UiWindow win, UiWindowResizeCallback cb, void* userdata) {
@@ -287,6 +320,16 @@ UI_API void ui_menu_set_bg_color(UiMenu menu, UiColor color) {
     if (m) m->SetBgColor({color.r, color.g, color.b, color.a});
 }
 
+UI_API void ui_menu_set_frosted_material(UiMenu menu, int enabled) {
+    auto m = Ctx().GetMenu(menu);
+    if (m) m->SetFrostedMaterial(enabled != 0);
+}
+
+UI_API void ui_menu_set_backdrop_blur(UiMenu menu, float radius) {
+    auto m = Ctx().GetMenu(menu);
+    if (m) m->SetBackdropBlur(radius);
+}
+
 UI_API void ui_menu_set_corner_radius(UiMenu menu, float radius) {
     auto m = Ctx().GetMenu(menu);
     if (m) m->SetCornerRadius(radius);
@@ -340,6 +383,21 @@ UI_API void ui_window_on_right_click(UiWindow win, UiRightClickCallback cb, void
     if (!cb) { w->onRightClick = nullptr; return; }
     uint64_t id = win;
     w->onRightClick = [cb, userdata, id](float x, float y) { cb(id, x, y, userdata); };
+}
+
+UI_API void ui_window_on_titlebar_drag(UiWindow win, UiTitleBarDragCallback cb, void* userdata) {
+    auto* w = Win(win);
+    if (!w) return;
+    if (!cb) { w->onTitleBarDrag = nullptr; return; }
+    uint64_t id = win;
+    w->onTitleBarDrag = [cb, userdata, id]() { cb(id, userdata); };
+}
+
+UI_API void ui_window_set_titlebar_drag_intercept(UiWindow win, int on) {
+    auto* w = Win(win);
+    if (!w) return;
+    w->titlebarDragIntercept_ = (on != 0);
+    if (!on) w->tbDragTracking_ = false;
 }
 
 // ================================================================
@@ -538,68 +596,23 @@ UI_API void ui_image_set_pixels(UiWidget w, UiWindow win,
 UI_API void ui_image_clear(UiWidget w) {
     auto* iv = As<ui::ImageViewWidget>(w);
     if (!iv) return;
-    iv->SetBitmap(nullptr);
-    if (iv->IsTiled()) iv->ClearTiles();
+    iv->ClearImage();
 }
 
-/* 从 ImageView 的当前 bitmap 读回像素到 CPU 内存。
+/* 从 ImageView 的 CPU backing 读回像素到 CPU 内存。
  * 返回 1 成功（*out_pixels 由 malloc 分配，调用方用 ui_image_free_pixels 释放）。
- * tile 模式 / 无 bitmap / 回读失败时返回 0。
+ * tile 模式 / 无图 / 回读失败时返回 0。
  * 像素格式：BGRA (premultiplied alpha)，stride = w*4。*/
 UI_API int ui_image_get_pixels(UiWidget w, UiWindow win,
                                 void** out_pixels, int* out_w, int* out_h) {
     if (out_pixels) *out_pixels = nullptr;
     if (out_w) *out_w = 0;
     if (out_h) *out_h = 0;
+    (void)win;
 
     auto* iv = As<ui::ImageViewWidget>(w);
-    auto* wn = Win(win);
-    if (!iv || !wn || !out_pixels || !out_w || !out_h) return 0;
-    if (iv->IsTiled()) return 0;
-
-    ID2D1Bitmap* src = iv->GetBitmap();
-    if (!src) return 0;
-
-    ID2D1DeviceContext* ctx = wn->GetRenderer().RT();
-    if (!ctx) return 0;
-
-    auto pxSz = src->GetPixelSize();
-    int w2 = (int)pxSz.width, h2 = (int)pxSz.height;
-    if (w2 <= 0 || h2 <= 0) return 0;
-
-    /* 创建 CPU_READ 中转 bitmap */
-    D2D1_BITMAP_PROPERTIES1 cpuProps = {};
-    cpuProps.pixelFormat = D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED);
-    cpuProps.bitmapOptions = D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
-    ComPtr<ID2D1Bitmap1> cpuBmp;
-    HRESULT hr = ctx->CreateBitmap(D2D1::SizeU(w2, h2), nullptr, 0, cpuProps, &cpuBmp);
-    if (FAILED(hr) || !cpuBmp) return 0;
-
-    D2D1_POINT_2U pt = {0, 0};
-    D2D1_RECT_U  rc = {0, 0, (UINT32)w2, (UINT32)h2};
-    hr = cpuBmp->CopyFromBitmap(&pt, src, &rc);
-    if (FAILED(hr)) return 0;
-
-    D2D1_MAPPED_RECT mapped;
-    hr = cpuBmp->Map(D2D1_MAP_OPTIONS_READ, &mapped);
-    if (FAILED(hr)) return 0;
-
-    size_t bytes = (size_t)w2 * (size_t)h2 * 4;
-    void* buf = malloc(bytes);
-    if (!buf) { cpuBmp->Unmap(); return 0; }
-
-    /* 逐行拷贝：源 stride 可能 != w*4 */
-    const BYTE* srcP = mapped.bits;
-    BYTE* dstP = (BYTE*)buf;
-    for (int y = 0; y < h2; ++y) {
-        memcpy(dstP + (size_t)y * w2 * 4, srcP + (size_t)y * mapped.pitch, (size_t)w2 * 4);
-    }
-    cpuBmp->Unmap();
-
-    *out_pixels = buf;
-    *out_w = w2;
-    *out_h = h2;
-    return 1;
+    if (!iv) return 0;
+    return iv->CopyPixels(out_pixels, out_w, out_h) ? 1 : 0;
 }
 
 UI_API void ui_image_free_pixels(void* pixels) {
@@ -741,10 +754,7 @@ UI_API void ui_image_set_tile_preview(UiWidget w, UiWindow win,
                                        const void* pixels, int width, int height, int stride) {
     auto* iv = As<ui::ImageViewWidget>(w);
     auto* wn = Win(win);
-    if (iv && wn) {
-        auto bmp = wn->GetRenderer().CreateBitmapFromPixels(pixels, width, height, stride);
-        iv->SetTilePreview(bmp, width, height);
-    }
+    if (iv && wn) iv->SetTilePreview(pixels, width, height, stride, wn->GetRenderer());
 }
 UI_API void ui_image_clear_tiles(UiWidget w) {
     auto* iv = As<ui::ImageViewWidget>(w);
@@ -1069,6 +1079,16 @@ UI_API void ui_gh_img_view_end_tile_batch(UiWidget w) {
     if (gv) gv->EndTileBatch();
 }
 
+UI_API void ui_gh_img_view_begin_view_update(UiWidget w) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (gv) gv->BeginViewUpdate();
+}
+
+UI_API void ui_gh_img_view_end_view_update(UiWidget w) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (gv) gv->EndViewUpdate();
+}
+
 UI_API void ui_gh_img_view_clear(UiWidget w) {
     auto* gv = As<ui::GhImgViewWidget>(w);
     if (gv) gv->Clear();
@@ -1305,6 +1325,11 @@ UI_API void ui_icon_button_set_ghost(UiWidget w, int ghost) {
 UI_API void ui_icon_button_set_icon_color(UiWidget w, UiColor color) {
     auto* ib = As<ui::IconButtonWidget>(w);
     if (ib) ib->SetIconColor(ToD2D(color));
+}
+
+UI_API void ui_icon_button_set_icon_color_role(UiWidget w, UiIconColorRole role) {
+    auto* ib = As<ui::IconButtonWidget>(w);
+    if (ib) ib->SetIconColorRole(static_cast<int>(role));
 }
 
 UI_API void ui_icon_button_set_icon_padding(UiWidget w, float padding) {
@@ -2052,63 +2077,151 @@ UI_API void ui_custom_set_focusable(UiWidget w, int focusable) {
 // Drawing API (used inside UiCustomDrawCallback)
 // ================================================================
 
-static ui::Renderer* R(UiDrawCtx ctx) { return (ui::Renderer*)ctx; }
+static ui::DrawApiContext* D(UiDrawCtx ctx) {
+    auto* d = static_cast<ui::DrawApiContext*>(ctx);
+    return (d && d->magic == ui::DrawApiContext::kMagic) ? d : nullptr;
+}
+
+static ui::Renderer* R(UiDrawCtx ctx) {
+    auto* d = D(ctx);
+    return d ? d->renderer : nullptr;
+}
+
+static ui::DisplayListRecorder* Rec(UiDrawCtx ctx) {
+    auto* d = D(ctx);
+    return d ? d->recorder : nullptr;
+}
+
+static uint64_t NextDrawBitmapGeneration() {
+    static std::atomic<uint64_t> next{1};
+    return next.fetch_add(1, std::memory_order_relaxed);
+}
 
 UI_API void ui_draw_fill_rect(UiDrawCtx ctx, UiRect rect, UiColor color) {
-    if (auto* r = R(ctx)) r->FillRect(ToD2DRect(rect), ToD2D(color));
+    const auto d2dRect = ToD2DRect(rect);
+    const auto d2dColor = ToD2D(color);
+    if (auto* rec = Rec(ctx)) rec->FillRect(d2dRect, d2dColor);
+    if (auto* r = R(ctx)) r->FillRect(d2dRect, d2dColor);
 }
 
 UI_API void ui_draw_rect(UiDrawCtx ctx, UiRect rect, UiColor color, float width) {
-    if (auto* r = R(ctx)) r->DrawRect(ToD2DRect(rect), ToD2D(color), width);
+    const auto d2dRect = ToD2DRect(rect);
+    const auto d2dColor = ToD2D(color);
+    if (auto* rec = Rec(ctx)) rec->DrawRect(d2dRect, d2dColor, width);
+    if (auto* r = R(ctx)) r->DrawRect(d2dRect, d2dColor, width);
 }
 
 UI_API void ui_draw_fill_rounded_rect(UiDrawCtx ctx, UiRect rect, float rx, float ry, UiColor color) {
-    if (auto* r = R(ctx)) r->FillRoundedRect(ToD2DRect(rect), rx, ry, ToD2D(color));
+    const auto d2dRect = ToD2DRect(rect);
+    const auto d2dColor = ToD2D(color);
+    if (auto* rec = Rec(ctx)) rec->FillRoundedRect(d2dRect, rx, ry, d2dColor);
+    if (auto* r = R(ctx)) r->FillRoundedRect(d2dRect, rx, ry, d2dColor);
 }
 
 UI_API void ui_draw_rounded_rect(UiDrawCtx ctx, UiRect rect, float rx, float ry, UiColor color, float width) {
-    if (auto* r = R(ctx)) r->DrawRoundedRect(ToD2DRect(rect), rx, ry, ToD2D(color), width);
+    const auto d2dRect = ToD2DRect(rect);
+    const auto d2dColor = ToD2D(color);
+    if (auto* rec = Rec(ctx)) rec->DrawRoundedRect(d2dRect, rx, ry, d2dColor, width);
+    if (auto* r = R(ctx)) r->DrawRoundedRect(d2dRect, rx, ry, d2dColor, width);
 }
 
 UI_API void ui_draw_line(UiDrawCtx ctx, float x1, float y1, float x2, float y2, UiColor color, float width) {
-    if (auto* r = R(ctx)) r->DrawLine(x1, y1, x2, y2, ToD2D(color), width);
+    const auto d2dColor = ToD2D(color);
+    if (auto* rec = Rec(ctx)) {
+        rec->DrawLine({x1, y1}, {x2, y2}, d2dColor, width);
+    }
+    if (auto* r = R(ctx)) r->DrawLine(x1, y1, x2, y2, d2dColor, width);
 }
 
 UI_API void ui_draw_text(UiDrawCtx ctx, const wchar_t* text, UiRect rect, UiColor color, float fontSize) {
-    if (auto* r = R(ctx)) r->DrawText(text ? text : L"", ToD2DRect(rect), ToD2D(color), fontSize);
+    const wchar_t* safeText = text ? text : L"";
+    const auto d2dRect = ToD2DRect(rect);
+    const auto d2dColor = ToD2D(color);
+    if (auto* rec = Rec(ctx)) {
+        ui::TextStyle style;
+        style.color = d2dColor;
+        style.font_size = fontSize;
+        style.paragraph_alignment = static_cast<int>(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        rec->DrawText(safeText, d2dRect, style);
+    }
+    if (auto* r = R(ctx)) r->DrawText(safeText, d2dRect, d2dColor, fontSize);
 }
 
 UI_API void ui_draw_text_ex(UiDrawCtx ctx, const wchar_t* text, UiRect rect, UiColor color,
                              float fontSize, int align, int bold) {
+    const wchar_t* safeText = text ? text : L"";
+    const auto d2dRect = ToD2DRect(rect);
+    const auto d2dColor = ToD2D(color);
+    const auto weight = bold ? DWRITE_FONT_WEIGHT_BOLD : DWRITE_FONT_WEIGHT_NORMAL;
+    if (auto* rec = Rec(ctx)) {
+        ui::TextStyle style;
+        style.color = d2dColor;
+        style.font_size = fontSize;
+        style.alignment = align;
+        style.paragraph_alignment = static_cast<int>(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        style.weight = static_cast<int>(weight);
+        rec->DrawText(safeText, d2dRect, style);
+    }
     if (auto* r = R(ctx)) {
-        r->DrawText(text ? text : L"", ToD2DRect(rect), ToD2D(color), fontSize,
-                    (DWRITE_TEXT_ALIGNMENT)align,
-                    bold ? DWRITE_FONT_WEIGHT_BOLD : DWRITE_FONT_WEIGHT_NORMAL);
+        r->DrawText(safeText, d2dRect, d2dColor, fontSize,
+                    (DWRITE_TEXT_ALIGNMENT)align, weight);
     }
 }
 
 UI_API float ui_draw_measure_text(UiDrawCtx ctx, const wchar_t* text, float fontSize) {
+    if (!text) return 0;
+    if (ui::g_activeMeasureContext) {
+        return ui::g_activeMeasureContext->MeasureTextWidth(text, fontSize);
+    }
     auto* r = R(ctx);
-    if (!r || !text) return 0;
+    if (!r) return 0;
     return r->MeasureTextWidth(text, fontSize);
 }
 
 UI_API void ui_draw_bitmap(UiDrawCtx ctx, const uint8_t* pixels,
                              int width, int height, int stride, UiRect dest) {
-    auto* r = R(ctx);
-    if (!r || !pixels || width <= 0 || height <= 0) return;
+    auto* d = D(ctx);
+    auto* r = d ? d->renderer : nullptr;
+    auto* rec = d ? d->recorder : nullptr;
+    if ((!r && !rec) || !pixels || width <= 0 || height <= 0) return;
 
-    auto bitmap = r->CreateBitmapFromPixels(pixels, width, height, stride);
-    if (bitmap) {
-        r->DrawBitmap(bitmap.Get(), ToD2DRect(dest), 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+    ui::ResourceKey resourceKey = ui::GlobalResourceStore().AddImage(
+        ui::ResourceKind::Bitmap, NextDrawBitmapGeneration(), width, height, stride,
+        ui::PixelFormat::BgraPremul, pixels, true);
+    auto res = ui::GlobalResourceStore().Acquire(resourceKey);
+    if (!res || !res->bytes) return;
+
+    bool ownedByDisplayList = false;
+    const auto d2dDest = ToD2DRect(dest);
+    if (rec) {
+        rec->DrawImage({resourceKey, res->width, res->height, res->stride, res->format},
+                       d2dDest, ui::ImageSampling::Linear, 1.0f);
+        rec->OwnResource(resourceKey);
+        ownedByDisplayList = true;
+    }
+
+    if (r) {
+        auto bitmap = r->CreateBitmapFromPixels(res->bytes->data(), res->width, res->height, res->stride);
+        if (bitmap) {
+            if (!ownedByDisplayList) d->transientResources.push_back(resourceKey);
+            r->DrawBitmap(bitmap.Get(), d2dDest, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            return;
+        }
+    }
+
+    if (!ownedByDisplayList) {
+        ui::GlobalResourceStore().Remove(resourceKey);
     }
 }
 
 UI_API void ui_draw_push_clip(UiDrawCtx ctx, UiRect rect) {
-    if (auto* r = R(ctx)) r->PushClip(ToD2DRect(rect));
+    const auto d2dRect = ToD2DRect(rect);
+    if (auto* rec = Rec(ctx)) rec->PushClip(d2dRect);
+    if (auto* r = R(ctx)) r->PushClip(d2dRect);
 }
 
 UI_API void ui_draw_pop_clip(UiDrawCtx ctx) {
+    if (auto* rec = Rec(ctx)) rec->PopClip();
     if (auto* r = R(ctx)) r->PopClip();
 }
 

@@ -1,9 +1,14 @@
 #include "svg_style_inliner.h"
 
+#include "css/css_parser.h"
+#include "css/selector.h"
+
 #include <windows.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <deque>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -148,7 +153,9 @@ std::string ExtractStyleBlocks(const std::string& svg) {
     return css;
 }
 
-/* 解析 CSS 文本 → ".classname" 选择器 → properties 字符串. 不接受复杂选择器. */
+/* 解析 CSS 文本 → ".classname" / "*" 选择器 → properties 字符串.
+ * 不接受复杂选择器. "*" 用来覆盖 Matplotlib 的全局 stroke-linejoin/cap 规则,
+ * D2D SvgDocument 不会可靠应用 <style> 块, 需要提前内联。 */
 void ParseCssRules(const std::string& css,
                    std::unordered_map<std::string, std::string>& rules) {
     size_t i = 0;
@@ -207,8 +214,18 @@ void ParseCssRules(const std::string& css,
             size_t tail = ce;
             while (tail > cs && IsWs((unsigned char)css[tail - 1])) tail--;
 
-            // 只接受 ".classname" — 必须 '.' + 全部 IsClassNameChar
-            if (tail > cs + 1 && css[cs] == '.') {
+            if (tail == cs + 1 && css[cs] == '*') {
+                auto it = rules.find("*");
+                if (it == rules.end()) {
+                    rules.emplace("*", props);
+                } else {
+                    if (!it->second.empty() && it->second.back() != ';') {
+                        it->second += ';';
+                    }
+                    it->second += props;
+                }
+            } else if (tail > cs + 1 && css[cs] == '.') {
+                // 只接受 ".classname" — 必须 '.' + 全部 IsClassNameChar
                 bool ok = true;
                 for (size_t k = cs + 1; k < tail; k++) {
                     if (!IsClassNameChar((unsigned char)css[k])) { ok = false; break; }
@@ -233,6 +250,467 @@ void ParseCssRules(const std::string& css,
     }
 }
 
+bool IsInlineStyleTarget(const std::string& s, size_t tag_s, size_t tag_e) {
+    if (tag_s + 1 >= tag_e) return false;
+    char c = s[tag_s + 1];
+    if (c == '/' || c == '!' || c == '?') return false;
+    size_t ns = tag_s + 1;
+    size_t ne = ns;
+    while (ne < tag_e && !IsWs((unsigned char)s[ne]) && s[ne] != '/' && s[ne] != '>') {
+        ne++;
+    }
+    const size_t len = ne - ns;
+    return !(len == 5 && std::memcmp(s.data() + ns, "style", 5) == 0);
+}
+
+size_t AttrInsertPos(const std::string& s, size_t tag_s, size_t tag_e);
+bool TagElementName(const std::string& s, size_t tag_s, size_t tag_e,
+                    size_t& ns, size_t& ne, bool& closing);
+bool NameEq(const std::string& s, size_t ns, size_t ne, const char* name);
+bool IsSelfClosing(const std::string& s, size_t ne, size_t tag_e);
+
+std::string ToLowerAscii(std::string s) {
+    for (char& c : s) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return s;
+}
+
+bool IEqualsAscii(const std::string& a, const char* b) {
+    size_t i = 0;
+    for (; i < a.size() && b[i]; i++) {
+        char ca = static_cast<char>(std::tolower(static_cast<unsigned char>(a[i])));
+        char cb = static_cast<char>(std::tolower(static_cast<unsigned char>(b[i])));
+        if (ca != cb) return false;
+    }
+    return i == a.size() && b[i] == '\0';
+}
+
+bool StripImportantSuffix(std::string& value) {
+    std::string v = Trim(value);
+    size_t bang = v.rfind('!');
+    if (bang == std::string::npos) {
+        value = std::move(v);
+        return false;
+    }
+
+    std::string tail = Trim(v.substr(bang + 1));
+    if (!IEqualsAscii(tail, "important")) {
+        value = std::move(v);
+        return false;
+    }
+
+    value = Trim(v.substr(0, bang));
+    return true;
+}
+
+bool IsSvgInlineStyleProperty(const std::string& prop) {
+    if (prop.empty()) return false;
+    if (prop.size() >= 2 && prop[0] == '-' && prop[1] == '-') return false;
+
+    static const char* kProps[] = {
+        "alignment-baseline",
+        "background-color",
+        "baseline-shift",
+        "clip",
+        "clip-path",
+        "clip-rule",
+        "color",
+        "color-interpolation",
+        "color-interpolation-filters",
+        "direction",
+        "display",
+        "dominant-baseline",
+        "fill",
+        "fill-opacity",
+        "fill-rule",
+        "filter",
+        "flood-color",
+        "flood-opacity",
+        "font",
+        "font-family",
+        "font-size",
+        "font-size-adjust",
+        "font-stretch",
+        "font-style",
+        "font-variant",
+        "font-weight",
+        "glyph-orientation-horizontal",
+        "glyph-orientation-vertical",
+        "image-rendering",
+        "letter-spacing",
+        "lighting-color",
+        "marker",
+        "marker-end",
+        "marker-mid",
+        "marker-start",
+        "mask",
+        "opacity",
+        "overflow",
+        "paint-order",
+        "pointer-events",
+        "shape-rendering",
+        "stop-color",
+        "stop-opacity",
+        "stroke",
+        "stroke-dasharray",
+        "stroke-dashoffset",
+        "stroke-linecap",
+        "stroke-linejoin",
+        "stroke-miterlimit",
+        "stroke-opacity",
+        "stroke-width",
+        "text-anchor",
+        "text-decoration",
+        "text-rendering",
+        "transform",
+        "unicode-bidi",
+        "vector-effect",
+        "visibility",
+        "white-space",
+        "word-spacing",
+        "writing-mode",
+    };
+
+    for (const char* p : kProps) {
+        if (prop == p) return true;
+    }
+    return false;
+}
+
+bool IsSvgPresentationAttribute(const std::string& prop) {
+    if (prop.empty()) return false;
+
+    static const char* kAttrs[] = {
+        "alignment-baseline",
+        "baseline-shift",
+        "clip-path",
+        "clip-rule",
+        "color",
+        "color-interpolation",
+        "color-interpolation-filters",
+        "direction",
+        "display",
+        "dominant-baseline",
+        "fill",
+        "fill-opacity",
+        "fill-rule",
+        "filter",
+        "flood-color",
+        "flood-opacity",
+        "font-family",
+        "font-size",
+        "font-size-adjust",
+        "font-stretch",
+        "font-style",
+        "font-variant",
+        "font-weight",
+        "glyph-orientation-horizontal",
+        "glyph-orientation-vertical",
+        "image-rendering",
+        "letter-spacing",
+        "lighting-color",
+        "marker",
+        "marker-end",
+        "marker-mid",
+        "marker-start",
+        "mask",
+        "opacity",
+        "overflow",
+        "paint-order",
+        "pointer-events",
+        "shape-rendering",
+        "stop-color",
+        "stop-opacity",
+        "stroke",
+        "stroke-dasharray",
+        "stroke-dashoffset",
+        "stroke-linecap",
+        "stroke-linejoin",
+        "stroke-miterlimit",
+        "stroke-opacity",
+        "stroke-width",
+        "text-anchor",
+        "text-decoration",
+        "text-rendering",
+        "transform",
+        "unicode-bidi",
+        "vector-effect",
+        "visibility",
+        "word-spacing",
+        "writing-mode",
+    };
+
+    for (const char* p : kAttrs) {
+        if (prop == p) return true;
+    }
+    return false;
+}
+
+void ParseClassList(const std::string& value, std::vector<std::string>& out) {
+    size_t i = 0;
+    while (i < value.size()) {
+        while (i < value.size() && IsWs(static_cast<unsigned char>(value[i]))) i++;
+        size_t j = i;
+        while (j < value.size() && !IsWs(static_cast<unsigned char>(value[j]))) j++;
+        if (j > i) out.emplace_back(value.data() + i, j - i);
+        i = j;
+    }
+}
+
+void ParseTagAttributes(const std::string& s, size_t tag_start, size_t tag_end,
+                        ui::css::MatchNode& node) {
+    size_t i = tag_start + 1;
+    while (i < tag_end && !IsWs(static_cast<unsigned char>(s[i]))
+           && s[i] != '/' && s[i] != '>') {
+        i++;
+    }
+
+    while (i < tag_end) {
+        while (i < tag_end && IsWs(static_cast<unsigned char>(s[i]))) i++;
+        if (i >= tag_end) break;
+        if (s[i] == '/') { i++; continue; }
+
+        size_t an_s = i;
+        while (i < tag_end && s[i] != '=' && !IsWs(static_cast<unsigned char>(s[i]))
+               && s[i] != '/' && s[i] != '>') {
+            i++;
+        }
+        size_t an_e = i;
+        if (an_s == an_e) { i++; continue; }
+
+        while (i < tag_end && IsWs(static_cast<unsigned char>(s[i]))) i++;
+
+        std::string name(s.data() + an_s, an_e - an_s);
+        std::string value;
+        if (i < tag_end && s[i] == '=') {
+            i++;
+            while (i < tag_end && IsWs(static_cast<unsigned char>(s[i]))) i++;
+            if (i < tag_end) {
+                char qc = s[i];
+                if (qc == '"' || qc == '\'') {
+                    i++;
+                    size_t v_s = i;
+                    while (i < tag_end && s[i] != qc) i++;
+                    value.assign(s.data() + v_s, i - v_s);
+                    if (i < tag_end) i++;
+                } else {
+                    size_t v_s = i;
+                    while (i < tag_end && !IsWs(static_cast<unsigned char>(s[i]))
+                           && s[i] != '/' && s[i] != '>') {
+                        i++;
+                    }
+                    value.assign(s.data() + v_s, i - v_s);
+                }
+            }
+        }
+
+        node.attrs[name] = value;
+        if (name == "id") {
+            node.id = value;
+        } else if (name == "class") {
+            ParseClassList(value, node.classes);
+        }
+    }
+}
+
+struct SvgResolvedDecl {
+    std::string property;
+    std::string value;
+    bool important = false;
+    int specificity = 0;
+    int sourceOrder = 0;
+};
+
+struct SvgStyleResult {
+    std::vector<SvgResolvedDecl> decls;
+    std::unordered_map<std::string, size_t> index;
+};
+
+void ApplySvgDecl(SvgStyleResult& out, SvgResolvedDecl decl) {
+    auto it = out.index.find(decl.property);
+    if (it == out.index.end()) {
+        out.index.emplace(decl.property, out.decls.size());
+        out.decls.push_back(std::move(decl));
+        return;
+    }
+
+    SvgResolvedDecl& cur = out.decls[it->second];
+    const bool wins =
+        (decl.important != cur.important) ? decl.important :
+        (decl.specificity != cur.specificity) ? (decl.specificity > cur.specificity) :
+        (decl.sourceOrder >= cur.sourceOrder);
+    if (wins) cur = std::move(decl);
+}
+
+bool AddDeclaration(SvgStyleResult& out, const ui::css::Declaration& d,
+                    int specificity, int sourceOrder) {
+    std::string prop = ToLowerAscii(Trim(d.property));
+    if (!IsSvgInlineStyleProperty(prop)) return false;
+
+    std::string value = d.value;
+    bool important = StripImportantSuffix(value);
+    if (value.empty()) return false;
+
+    SvgResolvedDecl resolved;
+    resolved.property = std::move(prop);
+    resolved.value = std::move(value);
+    resolved.important = important;
+    resolved.specificity = specificity;
+    resolved.sourceOrder = sourceOrder;
+    ApplySvgDecl(out, std::move(resolved));
+    return true;
+}
+
+bool ComputeSvgStyleForNode(const ui::css::Stylesheet& sheet,
+                            const ui::css::MatchNode& node,
+                            const std::vector<ui::css::Declaration>& inlineDecls,
+                            SvgStyleResult& out) {
+    bool sawStylesheetDecl = false;
+    int order = 0;
+
+    for (const auto& rule : sheet.rules) {
+        int bestSpec = -1;
+        for (const auto& sel : rule.selectors) {
+            if (ui::css::Matches(sel, node)) {
+                bestSpec = std::max(bestSpec, ui::css::Specificity(sel));
+            }
+        }
+
+        for (const auto& d : rule.declarations) {
+            if (bestSpec >= 0) {
+                if (AddDeclaration(out, d, bestSpec, order)) {
+                    sawStylesheetDecl = true;
+                }
+            }
+            order++;
+        }
+    }
+
+    for (const auto& d : inlineDecls) {
+        AddDeclaration(out, d, 1000000, order++);
+    }
+
+    return sawStylesheetDecl;
+}
+
+std::string SerializeSvgStyle(const SvgStyleResult& style) {
+    std::string out;
+    for (const auto& d : style.decls) {
+        if (d.property.empty() || d.value.empty()) continue;
+        if (!out.empty()) out += ';';
+        out += d.property;
+        out += ':';
+        out += d.value;
+    }
+    return out;
+}
+
+std::string EscapeStyleAttr(const std::string& value, char quote) {
+    std::string out;
+    out.reserve(value.size());
+    for (char c : value) {
+        if (c == '<') {
+            out += "&lt;";
+        } else if (c == '"' && quote == '"') {
+            out += "&quot;";
+        } else if (c == '\'' && quote == '\'') {
+            out += "&apos;";
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+std::string EscapeXmlAttr(const std::string& value, char quote) {
+    std::string out;
+    out.reserve(value.size());
+    for (char c : value) {
+        if (c == '&') {
+            out += "&amp;";
+        } else if (c == '<') {
+            out += "&lt;";
+        } else if (c == '"' && quote == '"') {
+            out += "&quot;";
+        } else if (c == '\'' && quote == '\'') {
+            out += "&apos;";
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+void UpsertTagAttr(std::string& tag_xml, const std::string& name, const std::string& value) {
+    if (tag_xml.empty() || tag_xml.front() != '<') return;
+
+    const size_t tag_e = tag_xml.size() - 1;
+    size_t v_s = 0, v_e = 0;
+    if (FindAttr(tag_xml, 0, tag_e, name.c_str(), v_s, v_e)) {
+        char quote = '"';
+        if (v_s > 0 && (tag_xml[v_s - 1] == '"' || tag_xml[v_s - 1] == '\'')) {
+            quote = tag_xml[v_s - 1];
+            tag_xml.replace(v_s, v_e - v_s, EscapeXmlAttr(value, quote));
+        } else {
+            tag_xml.replace(v_s, v_e - v_s, "\"" + EscapeXmlAttr(value, '"') + "\"");
+        }
+        return;
+    }
+
+    size_t insert_at = AttrInsertPos(tag_xml, 0, tag_e);
+    std::string attr = " ";
+    attr += name;
+    attr += "=\"";
+    attr += EscapeXmlAttr(value, '"');
+    attr += '"';
+    tag_xml.insert(insert_at, attr);
+}
+
+std::string BuildStyledTag(const std::string& svg_xml, size_t tag_s, size_t tag_e,
+                           bool has_style, size_t sty_vs, size_t sty_ve,
+                           const std::string& style_text,
+                           const SvgStyleResult& style) {
+    std::string tag_xml(svg_xml, tag_s, tag_e - tag_s + 1);
+
+    if (has_style) {
+        char quote = '"';
+        if (sty_vs > tag_s && (svg_xml[sty_vs - 1] == '"' || svg_xml[sty_vs - 1] == '\'')) {
+            quote = svg_xml[sty_vs - 1];
+        }
+        tag_xml.replace(sty_vs - tag_s, sty_ve - sty_vs,
+                        EscapeStyleAttr(style_text, quote));
+    } else {
+        size_t insert_at = AttrInsertPos(svg_xml, tag_s, tag_e) - tag_s;
+        std::string attr = " style=\"";
+        attr += EscapeStyleAttr(style_text, '"');
+        attr += '"';
+        tag_xml.insert(insert_at, attr);
+    }
+
+    // D2D can let presentation attrs like fill="none" win over inline style.
+    // Mirror resolved CSS values into attrs so Mermaid rough paths stay filled.
+    for (const auto& d : style.decls) {
+        if (IsSvgPresentationAttribute(d.property)) {
+            UpsertTagAttr(tag_xml, d.property, d.value);
+        }
+    }
+    return tag_xml;
+}
+
+struct SvgStackFrame {
+    std::string tag;
+    ui::css::MatchNode node;
+};
+
+void PopSvgStack(std::deque<SvgStackFrame>& stack, const std::string& tag) {
+    while (!stack.empty()) {
+        bool same = stack.back().tag == tag;
+        stack.pop_back();
+        if (same) break;
+    }
+}
+
 }  // namespace
 
 std::string InlineSvgStyleClasses(const std::string& svg_xml) {
@@ -244,15 +722,17 @@ std::string InlineSvgStyleClasses(const std::string& svg_xml) {
     std::string css = ExtractStyleBlocks(svg_xml);
     if (css.empty()) return svg_xml;
 
-    std::unordered_map<std::string, std::string> rules;
-    ParseCssRules(css, rules);
-    if (rules.empty()) return svg_xml;
+    auto parsed = ui::css::ParseStylesheet(css);
+    if (parsed.stylesheet.rules.empty()) return svg_xml;
 
     std::string out;
     out.reserve(svg_xml.size() + svg_xml.size() / 8);  // ~12% 增长预算
 
     size_t i = 0;
     const size_t N = svg_xml.size();
+    bool saw_root = false;
+    std::deque<SvgStackFrame> stack;
+
     while (i < N) {
         if (svg_xml[i] != '<') {
             out += svg_xml[i++];
@@ -267,43 +747,37 @@ std::string InlineSvgStyleClasses(const std::string& svg_xml) {
             break;
         }
 
-        // 跳过特殊 markup: <!-- comment -->, <![CDATA[..]]>, <?xml..?>
-        // 这些里面的 '>' 已经被 FindTagEnd 错误识别? 不会 — FindTagEnd 只看
-        // 引号. comment 里没引号但有 '>'? 是的, `<!-- > -->` 会让 FindTagEnd
-        // 提前停在第一个 '>'. 但 comment 不可能含 class= 属性, 退一步说就算
-        // 误识 tag, FindAttr 找 class 也找不到. 不影响正确性, 只是多扫一次.
-        // 为简单先不特殊处理.
-
-        size_t cls_vs, cls_ve;
-        bool has_class = FindAttr(svg_xml, tag_s, tag_e, "class", cls_vs, cls_ve);
-        if (!has_class) {
+        size_t ns = 0, ne = 0;
+        bool closing = false;
+        if (!TagElementName(svg_xml, tag_s, tag_e, ns, ne, closing)) {
             out.append(svg_xml, tag_s, tag_e - tag_s + 1);
             i = tag_e + 1;
             continue;
         }
 
-        // 累积该元素所有 class 引用的 props (空格分隔)
-        std::string props_acc;
-        size_t cn = cls_vs;
-        while (cn < cls_ve) {
-            while (cn < cls_ve && IsWs((unsigned char)svg_xml[cn])) cn++;
-            size_t ce = cn;
-            while (ce < cls_ve && !IsWs((unsigned char)svg_xml[ce])) ce++;
-            if (ce > cn) {
-                std::string one(svg_xml.data() + cn, ce - cn);
-                auto it = rules.find(one);
-                if (it != rules.end()) {
-                    if (!props_acc.empty() && props_acc.back() != ';') {
-                        props_acc += ';';
-                    }
-                    props_acc += it->second;
-                }
-            }
-            cn = ce;
+        std::string tag(svg_xml.data() + ns, ne - ns);
+        if (closing) {
+            out.append(svg_xml, tag_s, tag_e - tag_s + 1);
+            PopSvgStack(stack, tag);
+            i = tag_e + 1;
+            continue;
         }
 
-        if (props_acc.empty()) {
+        ui::css::MatchNode node;
+        node.tag = tag;
+        node.parent = stack.empty() ? nullptr : &stack.back().node;
+        if (!saw_root) {
+            node.stateBits |= ui::css::state::Root;
+            saw_root = true;
+        }
+        ParseTagAttributes(svg_xml, tag_s, tag_e, node);
+
+        const bool inline_target = IsInlineStyleTarget(svg_xml, tag_s, tag_e);
+        const bool self_close = IsSelfClosing(svg_xml, ne, tag_e);
+
+        if (!inline_target) {
             out.append(svg_xml, tag_s, tag_e - tag_s + 1);
+            if (!self_close) stack.push_back(SvgStackFrame{std::move(tag), std::move(node)});
             i = tag_e + 1;
             continue;
         }
@@ -312,29 +786,28 @@ std::string InlineSvgStyleClasses(const std::string& svg_xml) {
         size_t sty_vs, sty_ve;
         bool has_style = FindAttr(svg_xml, tag_s, tag_e, "style", sty_vs, sty_ve);
 
+        std::vector<ui::css::Declaration> inline_decls;
         if (has_style) {
-            // 在 style 值开头插 stylesheet props + ';' (原 inline 在后, 优先级正确)
-            out.append(svg_xml, tag_s, sty_vs - tag_s);  // <tag ... style="
-            out += props_acc;
-            if (props_acc.back() != ';') out += ';';
-            out.append(svg_xml, sty_vs, tag_e - sty_vs + 1);  // 原值 + "..." + 后续 + >
-        } else {
-            // 没 style, 在 tag 闭合 (`/>` 或 `>`) 前插入 ` style="props"`
-            // 找闭合前的实际位置: 跳过 trailing whitespace 和 '/'
-            size_t insert_at = tag_e;  // 此处是 '>'
-            while (insert_at > tag_s + 1
-                   && IsWs((unsigned char)svg_xml[insert_at - 1])) insert_at--;
-            if (insert_at > tag_s + 1 && svg_xml[insert_at - 1] == '/') {
-                insert_at--;
-                while (insert_at > tag_s + 1
-                       && IsWs((unsigned char)svg_xml[insert_at - 1])) insert_at--;
-            }
-            out.append(svg_xml, tag_s, insert_at - tag_s);
-            out += " style=\"";
-            out += props_acc;
-            out += '"';
-            out.append(svg_xml, insert_at, tag_e - insert_at + 1);
+            inline_decls = ui::css::ParseInlineStyle(svg_xml.substr(sty_vs, sty_ve - sty_vs));
         }
+
+        SvgStyleResult style;
+        const bool has_stylesheet_style =
+            ComputeSvgStyleForNode(parsed.stylesheet, node, inline_decls, style);
+        std::string style_text = SerializeSvgStyle(style);
+
+        if (!has_stylesheet_style || style_text.empty()) {
+            out.append(svg_xml, tag_s, tag_e - tag_s + 1);
+            if (!self_close) stack.push_back(SvgStackFrame{std::move(tag), std::move(node)});
+            i = tag_e + 1;
+            continue;
+        }
+
+        out += BuildStyledTag(svg_xml, tag_s, tag_e,
+                              has_style, sty_vs, sty_ve,
+                              style_text, style);
+
+        if (!self_close) stack.push_back(SvgStackFrame{std::move(tag), std::move(node)});
         i = tag_e + 1;
     }
 

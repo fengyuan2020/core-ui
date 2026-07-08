@@ -1,9 +1,11 @@
 #pragma once
 #include "widget.h"
 #include "renderer.h"
+#include "render_handles.h"
 #include "theme.h"
 #include "context_menu.h"
 #include "ui_context.h"  // GetContext().InvalidateAllWindows() from inline setters
+#include "animation.h"
 #include <cstdint>
 #include <map>
 #include <utility>
@@ -11,21 +13,7 @@
 
 namespace ui {
 
-// ---- Easing Functions ----
-enum class EasingFunction {
-    Linear,
-    EaseInQuad,
-    EaseOutQuad,
-    EaseInOutQuad,
-    EaseInCubic,
-    EaseOutCubic,
-    EaseInOutCubic,
-    EaseInElastic,
-    EaseOutElastic,
-    EaseInBounce,
-    EaseOutBounce,
-    EaseOutBack
-};
+class MeasureContext;
 
 // ---- Label ----
 class UI_API LabelWidget : public Widget {
@@ -87,7 +75,7 @@ private:
     int selectionStart_ = -1;
     int selectionEnd_ = -1;
     bool dragging_ = false;
-    int CharIndexAtX(Renderer& r, float x) const;
+    int CharIndexAtX(MeasureContext& measure, float x) const;
 };
 
 // ---- Button ----
@@ -141,11 +129,7 @@ class UI_API CheckBoxWidget : public Widget {
 public:
     explicit CheckBoxWidget(const std::wstring& text) : text_(text) {
         focusable = true;
-        checkAnimProgress_ = 0.0f;
-        lastTick_ = 0;
         animating_ = false;
-        animDurationMs_ = 200.0f;
-        easingFunc_ = EasingFunction::EaseOutCubic;
     }
 
     bool Checked() const { return checked_; }
@@ -155,13 +139,13 @@ public:
     // Set value without animation. Used by PageState mount-phase dispatch
     // (Widget::PaintedOnce() == false) and any caller that explicitly wants
     // to skip the transition.
-    void SetCheckedImmediate(bool v) { checked_ = v; checkAnimProgress_ = checked_ ? 1.0f : 0.0f; animating_ = false; }
+    void SetCheckedImmediate(bool v) { checked_ = v; checkAnim_.SetImmediate(checked_ ? 1.0f : 0.0f); animating_ = false; }
 
-    void SetAnimationDuration(float durationMs) { animDurationMs_ = durationMs; }
-    float GetAnimationDuration() const { return animDurationMs_; }
+    void SetAnimationDuration(float durationMs) { checkAnim_.SetDuration(durationMs); }
+    float GetAnimationDuration() const { return checkAnim_.Duration(); }
 
-    void SetEasingFunction(EasingFunction func) { easingFunc_ = func; }
-    EasingFunction GetEasingFunction() const { return easingFunc_; }
+    void SetEasingFunction(EasingFunction func) { checkAnim_.SetEasing(func); }
+    EasingFunction GetEasingFunction() const { return checkAnim_.Easing(); }
 
     void UpdateAnimation();
 
@@ -173,11 +157,8 @@ public:
 private:
     std::wstring text_;
     bool checked_ = false;
-    float checkAnimProgress_ = 0.0f;
-    uint64_t lastTick_ = 0;
+    AnimatedFloat checkAnim_{0.0f, 200.0f, EasingFunction::EaseOutCubic};
     bool animating_ = false;
-    float animDurationMs_ = 200.0f;
-    EasingFunction easingFunc_ = EasingFunction::EaseOutCubic;
     float ContentRight_() const;
 
     friend class UiWindowImpl;
@@ -205,6 +186,7 @@ public:
     void SetValue(float v) { value_ = std::clamp(v, min_, max_); }
 
     void UpdateThumbAnimation();
+    bool ThumbAnimating() const { return thumbScale_.Active(); }
 
     void OnDraw(Renderer& r) override;
     bool OnMouseDown(const MouseEvent& e) override;
@@ -216,12 +198,11 @@ private:
     float min_, max_, value_;
     bool dragging_ = false;
     float ValueFromX(float x) const;
+    void RetargetThumbAnimation();
 
     // Thumb scale animation: smoothly transitions between rest/hover/press sizes
-    float thumbScaleCurrent_ = 0.86f;   // current animated scale
-    float thumbScaleTarget_  = 0.86f;   // target scale for current state
-    uint64_t thumbAnimLastTick_ = 0;
-    static constexpr float kThumbAnimSpeed = 8.0f;  // ~120ms for full transition
+    AnimatedFloat thumbScale_{0.86f, 120.0f, EasingFunction::EaseOutCubic};
+    float thumbScaleTarget_ = 0.86f;   // target scale for current state
 
     friend class UiWindowImpl;
 };
@@ -246,10 +227,11 @@ public:
     enum class Fit { Fill, Contain, Cover, None };
 
     ImageWidget() = default;
+    ~ImageWidget() override;
     explicit ImageWidget(const std::string& src) : src_(src) {}
 
     // HTML <img src="logo.png"> 解析时调，name 是 asset registry 里的 key
-    void SetSrc(const std::string& src) { src_ = src; bitmap_.Reset(); }
+    void SetSrc(const std::string& src);
     const std::string& Src() const { return src_; }
 
     void SetFit(Fit f) { fit_ = f; }
@@ -259,9 +241,13 @@ public:
     D2D1_SIZE_F SizeHint() const override;
 
 private:
+    void ClearImageResource();
+
     std::string src_;
     Fit fit_ = Fit::Contain;
     mutable ComPtr<ID2D1Bitmap> bitmap_;       // lazy-loaded on first draw
+    ResourceKey imageResourceKey_;
+    uint64_t imageGeneration_ = 0;
     mutable bool loadFailed_ = false;          // 防止每帧都重试解码
     mutable float intrinsicW_ = 0, intrinsicH_ = 0;
 };
@@ -300,13 +286,12 @@ private:
     float scrollX_ = 0;
     uint64_t caretBlinkStartTick_ = 0;
     bool dragging_ = false;
-    Renderer* cachedRenderer_ = nullptr;
 
-    int CharIndexFromX(float x) const;
+    int CharIndexFromX(MeasureContext& measure, float x) const;
     void DeleteSelection();
     bool HasSelection() const { return selectionStart_ >= 0 && selectionEnd_ >= 0 && selectionStart_ != selectionEnd_; }
     void ClearSelection() { selectionStart_ = selectionEnd_ = -1; }
-    void EnsureCursorVisible();
+    void EnsureCursorVisible(MeasureContext& measure);
     std::wstring GetSelectedText() const;
     void SetClipboardText(const std::wstring& text);
     std::wstring GetClipboardText();
@@ -359,7 +344,6 @@ private:
     float dragStartY_ = 0;
     float dragStartScroll_ = 0;
     bool wrap_ = true;            /* default: browser-like soft-wrap */
-    Renderer* cachedRenderer_ = nullptr;
     static constexpr float kScrollBarWidth = 4.0f;
     static constexpr float kPad = 8.0f;       /* inner padding around text */
 
@@ -383,7 +367,7 @@ private:
 
     /* Layout-driven geometry. All return DIP. Layout origin is at
      * (rect.left + kPad, rect.top + kPad - scrollY_). */
-    IDWriteTextLayout* EnsureLayout(Renderer& r, float fontSize) const;
+    IDWriteTextLayout* EnsureLayout(MeasureContext& measure, float fontSize) const;
     int  HitTestPosFromXY(float x, float y) const;       /* x/y in widget coords */
     bool CaretXYForPos(int pos, float& outX, float& outY, float& outH) const;
     int  PosUp(int pos) const;     /* arrow up — visual line above */
@@ -394,7 +378,7 @@ private:
     void DeleteSelection();
     bool HasSelection() const { return selectionStart_ >= 0 && selectionEnd_ >= 0 && selectionStart_ != selectionEnd_; }
     void ClearSelection() { selectionStart_ = selectionEnd_ = -1; }
-    void EnsureCursorVisible();
+    void EnsureCursorVisible(MeasureContext* measure = nullptr);
     std::wstring GetSelectedText() const;
     void SetClipboardText(const std::wstring& text);
     std::wstring GetClipboardText();
@@ -528,11 +512,7 @@ public:
     RadioButtonWidget(const std::wstring& text, const std::string& group)
         : text_(text), group_(group) {
         focusable = true;
-        selectAnimProgress_ = 0.0f;
-        lastTick_ = 0;
         animating_ = false;
-        animDurationMs_ = 200.0f;
-        easingFunc_ = EasingFunction::EaseOutCubic;
     }
 
     bool Selected() const { return selected_; }
@@ -540,14 +520,14 @@ public:
     void SetText(const std::wstring& t) { text_ = t; ui::RequestLayout(); }
     void SetSelected(bool v);
     // Set value without animation. Used by PageState mount-phase dispatch.
-    void SetSelectedImmediate(bool v) { selected_ = v; selectAnimProgress_ = selected_ ? 1.0f : 0.0f; animating_ = false; }
+    void SetSelectedImmediate(bool v) { selected_ = v; selectAnim_.SetImmediate(selected_ ? 1.0f : 0.0f); animating_ = false; }
     const std::string& Group() const { return group_; }
 
-    void SetAnimationDuration(float durationMs) { animDurationMs_ = durationMs; }
-    float GetAnimationDuration() const { return animDurationMs_; }
+    void SetAnimationDuration(float durationMs) { selectAnim_.SetDuration(durationMs); }
+    float GetAnimationDuration() const { return selectAnim_.Duration(); }
 
-    void SetEasingFunction(EasingFunction func) { easingFunc_ = func; }
-    EasingFunction GetEasingFunction() const { return easingFunc_; }
+    void SetEasingFunction(EasingFunction func) { selectAnim_.SetEasing(func); }
+    EasingFunction GetEasingFunction() const { return selectAnim_.Easing(); }
 
     void UpdateAnimation();
 
@@ -560,11 +540,8 @@ private:
     std::wstring text_;
     std::string group_;
     bool selected_ = false;
-    float selectAnimProgress_ = 0.0f;
-    uint64_t lastTick_ = 0;
+    AnimatedFloat selectAnim_{0.0f, 200.0f, EasingFunction::EaseOutCubic};
     bool animating_ = false;
-    float animDurationMs_ = 200.0f;
-    EasingFunction easingFunc_ = EasingFunction::EaseOutCubic;
 
     void DeselectSiblings();
     float ContentRight_() const;
@@ -577,11 +554,7 @@ class UI_API ToggleWidget : public Widget {
 public:
     explicit ToggleWidget(const std::wstring& text = L"") : text_(text) {
         focusable = true;
-        animProgress_ = 0.0f;
-        lastTick_ = 0;
         animating_ = false;
-        animDurationMs_ = 200.0f;
-        easingFunc_ = EasingFunction::EaseOutCubic;
         UpdateCachedColors();
     }
 
@@ -590,18 +563,16 @@ public:
     void SetText(const std::wstring& t) { text_ = t; ui::RequestLayout(); }
     void SetOn(bool v);
     // Set value without animation. Used by PageState mount-phase dispatch.
-    void SetOnImmediate(bool v) { on_ = v; animProgress_ = on_ ? 1.0f : 0.0f; animating_ = false; }
+    void SetOnImmediate(bool v) { on_ = v; anim_.SetImmediate(on_ ? 1.0f : 0.0f); animating_ = false; }
 
-    void SetAnimationDuration(float durationMs) { animDurationMs_ = durationMs; }
-    float GetAnimationDuration() const { return animDurationMs_; }
+    void SetAnimationDuration(float durationMs) { anim_.SetDuration(durationMs); }
+    float GetAnimationDuration() const { return anim_.Duration(); }
 
-    void SetEasingFunction(EasingFunction func) { easingFunc_ = func; }
-    EasingFunction GetEasingFunction() const { return easingFunc_; }
+    void SetEasingFunction(EasingFunction func) { anim_.SetEasing(func); }
+    EasingFunction GetEasingFunction() const { return anim_.Easing(); }
 
     void UpdateAnimation();
     void UpdateCachedColors();
-
-    static float ApplyEasing(EasingFunction func, float t);
 
     void OnDraw(Renderer& r) override;
     bool OnMouseUp(const MouseEvent& e) override;
@@ -611,11 +582,8 @@ public:
 private:
     std::wstring text_;
     bool on_ = false;
-    float animProgress_ = 0.0f;
-    uint64_t lastTick_ = 0;
+    AnimatedFloat anim_{0.0f, 200.0f, EasingFunction::EaseOutCubic};
     bool animating_ = false;
-    float animDurationMs_ = 200.0f;
-    EasingFunction easingFunc_ = EasingFunction::EaseOutCubic;
 
     D2D1_COLOR_F CachedTrackColorOff_;
     D2D1_COLOR_F CachedTrackColorOn_;
@@ -630,26 +598,26 @@ private:
 class UI_API ProgressBarWidget : public Widget {
 public:
     ProgressBarWidget(float min, float max, float value)
-        : min_(min), max_(max), value_(value), targetValue_(value) {
-        animProgress_ = value;
-        lastTick_ = 0;
+        : min_(min),
+          max_(max),
+          value_(value),
+          targetValue_(value),
+          valueAnim_(value, 300.0f, EasingFunction::EaseOutCubic) {
         animating_ = false;
-        animDurationMs_ = 300.0f;
-        easingFunc_ = EasingFunction::EaseOutCubic;
     }
 
     float Value() const { return value_; }
     void SetValue(float v, bool animate = true);
     // Set value without animation. Used by PageState mount-phase dispatch.
-    void SetValueImmediate(float v) { targetValue_ = std::clamp(v, min_, max_); value_ = targetValue_; animProgress_ = targetValue_; animating_ = false; }
+    void SetValueImmediate(float v) { targetValue_ = std::clamp(v, min_, max_); value_ = targetValue_; valueAnim_.SetImmediate(targetValue_); animating_ = false; }
     void SetIndeterminate(bool v) { indeterminate_ = v; }
     bool IsIndeterminate() const { return indeterminate_; }
 
-    void SetAnimationDuration(float durationMs) { animDurationMs_ = durationMs; }
-    float GetAnimationDuration() const { return animDurationMs_; }
+    void SetAnimationDuration(float durationMs) { valueAnim_.SetDuration(durationMs); }
+    float GetAnimationDuration() const { return valueAnim_.Duration(); }
 
-    void SetEasingFunction(EasingFunction func) { easingFunc_ = func; }
-    EasingFunction GetEasingFunction() const { return easingFunc_; }
+    void SetEasingFunction(EasingFunction func) { valueAnim_.SetEasing(func); }
+    EasingFunction GetEasingFunction() const { return valueAnim_.Easing(); }
 
     void UpdateAnimation();
 
@@ -658,11 +626,8 @@ public:
 
 private:
     float min_, max_, value_, targetValue_;
-    float animProgress_ = 0.0f;
-    uint64_t lastTick_ = 0;
+    AnimatedFloat valueAnim_;
     bool animating_ = false;
-    float animDurationMs_ = 300.0f;
-    EasingFunction easingFunc_ = EasingFunction::EaseOutCubic;
     bool indeterminate_ = false;
 
     friend class UiWindowImpl;
@@ -739,17 +704,17 @@ public:
 
     // Image source
     void LoadFromFile(const std::wstring& path, Renderer& r);
-    void SetBitmap(ComPtr<ID2D1Bitmap> bmp);
+    void ClearImage();
     void SetBitmapFromPixels(const void* pixels, int w, int h, int stride, Renderer& r);
     void CreateEmpty(int w, int h, Renderer& r);
     void UpdateRegion(int x, int y, const void* pixels, int w, int h, int stride);
-    bool HasImage() const { return bitmap_ != nullptr || tiledMode_; }
-    ID2D1Bitmap* GetBitmap() const { return bitmap_.Get(); }
+    bool HasImage() const { return bitmap_ != nullptr || bitmapResourceKey_.IsValid() || tiledMode_; }
+    bool CopyPixels(void** outPixels, int* outW, int* outH) const;
 
-    // Tiled rendering mode (each tile = independent GPU texture)
+    // Tiled rendering mode (CPU resource + current renderer texture)
     void SetTiled(int fullWidth, int fullHeight, int tileSize, Renderer& r);
     void SetTile(int tileX, int tileY, const void* pixels, int w, int h, int stride, Renderer& r);
-    void SetTilePreview(ComPtr<ID2D1Bitmap> bmp, int w, int h);
+    void SetTilePreview(const void* pixels, int w, int h, int stride, Renderer& r);
     void EvictTile(int tileX, int tileY);   // 删单个 tile（LRU 淘汰用）
     void ClearTiles();
     bool IsTiled() const { return tiledMode_; }
@@ -829,6 +794,8 @@ public:
 
 private:
     ComPtr<ID2D1Bitmap> bitmap_;
+    ResourceKey bitmapResourceKey_;
+    uint64_t bitmapGeneration_ = 0;
     int imgW_ = 0, imgH_ = 0;
     int rotation_ = 0;  // 0, 90, 180, 270
     float zoom_ = 1.0f;
@@ -856,6 +823,9 @@ private:
     CropHandle HitTestCropHandle(float sx, float sy) const;
     void DrawCropOverlay(Renderer& r);
     void ClampCrop();
+    void ClearBitmapResource();
+    bool SetBitmapResourceFromPixels(const void* pixels, int w, int h, int stride,
+                                     Renderer& r, bool resetAnimation);
 
     void DrawCheckerboard(Renderer& r, const D2D1_RECT_F& area);
     void EnsureCheckerboardTile(Renderer& r);
@@ -863,6 +833,8 @@ private:
     void ConstrainPan();
 
     ComPtr<ID2D1Bitmap> checkerTile_;
+    ResourceKey checkerTileResourceKey_;
+    uint64_t checkerTileGeneration_ = 0;
     int checkerTheme_ = -1;  /* 缓存主题，切换时重建 */
 
     // Loading spinner
@@ -874,6 +846,7 @@ private:
     // Tiled rendering mode
     struct TileBitmap {
         ComPtr<ID2D1Bitmap> bmp;
+        ResourceKey resourceKey;
         int w = 0, h = 0;
     };
     bool tiledMode_ = false;
@@ -881,6 +854,8 @@ private:
     int tiledTileSize_ = 512;
     std::map<std::pair<int,int>, TileBitmap> tiles_;
     ComPtr<ID2D1Bitmap> tiledPreview_;  /* 全图预览，兜底未加载的区域 */
+    ResourceKey tiledPreviewResourceKey_;
+    uint64_t tiledGeneration_ = 0;
     int tiledPreviewW_ = 0, tiledPreviewH_ = 0;
 
     void DrawTiled(Renderer& r);
@@ -905,7 +880,8 @@ public:
     void SetSvg(const std::string& svgContent);
     void SetGhost(bool ghost) { ghost_ = ghost; }
     bool IsGhost() const { return ghost_; }
-    void SetIconColor(const D2D1_COLOR_F& c) { iconColor_ = c; customColor_ = true; }
+    void SetIconColor(const D2D1_COLOR_F& c) { iconColor_ = c; fixedColor_ = true; }
+    void SetIconColorRole(int role) { iconColorRole_ = role; fixedColor_ = false; }
     void SetIconPadding(float p) { iconPad_ = p; }
     void SetCornerRadius(float r) { cornerRadius_ = r; }
     /* ghost 模式 hover/press bg 视觉开关. 默认 true (标准按钮反馈).
@@ -924,7 +900,8 @@ private:
     SvgIcon icon_;
     std::string svgContent_;
     bool ghost_ = false;
-    bool customColor_ = false;
+    bool fixedColor_ = false;
+    int iconColorRole_ = 0; /* UiIconColorRole; 0 = UI_ICON_COLOR_BUTTON_TEXT. */
     D2D1_COLOR_F iconColor_ = {};
     float iconPad_ = 6.0f;
     float cornerRadius_ = 4.0f;
@@ -936,6 +913,7 @@ private:
 class UI_API TitleBarWidget : public Widget {
 public:
     explicit TitleBarWidget(const std::wstring& title = L"");
+    ~TitleBarWidget() override;
 
     void SetTitle(const std::wstring& t) { title_ = t; ui::RequestLayout(); }
     const std::wstring& Title() const { return title_; }
@@ -983,13 +961,16 @@ private:
     int titleWeight_ = 400;   // DWRITE_FONT_WEIGHT_NORMAL
 
     // Icon state — three-tier lookup at OnDraw time:
-    //   1. userIconRgba_ 非空 → 用户显式设的图，最高优先
+    //   1. userIconResourceKey_ 有效 → 用户显式设的图，最高优先
     //   2. 否则尝试从 GetModuleHandleW(nullptr) 加载 ICON 资源 ID=1
     //   3. 都没有 → 不画图标，标题文字滑到最左
     // 加载结果缓存到 iconBitmap_。HICON 加载只尝试一次（exeIconAttempted_）。
     ComPtr<ID2D1Bitmap> iconBitmap_;
     bool exeIconAttempted_ = false;
-    std::vector<uint8_t> userIconRgba_;
+    ResourceKey userIconResourceKey_;
+    ResourceKey exeIconResourceKey_;
+    uint64_t userIconGeneration_ = 0;
+    uint64_t exeIconGeneration_ = 0;
     int userIconW_ = 0;
     int userIconH_ = 0;
 };
@@ -1113,7 +1094,7 @@ public:
 
     bool IsExpanded() const { return expanded_; }
     void SetExpanded(bool v);
-    void SetExpandedImmediate(bool v) { expanded_ = v; animProgress_ = v ? 1.0f : 0.0f; animating_ = false; }
+    void SetExpandedImmediate(bool v) { expanded_ = v; expandAnim_.SetImmediate(v ? 1.0f : 0.0f); animating_ = false; }
     void Toggle() { SetExpanded(!expanded_); }
     void SetHeaderText(const std::wstring& t) { headerText_ = t; }
     const std::wstring& HeaderText() const { return headerText_; }
@@ -1136,9 +1117,8 @@ private:
     bool headerHovered_ = false;
     float headerHeight_ = 40.0f;
 
-    float animProgress_ = 1.0f;  // 0=collapsed, 1=expanded
+    AnimatedFloat expandAnim_{1.0f, 180.0f, EasingFunction::EaseOutCubic};
     bool animating_ = false;
-    uint64_t animLastTick_ = 0;
     float measuredContentH_ = 0;  // natural height of children
 
     friend class UiWindowImpl;
@@ -1174,7 +1154,6 @@ private:
     std::wstring editText_;
     int cursorPos_ = 0;
     int hoveredBtn_ = -1;  // -1=none, 0=up, 1=down
-    Renderer* cachedRenderer_ = nullptr;
 
     void Clamp();
     void CommitEdit();
@@ -1265,7 +1244,7 @@ public:
 
     bool IsPaneOpen() const { return paneOpen_; }
     void SetPaneOpen(bool open);
-    void SetPaneOpenImmediate(bool open) { paneOpen_ = open; animProgress_ = open ? 1.0f : 0.0f; animating_ = false; }
+    void SetPaneOpenImmediate(bool open) { paneOpen_ = open; paneAnim_.SetImmediate(open ? 1.0f : 0.0f); animating_ = false; }
     void TogglePane() { SetPaneOpen(!paneOpen_); }
 
     void SetDisplayMode(SplitViewMode mode) { mode_ = mode; }
@@ -1298,9 +1277,8 @@ private:
     float compactPaneLength_ = 48.0f;
 
     // Animation
-    float animProgress_ = 0.0f;   // 0=closed, 1=open
+    AnimatedFloat paneAnim_{0.0f, 200.0f, EasingFunction::EaseOutCubic};
     bool animating_ = false;
-    uint64_t animLastTick_ = 0;
 
     float CurrentPaneWidth() const;
 

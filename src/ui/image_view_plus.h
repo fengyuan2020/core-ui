@@ -42,8 +42,7 @@ public:
     // 直接喂一个 source（高级用法，比如外部自己解码的 PSD / 异步完成回调）
     void SetSource(std::unique_ptr<IImageSource> src);
 
-    // 便捷：位图/像素
-    void SetBitmap(ComPtr<ID2D1Bitmap> bmp);
+    // 便捷：像素
     void SetPixels(const void* pixels, int w, int h, int stride, Renderer& r);
 
     // 分块模式 —— 返回的 ITiledSource* 生命周期跟着 source_
@@ -167,6 +166,8 @@ private:
 
     // 棋盘
     ComPtr<ID2D1Bitmap> checkerTile_;
+    ResourceKey checkerTileResourceKey_;
+    uint64_t checkerTileGeneration_ = 0;
     int checkerTheme_ = -1;
     void EnsureCheckerboardTile(Renderer& r);
     void DrawCheckerboard(Renderer& r, const D2D1_RECT_F& area);

@@ -1,17 +1,34 @@
 #include "image_source.h"
+#include "display_list.h"
 #include "renderer.h"
+#include "resource_store.h"
+#include <atomic>
 #include <map>
 #include <cmath>
 #include <algorithm>
 
 namespace ui {
 
+namespace {
+
+uint64_t NextTiledSourceGeneration() {
+    static std::atomic<uint64_t> next{1};
+    return next.fetch_add(1, std::memory_order_relaxed);
+}
+
+} // namespace
+
 class TiledSource : public IImageSource, public IImageSource::ITiledSource {
 public:
     TiledSource(int fullW, int fullH, int tileSize, Renderer& r)
         : fullW_(fullW), fullH_(fullH),
           tileSize_(tileSize > 0 ? tileSize : 512),
-          renderer_(&r) {}
+          renderer_(&r),
+          generation_(NextTiledSourceGeneration()) {}
+
+    ~TiledSource() override {
+        ClearTiles();
+    }
 
     int Width()  const override { return fullW_; }
     int Height() const override { return fullH_; }
@@ -21,13 +38,6 @@ public:
     const char* TypeName() const override { return "TiledSource"; }
 
     void Draw(Renderer& r, const ImageDrawContext& ctx) override {
-        // 有 preview 则先画全图预览兜底
-        if (preview_) {
-            auto interp = (!ctx.antialias && ctx.zoom >= 4.0f)
-                ? D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
-                : D2D1_BITMAP_INTERPOLATION_MODE_LINEAR;
-            r.DrawBitmap(preview_.Get(), ctx.dest, 1.0f, interp);
-        }
         // 计算可见瓦片范围
         float drawW = ctx.dest.right  - ctx.dest.left;
         float drawH = ctx.dest.bottom - ctx.dest.top;
@@ -51,6 +61,7 @@ public:
                 float x1 = std::ceil (ctx.dest.left + (tx * ts + tw) * ctx.zoom) + 1.0f;
                 float y1 = std::ceil (ctx.dest.top  + (ty * ts + th) * ctx.zoom) + 1.0f;
                 D2D1_RECT_F dest = {x0, y0, x1, y1};
+                r.RecordImage(it->second.resourceKey, dest, ImageSampling::Nearest);
                 r.DrawBitmap(it->second.bmp.Get(), dest, 1.0f, interp);
             }
         }
@@ -60,24 +71,41 @@ public:
     void SetTile(int tx, int ty, const void* pixels,
                  int w, int h, int stride) override {
         if (!renderer_ || !pixels || w <= 0 || h <= 0) return;
-        auto bmp = renderer_->CreateBitmapFromPixels(pixels, w, h, stride);
-        if (bmp) tiles_[{tx, ty}] = {bmp, w, h};
+        ResourceKey resourceKey = GlobalResourceStore().AddImage(
+            ResourceKind::Tile, generation_, w, h, stride,
+            PixelFormat::BgraPremul, pixels, true);
+        auto res = GlobalResourceStore().Acquire(resourceKey);
+        if (!res || !res->bytes) return;
+
+        auto bmp = renderer_->CreateBitmapFromPixels(res->bytes->data(), res->width, res->height, res->stride);
+        if (!bmp) {
+            GlobalResourceStore().Remove(resourceKey);
+            return;
+        }
+
+        auto key = std::make_pair(tx, ty);
+        auto old = tiles_.find(key);
+        if (old != tiles_.end()) GlobalResourceStore().Remove(old->second.resourceKey);
+        tiles_[key] = {bmp, resourceKey, w, h};
     }
-    void SetPreview(ComPtr<ID2D1Bitmap> bmp, int /*w*/, int /*h*/) override {
-        preview_ = std::move(bmp);
+    void ClearTiles() override {
+        for (const auto& kv : tiles_) {
+            GlobalResourceStore().Remove(kv.second.resourceKey);
+        }
+        tiles_.clear();
     }
-    void ClearTiles() override { tiles_.clear(); preview_.Reset(); }
     int  TileSize() const override { return tileSize_; }
 
 private:
     struct Tile {
         ComPtr<ID2D1Bitmap> bmp;
+        ResourceKey resourceKey;
         int w = 0, h = 0;
     };
     int fullW_, fullH_, tileSize_;
     Renderer* renderer_;
+    uint64_t generation_;
     std::map<std::pair<int,int>, Tile> tiles_;
-    ComPtr<ID2D1Bitmap> preview_;
 };
 
 std::unique_ptr<IImageSource>

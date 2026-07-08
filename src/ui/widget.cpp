@@ -9,6 +9,25 @@ void RequestLayout() {
     LayoutDirtyFlag() = true;
     GetContext().InvalidateAllWindows();
 }
+
+void Widget::ApplyDynamicPositionOverrides() {
+    if (dynamicPosLeftSet) {
+        posLeft = dynamicPosLeft;
+        posLeftRaw = dynamicPosLeftRaw;
+    }
+    if (dynamicPosTopSet) {
+        posTop = dynamicPosTop;
+        posTopRaw = dynamicPosTopRaw;
+    }
+    if (dynamicPosRightSet) {
+        posRight = dynamicPosRight;
+        posRightRaw = dynamicPosRightRaw;
+    }
+    if (dynamicPosBottomSet) {
+        posBottom = dynamicPosBottom;
+        posBottomRaw = dynamicPosBottomRaw;
+    }
+}
 }  // namespace ui
 #include "css/value.h"
 
@@ -39,6 +58,16 @@ float ResolveAbsSide(const std::string& raw, float fallback, float parentSize) {
         }
     }
     return fallback;
+}
+
+void ResolvePercentSizing(Widget* child, float parentW, float parentH) {
+    if (!child) return;
+    if (child->percentW    >= 0) child->fixedW = parentW * child->percentW    / 100.0f;
+    if (child->percentH    >= 0) child->fixedH = parentH * child->percentH    / 100.0f;
+    if (child->percentMinW >= 0) child->minW   = parentW * child->percentMinW / 100.0f;
+    if (child->percentMinH >= 0) child->minH   = parentH * child->percentMinH / 100.0f;
+    if (child->percentMaxW >= 0) child->maxW   = parentW * child->percentMaxW / 100.0f;
+    if (child->percentMaxH >= 0) child->maxH   = parentH * child->percentMaxH / 100.0f;
 }
 }  // namespace
 
@@ -76,11 +105,33 @@ void Widget::RemoveChild(Widget* child) {
 
 namespace {
 
-// Draw a soft drop shadow behind the rect. Simulates CSS box-shadow with a
-// small number of layered rounded rects whose alpha decays outward.
+void DrawLayeredBoxShadowFallback(Renderer& r, const D2D1_RECT_F& base,
+                                  float baseRadius,
+                                  const Widget::BoxShadow& sh) {
+    constexpr int LAYERS = 12;
+    for (int i = LAYERS - 1; i >= 0; --i) {
+        float t = static_cast<float>(i) / static_cast<float>(LAYERS - 1);  // 0..1
+        float expand = sh.blur * (t * 1.5f - 0.5f);
+        D2D1_RECT_F lyr{
+            base.left   - expand,
+            base.top    - expand,
+            base.right  + expand,
+            base.bottom + expand,
+        };
+        // 内缩过深(小 widget + 大 blur)会让矩形反转, 跳过该层。
+        if (lyr.right <= lyr.left || lyr.bottom <= lyr.top) continue;
+        // Alpha decays quadratically outward; innermost layer at full alpha.
+        float a = sh.color.a * (1.0f - t) * (1.0f - t) / static_cast<float>(LAYERS);
+        D2D1_COLOR_F c{ sh.color.r, sh.color.g, sh.color.b, a };
+        float rad = baseRadius + expand; if (rad < 0.0f) rad = 0.0f;
+        r.FillRoundedRect(lyr, rad, rad, c);
+    }
+}
+
+// Draw a soft drop shadow behind the rect. Prefer a real D2D Gaussian blur; the
+// old layered approximation remains only as a fallback for unavailable effects.
 void DrawBoxShadow(Renderer& r, const D2D1_RECT_F& rect, const Widget::BoxShadow& sh, float radius) {
     if (!sh.set || sh.color.a <= 0.0f) return;
-    // Base (most solid) rect: rect offset by (offsetX, offsetY), expanded by spread
     D2D1_RECT_F base{
         rect.left   - sh.spread + sh.offsetX,
         rect.top    - sh.spread + sh.offsetY,
@@ -88,32 +139,42 @@ void DrawBoxShadow(Renderer& r, const D2D1_RECT_F& rect, const Widget::BoxShadow
         rect.bottom + sh.spread + sh.offsetY,
     };
     float baseRadius = radius + sh.spread;
-    // Sharp shadow shorthand: `box-shadow: 0 2px 0 #color` (blur=0). Skip the
-    // alpha-decay layer trick and just paint one solid rect — gives a crisp
-    // 1-pixel-accurate line, which is what people use this trick for
-    // (CSS underlines, Neobrutalism hard offsets).
     if (sh.blur < 0.5f) {
         r.FillRoundedRect(base, baseRadius, baseRadius, sh.color);
         return;
     }
-    constexpr int LAYERS = 6;
-
-    // Draw expanding layers from outermost (faintest) to innermost (strongest)
-    // so alpha compounding doesn't wash out the edges.
-    for (int i = LAYERS - 1; i >= 0; --i) {
-        float t = static_cast<float>(i) / static_cast<float>(LAYERS - 1);  // 0..1
-        float expand = sh.blur * t;
-        D2D1_RECT_F lyr{
-            base.left   - expand,
-            base.top    - expand,
-            base.right  + expand,
-            base.bottom + expand,
-        };
-        // Alpha decays quadratically outward; innermost layer at full alpha.
-        float a = sh.color.a * (1.0f - t) * (1.0f - t) / static_cast<float>(LAYERS);
-        D2D1_COLOR_F c{ sh.color.r, sh.color.g, sh.color.b, a };
-        r.FillRoundedRect(lyr, baseRadius + expand, baseRadius + expand, c);
+    if (!r.DrawBlurredRoundedRect(base, baseRadius, baseRadius, sh.blur, sh.color)) {
+        DrawLayeredBoxShadowFallback(r, base, baseRadius, sh);
     }
+}
+
+D2D1_RECT_F ExpandForOutsetShadow(D2D1_RECT_F bounds, const D2D1_RECT_F& rect,
+                                  float offsetX, float offsetY,
+                                  float blur, float spread,
+                                  D2D1_COLOR_F color) {
+    if (color.a <= 0.0f) return bounds;
+    const float extent = std::max(0.0f, spread) + std::max(0.0f, blur);
+    bounds.left = std::min(bounds.left, rect.left + offsetX - extent);
+    bounds.top = std::min(bounds.top, rect.top + offsetY - extent);
+    bounds.right = std::max(bounds.right, rect.right + offsetX + extent);
+    bounds.bottom = std::max(bounds.bottom, rect.bottom + offsetY + extent);
+    return bounds;
+}
+
+D2D1_RECT_F WidgetOpacityBounds(const Widget& w) {
+    D2D1_RECT_F bounds = w.rect;
+    if (!w.boxShadows.empty()) {
+        for (const auto& sh : w.boxShadows) {
+            if (sh.inset) continue;
+            bounds = ExpandForOutsetShadow(bounds, w.rect, sh.offsetX, sh.offsetY,
+                                           sh.blur, sh.spread, sh.color);
+        }
+    } else if (w.boxShadow.set) {
+        bounds = ExpandForOutsetShadow(bounds, w.rect, w.boxShadow.offsetX,
+                                       w.boxShadow.offsetY, w.boxShadow.blur,
+                                       w.boxShadow.spread, w.boxShadow.color);
+    }
+    return bounds;
 }
 
 // Draw an inset shadow inside the widget rect, approximating CSS
@@ -124,8 +185,6 @@ void DrawBoxShadow(Renderer& r, const D2D1_RECT_F& rect, const Widget::BoxShadow
 void DrawInsetBoxShadow(Renderer& r, const D2D1_RECT_F& rect,
                         const Widget::BoxShadowEx& sh, float radius) {
     if (sh.color.a <= 0.0f) return;
-    auto* ctx = r.RT();
-    if (!ctx) return;
     if (radius > 0) r.PushRoundedClip(rect, radius, radius);
     else            r.PushClip(rect);
 
@@ -182,121 +241,22 @@ void DrawInsetBoxShadow(Renderer& r, const D2D1_RECT_F& rect,
     else            r.PopClip();
 }
 
-// Build a D2D linear or radial gradient brush for a widget rect from the
-// CSS-spec gradient description. Returns nullptr on failure.
-ComPtr<ID2D1Brush> CreateBgGradientBrush(ID2D1RenderTarget* rt,
-                                         const D2D1_RECT_F& rect,
-                                         const Widget::BgGradient& g) {
-    if (!rt || g.stops.empty()) return nullptr;
-
-    std::vector<D2D1_GRADIENT_STOP> d2dStops;
-    d2dStops.reserve(g.stops.size());
-    for (size_t i = 0; i < g.stops.size(); ++i) {
-        D2D1_GRADIENT_STOP gs;
-        if (g.stops[i].position >= 0) {
-            gs.position = g.stops[i].position;
-        } else {
-            gs.position = (g.stops.size() > 1) ? (float)i / (float)(g.stops.size() - 1) : 0.0f;
-        }
-        gs.color = g.stops[i].color;
-        d2dStops.push_back(gs);
+GradientRef ToGradientRef(const Widget::BgGradient& layer) {
+    GradientRef ref;
+    ref.radial = layer.kind == Widget::BgGradient::Radial;
+    ref.angle_deg = layer.angleDeg;
+    ref.cx_pct = layer.cxPct;
+    ref.cy_pct = layer.cyPct;
+    ref.radius_pct = layer.radiusPct;
+    ref.tile_w = layer.tileW;
+    ref.tile_h = layer.tileH;
+    ref.pos_x = layer.posX;
+    ref.pos_y = layer.posY;
+    ref.stops.reserve(layer.stops.size());
+    for (const auto& stop : layer.stops) {
+        ref.stops.push_back(GradientStopRef{stop.position, stop.color});
     }
-    ComPtr<ID2D1GradientStopCollection> stops;
-    rt->CreateGradientStopCollection(d2dStops.data(), (UINT32)d2dStops.size(),
-                                     D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP,
-                                     stops.GetAddressOf());
-    if (!stops) return nullptr;
-
-    if (g.kind == Widget::BgGradient::Linear) {
-        // CSS angle: 0deg = bottom→top, increases clockwise.
-        // direction vector (dx, dy) where +y is screen-down:
-        //   dx = sin(rad), dy = -cos(rad)
-        float rad = g.angleDeg * 3.14159265f / 180.0f;
-        float dx = std::sin(rad);
-        float dy = -std::cos(rad);
-        float cx = (rect.left + rect.right) * 0.5f;
-        float cy = (rect.top + rect.bottom) * 0.5f;
-        float halfW = (rect.right - rect.left) * 0.5f;
-        float halfH = (rect.bottom - rect.top) * 0.5f;
-        float halfLen = std::abs(dx) * halfW + std::abs(dy) * halfH;
-        D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES props = {
-            { cx - dx * halfLen, cy - dy * halfLen },
-            { cx + dx * halfLen, cy + dy * halfLen }
-        };
-        ComPtr<ID2D1LinearGradientBrush> brush;
-        rt->CreateLinearGradientBrush(props, stops.Get(), brush.GetAddressOf());
-        return brush;
-    }
-    // Radial
-    float w = rect.right - rect.left;
-    float h = rect.bottom - rect.top;
-    float cx = rect.left + w * g.cxPct / 100.0f;
-    float cy = rect.top  + h * g.cyPct / 100.0f;
-    float radius = std::max(w, h) * g.radiusPct / 100.0f;
-    D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES props = {};
-    props.center = { cx, cy };
-    props.gradientOriginOffset = { 0, 0 };
-    props.radiusX = radius;
-    props.radiusY = radius;
-    ComPtr<ID2D1RadialGradientBrush> brush;
-    rt->CreateRadialGradientBrush(props, stops.Get(), brush.GetAddressOf());
-    return brush;
-}
-
-// Paint one CSS gradient layer into `rect`. When the layer has a tile size
-// set (background-size on the CSS rule), render the gradient into a tile-
-// sized off-screen bitmap and use a wrap-mode bitmap brush so D2D repeats
-// the tile across rect — that's how multi-layer checkerboard patterns work.
-void PaintGradientLayer(ID2D1RenderTarget* rt, const D2D1_RECT_F& rect,
-                        const Widget::BgGradient& layer, float radius) {
-    if (!rt || layer.stops.empty()) return;
-    bool tile = (layer.tileW > 0 && layer.tileH > 0);
-
-    if (!tile) {
-        auto brush = CreateBgGradientBrush(rt, rect, layer);
-        if (!brush) return;
-        if (radius > 0) {
-            rt->FillRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), brush.Get());
-        } else {
-            rt->FillRectangle(rect, brush.Get());
-        }
-        return;
-    }
-
-    // Tiled: build a one-tile bitmap, then BitmapBrush with WRAP across rect.
-    D2D1_SIZE_F tileSizeDip = D2D1::SizeF(layer.tileW, layer.tileH);
-    ComPtr<ID2D1BitmapRenderTarget> tileRT;
-    if (FAILED(rt->CreateCompatibleRenderTarget(tileSizeDip, tileRT.GetAddressOf()))) return;
-
-    D2D1_RECT_F tileRect = {0.0f, 0.0f, layer.tileW, layer.tileH};
-    auto tileBrush = CreateBgGradientBrush(tileRT.Get(), tileRect, layer);
-    if (!tileBrush) return;
-
-    tileRT->BeginDraw();
-    tileRT->Clear(D2D1::ColorF(0, 0, 0, 0));
-    tileRT->FillRectangle(tileRect, tileBrush.Get());
-    if (FAILED(tileRT->EndDraw())) return;
-
-    ComPtr<ID2D1Bitmap> tileBmp;
-    if (FAILED(tileRT->GetBitmap(tileBmp.GetAddressOf()))) return;
-
-    D2D1_BITMAP_BRUSH_PROPERTIES bbp = {
-        D2D1_EXTEND_MODE_WRAP,
-        D2D1_EXTEND_MODE_WRAP,
-        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-    };
-    D2D1_BRUSH_PROPERTIES bp = {};
-    bp.opacity = 1.0f;
-    bp.transform = D2D1::Matrix3x2F::Translation(rect.left + layer.posX, rect.top + layer.posY);
-
-    ComPtr<ID2D1BitmapBrush> bmpBrush;
-    if (FAILED(rt->CreateBitmapBrush(tileBmp.Get(), bbp, bp, bmpBrush.GetAddressOf()))) return;
-
-    if (radius > 0) {
-        rt->FillRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), bmpBrush.Get());
-    } else {
-        rt->FillRectangle(rect, bmpBrush.Get());
-    }
+    return ref;
 }
 
 }  // namespace
@@ -320,7 +280,7 @@ void Widget::OnDraw(Renderer& r) {
     }
     if (hasBgGradient) {
         for (const auto& layer : bgGradients) {
-            PaintGradientLayer(r.RT(), rect, layer, radius);
+            r.FillGradientRect(ToGradientRef(layer), rect, radius);
         }
     }
 
@@ -434,7 +394,7 @@ void Widget::DrawTree(Renderer& r) {
     if (!visible || opacity <= 0.0f) return;
 
     bool useLayer = (opacity < 1.0f);
-    if (useLayer) r.PushOpacity(opacity, rect);
+    if (useLayer) r.PushOpacity(opacity, WidgetOpacityBounds(*this));
 
     const bool hasTranslate = (transformX != 0.0f || transformY != 0.0f);
     if (hasTranslate) ShiftSubtreeRects(this, transformX, transformY);
@@ -442,9 +402,7 @@ void Widget::DrawTree(Renderer& r) {
     // CSS transform: rotate / scale around the widget's center. Done via
     // ID2D1RenderTarget transform — does NOT affect layout (no reflow).
     bool hasMatrix = (rotateDeg != 0.0f) || (scaleX != 1.0f) || (scaleY != 1.0f);
-    D2D1_MATRIX_3X2_F savedXform = D2D1::Matrix3x2F::Identity();
-    if (hasMatrix && r.RT()) {
-        r.RT()->GetTransform(&savedXform);
+    if (hasMatrix) {
         D2D1_POINT_2F pivot = {
             (rect.left + rect.right) * 0.5f,
             (rect.top  + rect.bottom) * 0.5f
@@ -455,7 +413,7 @@ void Widget::DrawTree(Renderer& r) {
         if (rotateDeg != 0.0f)
             m = m * D2D1::Matrix3x2F::Rotation(rotateDeg);
         m = m * D2D1::Matrix3x2F::Translation(pivot.x, pivot.y);
-        r.RT()->SetTransform(m * savedXform);
+        r.PushTransform(m);
     }
 
     // Outset box-shadows paint behind the widget. Iterate the multi list
@@ -475,6 +433,10 @@ void Widget::DrawTree(Renderer& r) {
         DrawBoxShadow(r, rect, boxShadow, bgRadius);
     }
 
+    if (backdropBlur > 0.5f) {
+        r.DrawBackdropBlur(rect, bgRadius, backdropBlur);
+    }
+
     OnDraw(r);
     paintedOnce_ = true;   // L45: mount-phase transition gate, 见 widget.h PaintedOnce()
     DrawFocusRing(r);
@@ -487,17 +449,26 @@ void Widget::DrawTree(Renderer& r) {
         if (bgRadius > 0) r.PushRoundedClip(rect, bgRadius, bgRadius);
         else              r.PushClip(rect);
     }
+    // 先画非绝对定位子节点(DOM 顺序), 再把绝对定位的画在最上层(各自 DOM 稳定序)。
+    // CSS 里 positioned(absolute)元素默认盖在非定位元素之上; core-ui 不解析 z-index,
+    // 用"绝对定位置顶"近似该语义。否则早 DOM 的绝对浮层(如全屏顶部标题栏)会被后面的
+    // 兄弟(画布/image)覆盖 —— 只有晚 DOM 的浮层(底部 toolbar)能正常盖在画布上。
+    bool hasAbsChild = false;
     for (auto& child : children_) {
+        if (child->positionAbsolute) { hasAbsChild = true; continue; }
         child->DrawTree(r);
+    }
+    if (hasAbsChild) {
+        for (auto& child : children_) {
+            if (child->positionAbsolute) child->DrawTree(r);
+        }
     }
     if (clipChildren) {
         if (bgRadius > 0) r.PopRoundedClip();
         else              r.PopClip();
     }
 
-    if (hasMatrix && r.RT()) {
-        r.RT()->SetTransform(savedXform);
-    }
+    if (hasMatrix) r.PopTransform();
     if (hasTranslate) ShiftSubtreeRects(this, -transformX, -transformY);
 
     if (useLayer) r.PopOpacity();
@@ -517,7 +488,15 @@ void Widget::DrawOverlays(Renderer& r) {
 
 Widget* Widget::HitTest(float x, float y) {
     if (!visible || !enabled || opacity <= 0.0f || !Contains(x, y)) return nullptr;
+    // L219: 命中顺序必须跟 DrawTree 的绘制顺序一致 —— 绝对定位子节点画在最上层,
+    // 所以也要先测它们(各自逆 DOM 序), 否则早 DOM 的绝对浮层(如全屏顶部标题栏)
+    // 虽然画在画布之上, 点击却先命中"逻辑在它之后"的画布 → 浮层按钮点不到。
     for (int i = (int)children_.size() - 1; i >= 0; --i) {
+        if (!children_[i]->positionAbsolute) continue;
+        if (auto* hit = children_[i]->HitTest(x, y)) return hit;
+    }
+    for (int i = (int)children_.size() - 1; i >= 0; --i) {
+        if (children_[i]->positionAbsolute) continue;
         if (auto* hit = children_[i]->HitTest(x, y)) return hit;
     }
     return hitTransparent ? nullptr : this;
@@ -574,6 +553,9 @@ void VBoxWidget::DoLayout() {
         if (child->percentMinH >= 0) child->minH   = totalH  * child->percentMinH / 100.0f;
         if (child->percentMaxW >= 0) child->maxW   = cw      * child->percentMaxW / 100.0f;
         if (child->percentMaxH >= 0) child->maxH   = totalH  * child->percentMaxH / 100.0f;
+    }
+    for (auto* child : absChildren) {
+        ResolvePercentSizing(child, cw, totalH);
     }
 
     // First pass: measure fixed children, sum flex weights
@@ -747,6 +729,9 @@ void HBoxWidget::DoLayout() {
         if (child->percentMinH >= 0) child->minH   = ch      * child->percentMinH / 100.0f;
         if (child->percentMaxW >= 0) child->maxW   = totalW  * child->percentMaxW / 100.0f;
         if (child->percentMaxH >= 0) child->maxH   = ch      * child->percentMaxH / 100.0f;
+    }
+    for (auto* child : absChildren) {
+        ResolvePercentSizing(child, totalW, ch);
     }
 
     // First pass: measure fixed children, sum flex weights
@@ -936,6 +921,9 @@ void HBoxWidget::DoLayoutWrap() {
         if (child->percentMinH >= 0) child->minH   = ch     * child->percentMinH / 100.0f;
         if (child->percentMaxW >= 0) child->maxW   = totalW * child->percentMaxW / 100.0f;
         if (child->percentMaxH >= 0) child->maxH   = ch     * child->percentMaxH / 100.0f;
+    }
+    for (auto* child : absChildren) {
+        ResolvePercentSizing(child, totalW, ch);
     }
 
     // Per-child natural width (clamped to [min, max]).

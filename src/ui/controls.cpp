@@ -1,15 +1,32 @@
 #include "controls.h"
 #include "event.h"
 #include "asset.h"
+#include "display_list.h"
+#include "draw_api_context.h"
+#include "measure_context.h"
 #include "renderer.h"
+#include "resource_store.h"
 #include <algorithm>
 #include <cmath>
 #include <functional>
 #include <unordered_map>
 #include <windows.h>
 #include <cstring>
+#include <cstdlib>
+#include <limits>
 
 namespace ui {
+
+namespace {
+
+ImageSampling SamplingForBitmap(bool useHQ, D2D1_BITMAP_INTERPOLATION_MODE interp) {
+    if (useHQ) return ImageSampling::HighQualityCubic;
+    return interp == D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+        ? ImageSampling::Nearest
+        : ImageSampling::Linear;
+}
+
+} // namespace
 
 // ---- Label ----
 
@@ -98,7 +115,7 @@ void LabelWidget::SetSelectable(bool v) {
 }
 
 // 二分查找：x 像素位置对应文本中的字符索引
-int LabelWidget::CharIndexAtX(Renderer& r, float x) const {
+int LabelWidget::CharIndexAtX(MeasureContext& measure, float x) const {
     if (text_.empty()) return 0;
     float fs = (css.fontSize > 0) ? css.fontSize : fontSize_;
     // 文本起点偏移 padL（OnDraw 把 textRect 内缩了）—— 不减 padding，
@@ -108,7 +125,7 @@ int LabelWidget::CharIndexAtX(Renderer& r, float x) const {
     int lo = 0, hi = (int)text_.size();
     while (lo < hi) {
         int mid = (lo + hi + 1) / 2;
-        float w = r.MeasureTextWidth(text_.substr(0, mid), fs, nullptr);
+        float w = measure.MeasureTextWidth(text_.substr(0, mid), fs, nullptr);
         if (w <= relX) lo = mid;
         else           hi = mid - 1;
     }
@@ -121,9 +138,9 @@ bool LabelWidget::OnMouseDown(const MouseEvent& e) {
     // generic event hooks (onMouseDownHook → @mousedown handler) fire.
     if (!selectable) return Widget::OnMouseDown(e);
     if (!Contains(e.x, e.y)) return Widget::OnMouseDown(e);
-    extern Renderer* g_activeRenderer;
-    if (!g_activeRenderer) return Widget::OnMouseDown(e);
-    int idx = CharIndexAtX(*g_activeRenderer, e.x);
+    extern MeasureContext* g_activeMeasureContext;
+    if (!g_activeMeasureContext) return Widget::OnMouseDown(e);
+    int idx = CharIndexAtX(*g_activeMeasureContext, e.x);
     selectionStart_ = selectionEnd_ = idx;
     dragging_ = true;
     Widget::OnMouseDown(e);   // still fire any user @mousedown alongside selection
@@ -132,9 +149,9 @@ bool LabelWidget::OnMouseDown(const MouseEvent& e) {
 
 bool LabelWidget::OnMouseMove(const MouseEvent& e) {
     if (selectable && dragging_) {
-        extern Renderer* g_activeRenderer;
-        if (g_activeRenderer) {
-            selectionEnd_ = CharIndexAtX(*g_activeRenderer, e.x);
+        extern MeasureContext* g_activeMeasureContext;
+        if (g_activeMeasureContext) {
+            selectionEnd_ = CharIndexAtX(*g_activeMeasureContext, e.x);
         }
         Widget::OnMouseMove(e);
         return true;
@@ -193,11 +210,11 @@ D2D1_SIZE_F LabelWidget::SizeHint() const {
         // 优先用 renderer 的精确测量（DWrite），估算只在 renderer 还没 attach
         // 时兜底。Estimate 对粗体小字（如 11px bold "PRO"）会少算 → wrap=true
         // 时把单行文字折成 2 行。+1px 防亚像素 ellipsis。
-        extern Renderer* g_activeRenderer;
-        if (g_activeRenderer && !text_.empty()) {
+        extern MeasureContext* g_activeMeasureContext;
+        if (g_activeMeasureContext && !text_.empty()) {
             auto weight = bold_ ? DWRITE_FONT_WEIGHT_SEMI_BOLD
                                 : DWRITE_FONT_WEIGHT_NORMAL;
-            estW = g_activeRenderer->MeasureTextWidth(text_, fontSize_, nullptr, weight) + 1.0f;
+            estW = g_activeMeasureContext->MeasureTextWidth(text_, fontSize_, nullptr, weight) + 1.0f;
         } else {
             float asciiW = bold_ ? fontSize_ * 0.66f : fontSize_ * 0.62f;
             for (wchar_t ch : text_) {
@@ -242,10 +259,10 @@ D2D1_SIZE_F LabelWidget::SizeHint() const {
          * 的方案相比换来"absolute / shrink-to-fit 不死锁"的更大好处. */
         float availW = fixedW - padL - padR;
         if (availW > 10.0f) {
-            extern Renderer* g_activeRenderer;
-            if (g_activeRenderer) {
+            extern MeasureContext* g_activeMeasureContext;
+            if (g_activeMeasureContext) {
                 auto weight = bold_ ? DWRITE_FONT_WEIGHT_SEMI_BOLD : DWRITE_FONT_WEIGHT_NORMAL;
-                float textH = g_activeRenderer->MeasureTextHeight(text_, availW, fontSize_, weight);
+                float textH = g_activeMeasureContext->MeasureTextHeight(text_, availW, fontSize_, weight);
                 /* build 92 (L20): wrap 分支也走 line-height. DWrite textH 包含
                  * ascent + descent (单行 ≈ fontSize × 1.2). 折成行数后乘 lineH.
                  * 1.4 阈值: 单行实际 ratio ≈ 1.2, 用 1.4 当 "definitely > 1 line"
@@ -433,9 +450,9 @@ D2D1_SIZE_F ButtonWidget::SizeHint() const {
     constexpr float kHorizPad = 24.0f;   // 12px each side
     constexpr float kMinW     = 60.0f;
     float textW = 0.0f;
-    extern Renderer* g_activeRenderer;
-    if (g_activeRenderer && !text_.empty()) {
-        textW = g_activeRenderer->MeasureTextWidth(text_, fontSize_, nullptr);
+    extern MeasureContext* g_activeMeasureContext;
+    if (g_activeMeasureContext && !text_.empty()) {
+        textW = g_activeMeasureContext->MeasureTextWidth(text_, fontSize_, nullptr);
     } else {
         // Fallback: 0.7×fontSize per char (close enough for ASCII; CJK ends
         // up wide enough on the next frame once the renderer is up).
@@ -451,42 +468,15 @@ void CheckBoxWidget::SetChecked(bool v) {
     if (checked_ == v) return;
 
     checked_ = v;
-    animating_ = true;
-    lastTick_ = 0;
+    checkAnim_.SetTarget(checked_ ? 1.0f : 0.0f);
+    animating_ = checkAnim_.Active();
+    ui::GetContext().RegisterAnimatingWidget(this);
 }
 
 void CheckBoxWidget::UpdateAnimation() {
-    uint64_t now = GetTickCount64();
-    if (lastTick_ == 0) lastTick_ = now;
-
-    if (!animating_) {
-        checkAnimProgress_ = checked_ ? 1.0f : 0.0f;
-        return;
-    }
-
-    float target = checked_ ? 1.0f : 0.0f;
-    float diff = target - checkAnimProgress_;
-
-    if (std::abs(diff) < 0.001f) {
-        checkAnimProgress_ = target;
-        animating_ = false;
-        return;
-    }
-
-    float elapsed = (float)(now - lastTick_);
-    float increment = elapsed / animDurationMs_;
-    lastTick_ = now;
-
-    if (diff > 0) {
-        checkAnimProgress_ = std::min(1.0f, checkAnimProgress_ + increment);
-    } else {
-        checkAnimProgress_ = std::max(0.0f, checkAnimProgress_ - increment);
-    }
-
-    if ((diff > 0 && checkAnimProgress_ >= 1.0f) || (diff < 0 && checkAnimProgress_ <= 0.0f)) {
-        checkAnimProgress_ = target;
-        animating_ = false;
-    }
+    checkAnim_.SetIdleTarget(checked_ ? 1.0f : 0.0f);
+    checkAnim_.SampleFrame(GetTickCount64());
+    animating_ = checkAnim_.Active();
 }
 
 void CheckBoxWidget::OnDraw(Renderer& r) {
@@ -505,7 +495,9 @@ void CheckBoxWidget::OnDraw(Renderer& r) {
     D2D1_COLOR_F accentHover = css.hasAccent ? css.accent : theme::kAccentHover();
     D2D1_COLOR_F fg = css.hasFg ? css.fg : theme::kBtnText();
 
-    float t = ToggleWidget::ApplyEasing(easingFunc_, checkAnimProgress_);
+    checkAnim_.SetIdleTarget(checked_ ? 1.0f : 0.0f);
+    float t = std::clamp(checkAnim_.SampleFrame(GetTickCount64()), 0.0f, 1.0f);
+    animating_ = checkAnim_.Active();
 
     if (t > 0.01f) {
         D2D1_COLOR_F accentBg = hovered ? accentHover : accent;
@@ -593,29 +585,22 @@ void SeparatorWidget::OnDraw(Renderer& r) {
 
 // ---- Slider ----
 
-void SliderWidget::UpdateThumbAnimation() {
-    // Determine target scale based on current state
+void SliderWidget::RetargetThumbAnimation() {
     float target = 0.86f;  // rest
     if (dragging_)     target = 0.71f;   // pressed
     else if (hovered)  target = 1.167f;  // hover
-    thumbScaleTarget_ = target;
 
-    // Animate using exponential decay (ease-out feel: fast start, slow finish)
-    // WinUI 3 uses ~167ms with EaseOutCubic curve
-    uint64_t now = GetTickCount64();
-    if (thumbAnimLastTick_ == 0) thumbAnimLastTick_ = now;
-    float dtMs = (float)(now - thumbAnimLastTick_);
-    thumbAnimLastTick_ = now;
-
-    float diff = thumbScaleTarget_ - thumbScaleCurrent_;
-    if (std::abs(diff) < 0.001f) {
-        thumbScaleCurrent_ = thumbScaleTarget_;
-    } else {
-        // Exponential ease-out: each frame moves 15-20% of remaining distance
-        // At 60fps (~16ms), this gives ~120ms to 95% completion
-        float factor = 1.0f - std::exp(-dtMs / 25.0f);  // time constant ~25ms
-        thumbScaleCurrent_ += diff * factor;
+    if (std::abs(target - thumbScaleTarget_) >= 0.001f) {
+        thumbScaleTarget_ = target;
+        thumbScale_.SetTarget(thumbScaleTarget_);
+        ui::GetContext().RegisterAnimatingWidget(this);
     }
+}
+
+void SliderWidget::UpdateThumbAnimation() {
+    RetargetThumbAnimation();
+    thumbScale_.SetIdleTarget(thumbScaleTarget_);
+    thumbScale_.SampleFrame(GetTickCount64());
 }
 
 void SliderWidget::OnDraw(Renderer& r) {
@@ -655,7 +640,7 @@ void SliderWidget::OnDraw(Renderer& r) {
     r.DrawRoundedRect(thumbOuter, outerR, outerR, thumbBorder, 1.0f);
 
     float innerBase = 6.0f;
-    float innerR = innerBase * thumbScaleCurrent_;
+    float innerR = innerBase * thumbScale_.Current();
     D2D1_RECT_F innerDot = {thumbX - innerR, cy - innerR, thumbX + innerR, cy + innerR};
     r.FillRoundedRect(innerDot, innerR, innerR, accent);
 }
@@ -672,6 +657,7 @@ bool SliderWidget::OnMouseDown(const MouseEvent& e) {
     if (Contains(e.x, e.y)) {
         dragging_ = true;
         pressed = true;
+        RetargetThumbAnimation();
         value_ = ValueFromX(e.x);
         if (onFloatChanged) onFloatChanged(value_);
         return true;
@@ -691,6 +677,7 @@ bool SliderWidget::OnMouseMove(const MouseEvent& e) {
     float dx = e.x - thumbX, dy = e.y - cy;
     bool nearThumb = (dx * dx + dy * dy) <= (14.0f * 14.0f);  // 14px radius hit area
     hovered = inBounds && nearThumb;
+    RetargetThumbAnimation();
 
     if (dragging_) {
         value_ = ValueFromX(e.x);
@@ -704,6 +691,7 @@ bool SliderWidget::OnMouseUp(const MouseEvent& e) {
     if (dragging_) {
         dragging_ = false;
         pressed = false;
+        RetargetThumbAnimation();
         return true;
     }
     return false;
@@ -714,6 +702,27 @@ D2D1_SIZE_F SliderWidget::SizeHint() const {
 }
 
 // ---- Image ----
+
+ImageWidget::~ImageWidget() {
+    ClearImageResource();
+}
+
+void ImageWidget::ClearImageResource() {
+    if (imageResourceKey_.IsValid()) {
+        GlobalResourceStore().Remove(imageResourceKey_);
+        imageResourceKey_ = {};
+    }
+    bitmap_.Reset();
+    intrinsicW_ = 0.0f;
+    intrinsicH_ = 0.0f;
+}
+
+void ImageWidget::SetSrc(const std::string& src) {
+    if (src_ == src) return;
+    ClearImageResource();
+    src_ = src;
+    loadFailed_ = false;
+}
 
 D2D1_SIZE_F ImageWidget::SizeHint() const {
     /* CSS 给了显式 width/height 就用它（HBox/VBox 已经按这个排）。否则
@@ -728,25 +737,41 @@ void ImageWidget::OnDraw(Renderer& r) {
     Widget::OnDraw(r);
 
     /* lazy 加载。loadFailed_ 防止每帧重试。 */
-    if (!bitmap_ && !loadFailed_ && !src_.empty()) {
+    if (!imageResourceKey_.IsValid() && !loadFailed_ && !src_.empty()) {
         const void* bytes = nullptr;
         size_t size = 0;
         ui::asset::DataOwnerPtr owner;
         if (ui::asset::Resolve(src_, &bytes, &size, &owner)) {
-            bitmap_ = r.LoadImageFromBytes(bytes, size);
+            std::vector<uint8_t> pixels;
+            int width = 0, height = 0, stride = 0;
+            if (r.DecodeImageBytesToBgraPremul(bytes, size, pixels, width, height, stride)) {
+                const uint64_t nextGeneration = imageGeneration_ + 1;
+                ResourceKey key = GlobalResourceStore().AddImage(
+                    ResourceKind::Bitmap, nextGeneration, width, height, stride,
+                    PixelFormat::BgraPremul, pixels.data(), true);
+                if (key.IsValid()) {
+                    imageResourceKey_ = key;
+                    imageGeneration_ = nextGeneration;
+                    intrinsicW_ = static_cast<float>(width);
+                    intrinsicH_ = static_cast<float>(height);
+                }
+            }
         }
-        if (!bitmap_) {
+        if (!imageResourceKey_.IsValid()) {
             loadFailed_ = true;   // 不再重试，避免每帧 IO
-        } else {
-            auto sz = bitmap_->GetSize();
-            intrinsicW_ = sz.width;
-            intrinsicH_ = sz.height;
         }
     }
-    if (!bitmap_) return;
+    if (!imageResourceKey_.IsValid()) return;
 
-    auto sz = bitmap_->GetSize();
-    float bw = sz.width, bh = sz.height;
+    if (!bitmap_ && r.RT()) {
+        auto res = GlobalResourceStore().Acquire(imageResourceKey_);
+        if (res && res->bytes) {
+            bitmap_ = r.CreateBitmapFromPixels(res->bytes->data(), res->width, res->height, res->stride);
+        }
+    }
+
+    float bw = intrinsicW_;
+    float bh = intrinsicH_;
     if (bw <= 0 || bh <= 0) return;
 
     float rw = rect.right - rect.left;
@@ -758,7 +783,8 @@ void ImageWidget::OnDraw(Renderer& r) {
         /* 不缩放，左上角对齐，超出部分裁剪 */
         dst = { rect.left, rect.top, rect.left + bw, rect.top + bh };
         r.PushClip(rect);
-        r.RT()->DrawBitmap(bitmap_.Get(), dst);
+        r.RecordImage(imageResourceKey_, dst, ImageSampling::Linear);
+        if (bitmap_) r.DrawBitmap(bitmap_.Get(), dst);
         r.PopClip();
         return;
     }
@@ -777,7 +803,8 @@ void ImageWidget::OnDraw(Renderer& r) {
         dst = { dx, dy, dx + dw, dy + dh };
     }
     r.PushClip(rect);
-    r.RT()->DrawBitmap(bitmap_.Get(), dst);
+    r.RecordImage(imageResourceKey_, dst, ImageSampling::Linear);
+    if (bitmap_) r.DrawBitmap(bitmap_.Get(), dst);
     r.PopClip();
 }
 
@@ -802,18 +829,18 @@ bool TextInputWidget::ShouldShowCaret() const {
     return ((elapsed / blinkMs) % 2ULL) == 0ULL;
 }
 
-int TextInputWidget::CharIndexFromX(float x) const {
-    if (!cachedRenderer_) return cursorPos_;
+int TextInputWidget::CharIndexFromX(MeasureContext& measure, float x) const {
+    float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
     float textX = rect.left + 11.0f - scrollX_;
     if (x <= textX) return 0;
 
     for (int i = 0; i <= (int)text_.size(); i++) {
         std::wstring substr = text_.substr(0, i);
-        float w = cachedRenderer_->MeasureTextWidth(substr, theme::kFontSizeNormal, nullptr);
+        float w = measure.MeasureTextWidth(substr, fontSize, nullptr);
         float charX = textX + w;
         if (i < (int)text_.size()) {
             std::wstring nextSubstr = text_.substr(0, i + 1);
-            float nextW = cachedRenderer_->MeasureTextWidth(nextSubstr, theme::kFontSizeNormal, nullptr);
+            float nextW = measure.MeasureTextWidth(nextSubstr, fontSize, nullptr);
             float nextCharX = textX + nextW;
             if (x < (charX + nextCharX) / 2.0f) return i;
         } else {
@@ -832,11 +859,11 @@ void TextInputWidget::DeleteSelection() {
     ClearSelection();
 }
 
-void TextInputWidget::EnsureCursorVisible() {
-    if (!cachedRenderer_) return;
+void TextInputWidget::EnsureCursorVisible(MeasureContext& measure) {
+    float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
     float textAreaW = rect.right - rect.left - 22.0f;  // 11px padding each side
     std::wstring before = text_.substr(0, cursorPos_);
-    float cursorX = cachedRenderer_->MeasureTextWidth(before, theme::kFontSizeNormal, nullptr);
+    float cursorX = measure.MeasureTextWidth(before, fontSize, nullptr);
 
     if (cursorX - scrollX_ < 0) scrollX_ = cursorX;
     else if (cursorX - scrollX_ > textAreaW) scrollX_ = cursorX - textAreaW;
@@ -877,7 +904,6 @@ std::wstring TextInputWidget::GetClipboardText() {
 }
 
 void TextInputWidget::OnDraw(Renderer& r) {
-    cachedRenderer_ = &r;
     bool dark = theme::IsDark();
     float cr = (css.borderRadius >= 0) ? css.borderRadius : theme::radius::medium;
     float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
@@ -1009,7 +1035,9 @@ void TextInputWidget::OnDraw(Renderer& r) {
     }
 
     r.PopClip();
-    EnsureCursorVisible();
+    MeasureContext paintMeasure;
+    paintMeasure.BindRenderer(&r);
+    EnsureCursorVisible(paintMeasure);
 }
 
 bool TextInputWidget::OnMouseDown(const MouseEvent& e) {
@@ -1017,7 +1045,10 @@ bool TextInputWidget::OnMouseDown(const MouseEvent& e) {
     bool wasFocused = focused;
     focused = Contains(e.x, e.y);
     if (focused) {
-        cursorPos_ = CharIndexFromX(e.x);
+        extern MeasureContext* g_activeMeasureContext;
+        if (g_activeMeasureContext) {
+            cursorPos_ = CharIndexFromX(*g_activeMeasureContext, e.x);
+        }
         if (GetKeyState(VK_SHIFT) & 0x8000) {
             if (selectionStart_ < 0) selectionStart_ = cursorPos_;
             selectionEnd_ = cursorPos_;
@@ -1036,7 +1067,10 @@ bool TextInputWidget::OnMouseDown(const MouseEvent& e) {
 bool TextInputWidget::OnMouseMove(const MouseEvent& e) {
     hovered = Contains(e.x, e.y);
     if (dragging_ && focused) {
-        cursorPos_ = CharIndexFromX(e.x);
+        extern MeasureContext* g_activeMeasureContext;
+        if (g_activeMeasureContext) {
+            cursorPos_ = CharIndexFromX(*g_activeMeasureContext, e.x);
+        }
         selectionEnd_ = cursorPos_;
         return true;
     }
@@ -1073,6 +1107,8 @@ bool TextInputWidget::OnKeyChar(wchar_t ch) {
     }
 
     ResetCaretBlink();
+    extern MeasureContext* g_activeMeasureContext;
+    if (g_activeMeasureContext) EnsureCursorVisible(*g_activeMeasureContext);
     if (onTextChanged) onTextChanged(text_);
     return true;
 }
@@ -1114,6 +1150,8 @@ bool TextInputWidget::OnKeyDown(int vk) {
             }
         }
         ResetCaretBlink();
+        extern MeasureContext* g_activeMeasureContext;
+        if (g_activeMeasureContext) EnsureCursorVisible(*g_activeMeasureContext);
         return true;
     }
     if (ctrl && vk == 'A') {
@@ -1142,6 +1180,8 @@ bool TextInputWidget::OnKeyDown(int vk) {
     }
 
     ResetCaretBlink();
+    extern MeasureContext* g_activeMeasureContext;
+    if (g_activeMeasureContext) EnsureCursorVisible(*g_activeMeasureContext);
     if ((vk == 0x2E || (ctrl && vk == 'V') || (ctrl && vk == 'X')) && onTextChanged)
         onTextChanged(text_);
     return true;
@@ -1225,9 +1265,7 @@ void TextAreaWidget::SetText(const std::wstring& t) {
 // Single IDWriteTextLayout shared by hit-test + caret + selection + draw.
 // Re-built when text / max-width / fontSize / wrap mode change.
 
-IDWriteTextLayout* TextAreaWidget::EnsureLayout(Renderer& r, float fontSize) const {
-    if (!r.DWFactory()) return nullptr;
-
+IDWriteTextLayout* TextAreaWidget::EnsureLayout(MeasureContext& measure, float fontSize) const {
     float maxW = (rect.right - rect.left) - 2 * kPad;
     if (maxW <= 0) maxW = 1;
     // When wrap is off, give layout effectively-unbounded width so each
@@ -1245,7 +1283,7 @@ IDWriteTextLayout* TextAreaWidget::EnsureLayout(Renderer& r, float fontSize) con
 
     // Empty text → single space so we still get line metrics for caret height.
     std::wstring src = text_.empty() ? std::wstring(L" ") : text_;
-    cachedLayout_ = r.CreateTextLayout(src, layoutW, 1e6f, fontSize, wrap_);
+    cachedLayout_ = measure.CreateTextLayout(src, layoutW, 1e6f, fontSize, wrap_);
     if (!cachedLayout_) return nullptr;
 
     // Sample a baseline line height from line metrics.
@@ -1344,7 +1382,11 @@ void TextAreaWidget::DeleteSelection() {
     layoutDirty_ = true;
 }
 
-void TextAreaWidget::EnsureCursorVisible() {
+void TextAreaWidget::EnsureCursorVisible(MeasureContext* measure) {
+    if (measure) {
+        float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
+        EnsureLayout(*measure, fontSize);
+    }
     if (!cachedLayout_) return;
     float cx, cy, ch;
     if (!CaretXYForPos(cursorPos_, cx, cy, ch)) return;
@@ -1391,7 +1433,6 @@ std::wstring TextAreaWidget::GetClipboardText() {
 }
 
 void TextAreaWidget::OnDraw(Renderer& r) {
-    cachedRenderer_ = &r;
     bool dark = theme::IsDark();
     float cr = (css.borderRadius >= 0) ? css.borderRadius : theme::radius::medium;
     float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
@@ -1448,7 +1489,9 @@ void TextAreaWidget::OnDraw(Renderer& r) {
             r.DrawLine(cursorX, cy1, cursorX, cy2, caret, 1.5f);
         }
     } else {
-        IDWriteTextLayout* layout = EnsureLayout(r, fontSize);
+        MeasureContext paintMeasure;
+        paintMeasure.BindRenderer(&r);
+        IDWriteTextLayout* layout = EnsureLayout(paintMeasure, fontSize);
         if (layout) {
             float originX = rect.left + kPad;
             float originY = rect.top + kPad - scrollY_;
@@ -1493,26 +1536,29 @@ void TextAreaWidget::OnDraw(Renderer& r) {
                 }
             }
 
-            // ---- Text: one DrawTextLayout for the whole content ----
-            if (auto* rt = r.RT()) {
-                ComPtr<ID2D1SolidColorBrush> brush;
-                rt->CreateSolidColorBrush(fg, brush.GetAddressOf());
-                if (brush) {
-                    rt->DrawTextLayout({originX, originY}, layout, brush.Get());
-                }
-                // Re-draw the selected glyphs in selFg by clipping to each line's
-                // selection rect. Cheap because the layout is already shaped/cached.
-                if (hasSelFg && !selHits.empty()) {
-                    ComPtr<ID2D1SolidColorBrush> selBrush;
-                    rt->CreateSolidColorBrush(selFg, selBrush.GetAddressOf());
-                    if (selBrush) {
-                        for (const auto& m : selHits) {
-                            D2D1_RECT_F clip = {m.left, m.top, m.left + m.width, m.top + m.height};
-                            r.PushClip(clip);
-                            rt->DrawTextLayout({originX, originY}, layout, selBrush.Get());
-                            r.PopClip();
-                        }
-                    }
+            // ---- Text: draw through Renderer so the DisplayList records it ----
+            const float layoutW = textArea.right - textArea.left;
+            const float layoutH = std::max(textArea.bottom - textArea.top + scrollY_,
+                                           ContentHeight());
+            D2D1_RECT_F textRect = {originX, originY, originX + layoutW, originY + layoutH};
+            r.DrawText(text_, textRect, fg, fontSize,
+                       DWRITE_TEXT_ALIGNMENT_LEADING,
+                       DWRITE_FONT_WEIGHT_NORMAL,
+                       DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
+                       wrap_);
+            // Re-draw the selected glyphs in selFg by clipping to each line's
+            // selection rect. Cheap enough here; selection rectangles still come
+            // from the cached layout used for hit-testing/caret geometry.
+            if (hasSelFg && !selHits.empty()) {
+                for (const auto& m : selHits) {
+                    D2D1_RECT_F clip = {m.left, m.top, m.left + m.width, m.top + m.height};
+                    r.PushClip(clip);
+                    r.DrawText(text_, textRect, selFg, fontSize,
+                               DWRITE_TEXT_ALIGNMENT_LEADING,
+                               DWRITE_FONT_WEIGHT_NORMAL,
+                               DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
+                               wrap_);
+                    r.PopClip();
                 }
             }
 
@@ -1556,6 +1602,11 @@ bool TextAreaWidget::OnMouseDown(const MouseEvent& e) {
 
     focused = Contains(e.x, e.y);
     if (focused) {
+        extern MeasureContext* g_activeMeasureContext;
+        if (g_activeMeasureContext) {
+            float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
+            EnsureLayout(*g_activeMeasureContext, fontSize);
+        }
         cursorPos_ = HitTestPosFromXY(e.x, e.y);
         if (GetKeyState(VK_SHIFT) & 0x8000) {
             if (selectionStart_ < 0) selectionStart_ = cursorPos_;
@@ -1586,6 +1637,11 @@ bool TextAreaWidget::OnMouseMove(const MouseEvent& e) {
         return true;
     }
     if (dragging_ && focused) {
+        extern MeasureContext* g_activeMeasureContext;
+        if (g_activeMeasureContext) {
+            float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
+            EnsureLayout(*g_activeMeasureContext, fontSize);
+        }
         cursorPos_ = HitTestPosFromXY(e.x, e.y);
         selectionEnd_ = cursorPos_;
         return true;
@@ -1640,13 +1696,20 @@ bool TextAreaWidget::OnKeyChar(wchar_t ch) {
     }
 
     ResetCaretBlink();
-    EnsureCursorVisible();
+    extern MeasureContext* g_activeMeasureContext;
+    EnsureCursorVisible(g_activeMeasureContext);
     if (onTextChanged) onTextChanged(text_);
     return true;
 }
 
 bool TextAreaWidget::OnKeyDown(int vk) {
     if (!focused || !enabled) return false;
+
+    extern MeasureContext* g_activeMeasureContext;
+    if (g_activeMeasureContext) {
+        float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
+        EnsureLayout(*g_activeMeasureContext, fontSize);
+    }
 
     bool shift = GetKeyState(VK_SHIFT) & 0x8000;
     bool ctrl = GetKeyState(VK_CONTROL) & 0x8000;
@@ -1676,6 +1739,7 @@ bool TextAreaWidget::OnKeyDown(int vk) {
             }
         }
         ResetCaretBlink();
+        EnsureCursorVisible(g_activeMeasureContext);
         return true;
     }
     if (ctrl && vk == 'A') {
@@ -1709,7 +1773,7 @@ bool TextAreaWidget::OnKeyDown(int vk) {
     }
 
     ResetCaretBlink();
-    EnsureCursorVisible();
+    EnsureCursorVisible(g_activeMeasureContext);
     if ((vk == 0x2E || (ctrl && vk == 'V') || (ctrl && vk == 'X')) && onTextChanged)
         onTextChanged(text_);
     return true;
@@ -2230,42 +2294,15 @@ void RadioButtonWidget::SetSelected(bool v) {
     if (selected_) {
         DeselectSiblings();
     }
-    animating_ = true;
-    lastTick_ = 0;
+    selectAnim_.SetTarget(selected_ ? 1.0f : 0.0f);
+    animating_ = selectAnim_.Active();
+    ui::GetContext().RegisterAnimatingWidget(this);
 }
 
 void RadioButtonWidget::UpdateAnimation() {
-    uint64_t now = GetTickCount64();
-    if (lastTick_ == 0) lastTick_ = now;
-
-    if (!animating_) {
-        selectAnimProgress_ = selected_ ? 1.0f : 0.0f;
-        return;
-    }
-
-    float target = selected_ ? 1.0f : 0.0f;
-    float diff = target - selectAnimProgress_;
-
-    if (std::abs(diff) < 0.001f) {
-        selectAnimProgress_ = target;
-        animating_ = false;
-        return;
-    }
-
-    float elapsed = (float)(now - lastTick_);
-    float increment = elapsed / animDurationMs_;
-    lastTick_ = now;
-
-    if (diff > 0) {
-        selectAnimProgress_ = std::min(1.0f, selectAnimProgress_ + increment);
-    } else {
-        selectAnimProgress_ = std::max(0.0f, selectAnimProgress_ - increment);
-    }
-
-    if ((diff > 0 && selectAnimProgress_ >= 1.0f) || (diff < 0 && selectAnimProgress_ <= 0.0f)) {
-        selectAnimProgress_ = target;
-        animating_ = false;
-    }
+    selectAnim_.SetIdleTarget(selected_ ? 1.0f : 0.0f);
+    selectAnim_.SampleFrame(GetTickCount64());
+    animating_ = selectAnim_.Active();
 }
 
 void RadioButtonWidget::DeselectSiblings() {
@@ -2300,7 +2337,9 @@ void RadioButtonWidget::OnDraw(Renderer& r) {
     D2D1_COLOR_F fg = css.hasFg ? css.fg : theme::kBtnText();
     float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
 
-    float t = ToggleWidget::ApplyEasing(easingFunc_, selectAnimProgress_);
+    selectAnim_.SetIdleTarget(selected_ ? 1.0f : 0.0f);
+    float t = std::clamp(selectAnim_.SampleFrame(GetTickCount64()), 0.0f, 1.0f);
+    animating_ = selectAnim_.Active();
 
     if (t > 0.01f) {
         D2D1_COLOR_F accentFill = hovered ? accentHover : accent;
@@ -2309,7 +2348,7 @@ void RadioButtonWidget::OnDraw(Renderer& r) {
         float dotBaseR = 6.0f;
         if (pressed)      dotBaseR = 5.0f;
         else if (hovered) dotBaseR = 7.0f;
-        float dotR = dotBaseR * ToggleWidget::ApplyEasing(EasingFunction::EaseOutCubic, t);
+        float dotR = dotBaseR * ApplyEasing(EasingFunction::EaseOutCubic, t);
 
         if (dotR > 0.5f) {
             D2D1_RECT_F inner = {cx - dotR, cy - dotR, cx + dotR, cy + dotR};
@@ -2364,46 +2403,6 @@ D2D1_SIZE_F RadioButtonWidget::SizeHint() const {
 
 // ---- Toggle ----
 
-float ToggleWidget::ApplyEasing(EasingFunction func, float t) {
-    switch (func) {
-        case EasingFunction::Linear:
-            return t;
-        case EasingFunction::EaseInQuad:
-            return t * t;
-        case EasingFunction::EaseOutQuad:
-            return 1 - (1 - t) * (1 - t);
-        case EasingFunction::EaseInOutQuad:
-            return t < 0.5f ? 2 * t * t : 1 - pow(-2 * t + 2, 2) / 2;
-        case EasingFunction::EaseInCubic:
-            return t * t * t;
-        case EasingFunction::EaseOutCubic:
-            return 1 - pow(1 - t, 3);
-        case EasingFunction::EaseInOutCubic:
-            return t < 0.5f ? 4 * t * t * t : 1 - pow(-2 * t + 2, 3) / 2;
-        case EasingFunction::EaseInElastic:
-            return t == 0 ? 0 : t == 1 ? 1 :
-                -pow(2, 10 * t - 10) * sin((t * 10 - 10.75) * (2 * 3.14159 / 3));
-        case EasingFunction::EaseOutElastic:
-            return t == 0 ? 0 : t == 1 ? 1 :
-                pow(2, -10 * t) * sin((t * 10 - 0.75) * (2 * 3.14159 / 3)) + 1;
-        case EasingFunction::EaseInBounce: {
-            float x = 1 - t;
-            if (x < 1/2.75f) return 1 - (7.5625f * x * x);
-            if (x < 2/2.75f) return 1 - (7.5625f * (x -= 1.5f/2.75f) * x + 0.75f);
-            if (x < 2.5f/2.75f) return 1 - (7.5625f * (x -= 2.25f/2.75f) * x + 0.9375f);
-            return 1 - (7.5625f * (x -= 2.625f/2.75f) * x + 0.984375f);
-        }
-        case EasingFunction::EaseOutBounce: {
-            if (t < 1/2.75f) return 7.5625f * t * t;
-            if (t < 2/2.75f) return 7.5625f * (t -= 1.5f/2.75f) * t + 0.75f;
-            if (t < 2.5f/2.75f) return 7.5625f * (t -= 2.25f/2.75f) * t + 0.9375f;
-            return 7.5625f * (t -= 2.625f/2.75f) * t + 0.984375f;
-        }
-        default:
-            return t;
-    }
-}
-
 void ToggleWidget::UpdateCachedColors() {
     bool dark = theme::IsDark();
     // Off-state should feel soft, not high-contrast: track stays near the
@@ -2420,45 +2419,18 @@ void ToggleWidget::UpdateCachedColors() {
 }
 
 void ToggleWidget::UpdateAnimation() {
-    uint64_t now = GetTickCount64();
-    if (lastTick_ == 0) lastTick_ = now;
-
-    if (!animating_) {
-        animProgress_ = on_ ? 1.0f : 0.0f;
-        return;
-    }
-
-    float target = on_ ? 1.0f : 0.0f;
-    float diff = target - animProgress_;
-
-    if (std::abs(diff) < 0.001f) {
-        animProgress_ = target;
-        animating_ = false;
-        return;
-    }
-
-    float elapsed = (float)(now - lastTick_);
-    float increment = elapsed / animDurationMs_;
-    lastTick_ = now;
-
-    if (diff > 0) {
-        animProgress_ = std::min(1.0f, animProgress_ + increment);
-    } else {
-        animProgress_ = std::max(0.0f, animProgress_ - increment);
-    }
-
-    if ((diff > 0 && animProgress_ >= 1.0f) || (diff < 0 && animProgress_ <= 0.0f)) {
-        animProgress_ = target;
-        animating_ = false;
-    }
+    anim_.SetIdleTarget(on_ ? 1.0f : 0.0f);
+    anim_.SampleFrame(GetTickCount64());
+    animating_ = anim_.Active();
 }
 
 void ToggleWidget::SetOn(bool v) {
     if (on_ == v) return;
 
     on_ = v;
-    animating_ = true;
-    lastTick_ = 0;
+    anim_.SetTarget(on_ ? 1.0f : 0.0f);
+    animating_ = anim_.Active();
+    ui::GetContext().RegisterAnimatingWidget(this);
 }
 
 void ToggleWidget::OnDraw(Renderer& r) {
@@ -2481,7 +2453,9 @@ void ToggleWidget::OnDraw(Renderer& r) {
     D2D1_COLOR_F onTrack  = css.hasAccent ? css.accent : CachedTrackColorOn_;
     D2D1_COLOR_F offTrack = (bgColor.a > 0) ? bgColor  : CachedTrackColorOff_;
 
-    float t = ApplyEasing(easingFunc_, animProgress_);
+    anim_.SetIdleTarget(on_ ? 1.0f : 0.0f);
+    float t = std::clamp(anim_.SampleFrame(GetTickCount64()), 0.0f, 1.0f);
+    animating_ = anim_.Active();
     D2D1_COLOR_F trackColor = {
         offTrack.r + t * (onTrack.r - offTrack.r),
         offTrack.g + t * (onTrack.g - offTrack.g),
@@ -2562,51 +2536,24 @@ void ProgressBarWidget::SetValue(float v, bool animate) {
 
     if (!animate) {
         value_ = targetValue_;
-        animProgress_ = targetValue_;
+        valueAnim_.SetImmediate(targetValue_);
         animating_ = false;
         return;
     }
 
-    if (value_ != targetValue_) {
-        animating_ = true;
-        lastTick_ = 0;
+    if (value_ != targetValue_ || valueAnim_.Current() != targetValue_) {
+        value_ = targetValue_;
+        valueAnim_.SetTarget(targetValue_);
+        animating_ = valueAnim_.Active();
+        if (!animating_) return;
+        ui::GetContext().RegisterAnimatingWidget(this);
     }
 }
 
 void ProgressBarWidget::UpdateAnimation() {
-    uint64_t now = GetTickCount64();
-    if (lastTick_ == 0) lastTick_ = now;
-
-    if (!animating_) {
-        animProgress_ = value_;
-        return;
-    }
-
-    float diff = targetValue_ - animProgress_;
-
-    if (std::abs(diff) < 0.001f) {
-        animProgress_ = targetValue_;
-        value_ = targetValue_;
-        animating_ = false;
-        return;
-    }
-
-    float elapsed = (float)(now - lastTick_);
-    float range = targetValue_ - value_;
-    float increment = (elapsed / animDurationMs_) * std::abs(range);
-    lastTick_ = now;
-
-    if (range > 0) {
-        animProgress_ = std::min(targetValue_, animProgress_ + increment);
-    } else {
-        animProgress_ = std::max(targetValue_, animProgress_ - increment);
-    }
-
-    if ((range > 0 && animProgress_ >= targetValue_) || (range < 0 && animProgress_ <= targetValue_)) {
-        animProgress_ = targetValue_;
-        value_ = targetValue_;
-        animating_ = false;
-    }
+    valueAnim_.SetIdleTarget(targetValue_);
+    valueAnim_.SampleFrame(GetTickCount64());
+    animating_ = valueAnim_.Active();
 }
 
 void ProgressBarWidget::OnDraw(Renderer& r) {
@@ -2641,7 +2588,10 @@ void ProgressBarWidget::OnDraw(Renderer& r) {
             r.FillRoundedRect(fillRect, cr, cr, accent);
         }
     } else {
-        float pct = (max_ > min_) ? (animProgress_ - min_) / (max_ - min_) : 0;
+        valueAnim_.SetIdleTarget(targetValue_);
+        float visualValue = valueAnim_.SampleFrame(GetTickCount64());
+        animating_ = valueAnim_.Active();
+        float pct = (max_ > min_) ? (visualValue - min_) / (max_ - min_) : 0;
         float fillW = (rect.right - rect.left) * pct;
         if (fillW > 0) {
             D2D1_RECT_F fillRect = {rect.left, cy - barH/2, rect.left + fillW, cy + barH/2};
@@ -2767,6 +2717,11 @@ ImageViewWidget::ImageViewWidget() {
 }
 
 ImageViewWidget::~ImageViewWidget() {
+    ClearBitmapResource();
+    if (checkerTileResourceKey_.IsValid()) {
+        GlobalResourceStore().Remove(checkerTileResourceKey_);
+    }
+    ClearTiles();
     if (loadingTimerId_) {
         KillTimer(NULL, loadingTimerId_);
         g_loadingTimerMap.erase(loadingTimerId_);
@@ -2793,60 +2748,155 @@ void ImageViewWidget::LoadFromFile(const std::wstring& path, Renderer& r) {
         StopAnimation();
         gif_ = std::move(player);
         currentFrame_ = 0;
-        /* 合成帧 0 到 CPU 画布，创建唯一 GPU 位图（后续帧通过 CopyFromMemory 复用） */
+        /* 合成帧 0 到 CPU 画布，创建 resource 主状态；GPU 位图只是有 RT 时的缓存。 */
         const uint8_t* px = gif_->ComposeTo(0);
         int w = gif_->CanvasWidth();
         int h = gif_->CanvasHeight();
-        bitmap_ = (px ? r.CreateBitmapFromPixels(px, w, h, w * 4) : nullptr);
-        if (bitmap_) {
-            imgW_ = w;
-            imgH_ = h;
-        }
+        if (px) SetBitmapResourceFromPixels(px, w, h, w * 4, r, false);
         StartAnimation();
         return;
     }
     /* 静态图 */
-    auto bmp = r.LoadImageFromFile(path);
-    SetBitmap(bmp);
-}
-
-void ImageViewWidget::SetBitmap(ComPtr<ID2D1Bitmap> bmp) {
-    StopAnimation();
-    gif_.reset();
-    currentFrame_ = 0;
-    bitmap_ = bmp;
-    if (bitmap_) {
-        auto sz = bitmap_->GetPixelSize();
-        imgW_ = (int)sz.width;
-        imgH_ = (int)sz.height;
+    std::vector<uint8_t> pixels;
+    int w = 0, h = 0, stride = 0;
+    if (r.DecodeImageFileToBgraPremul(path, pixels, w, h, stride)) {
+        SetBitmapResourceFromPixels(pixels.data(), w, h, stride, r, true);
     } else {
-        imgW_ = imgH_ = 0;
+        ClearImage();
     }
 }
 
+void ImageViewWidget::ClearImage() {
+    StopAnimation();
+    gif_.reset();
+    currentFrame_ = 0;
+    ClearBitmapResource();
+    bitmap_.Reset();
+    imgW_ = imgH_ = 0;
+    ++bitmapGeneration_;
+    if (tiledMode_) ClearTiles();
+}
+
+bool ImageViewWidget::CopyPixels(void** outPixels, int* outW, int* outH) const {
+    if (outPixels) *outPixels = nullptr;
+    if (outW) *outW = 0;
+    if (outH) *outH = 0;
+    if (!outPixels || !outW || !outH || tiledMode_) return false;
+
+    auto res = GlobalResourceStore().Acquire(bitmapResourceKey_);
+    if (!res || !res->bytes || res->format != PixelFormat::BgraPremul ||
+        res->width <= 0 || res->height <= 0 ||
+        res->stride < res->width * 4) {
+        return false;
+    }
+
+    const size_t rowBytes = static_cast<size_t>(res->width) * 4u;
+    const size_t totalBytes = rowBytes * static_cast<size_t>(res->height);
+    void* buf = std::malloc(totalBytes);
+    if (!buf) return false;
+
+    auto* dst = static_cast<uint8_t*>(buf);
+    const auto* src = res->bytes->data();
+    for (int y = 0; y < res->height; ++y) {
+        std::memcpy(dst + static_cast<size_t>(y) * rowBytes,
+                    src + static_cast<size_t>(y) * res->stride,
+                    rowBytes);
+    }
+
+    *outPixels = buf;
+    *outW = res->width;
+    *outH = res->height;
+    return true;
+}
+
+void ImageViewWidget::ClearBitmapResource() {
+    if (!bitmapResourceKey_.IsValid()) return;
+    GlobalResourceStore().Remove(bitmapResourceKey_);
+    bitmapResourceKey_ = {};
+}
+
+bool ImageViewWidget::SetBitmapResourceFromPixels(const void* pixels, int w, int h, int stride,
+                                                  Renderer& r, bool resetAnimation) {
+    const uint64_t nextGeneration = bitmapGeneration_ + 1;
+    ResourceKey resourceKey = GlobalResourceStore().AddImage(
+        ResourceKind::Bitmap, nextGeneration, w, h, stride,
+        PixelFormat::BgraPremul, pixels, true);
+    auto res = GlobalResourceStore().Acquire(resourceKey);
+    if (!res || !res->bytes) {
+        if (resourceKey.IsValid()) GlobalResourceStore().Remove(resourceKey);
+        ClearImage();
+        return false;
+    }
+
+    auto bmp = r.CreateBitmapFromPixels(res->bytes->data(), res->width, res->height, res->stride);
+
+    ClearBitmapResource();
+    if (resetAnimation) {
+        StopAnimation();
+        gif_.reset();
+        currentFrame_ = 0;
+    }
+    bitmapGeneration_ = nextGeneration;
+    bitmap_ = std::move(bmp);
+    bitmapResourceKey_ = resourceKey;
+    imgW_ = res->width;
+    imgH_ = res->height;
+    return true;
+}
+
 void ImageViewWidget::SetBitmapFromPixels(const void* pixels, int w, int h, int stride, Renderer& r) {
-    auto bmp = r.CreateBitmapFromPixels(pixels, w, h, stride);
-    SetBitmap(bmp);
+    SetBitmapResourceFromPixels(pixels, w, h, stride, r, true);
 }
 
 void ImageViewWidget::CreateEmpty(int w, int h, Renderer& r) {
-    auto bmp = r.CreateEmptyBitmap(w, h);
-    SetBitmap(bmp);
+    if (w <= 0 || h <= 0) {
+        ClearImage();
+        return;
+    }
+    const size_t rowBytes = static_cast<size_t>(w) * 4;
+    if (rowBytes > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        ClearImage();
+        return;
+    }
+    if (static_cast<size_t>(h) > static_cast<size_t>(-1) / rowBytes) {
+        ClearImage();
+        return;
+    }
+    std::vector<uint8_t> pixels(rowBytes * static_cast<size_t>(h), 0);
+    SetBitmapResourceFromPixels(pixels.data(), w, h, static_cast<int>(rowBytes), r, true);
 }
 
 void ImageViewWidget::UpdateRegion(int x, int y, const void* pixels, int w, int h, int stride) {
-    if (!bitmap_ || !pixels || w <= 0 || h <= 0) return;
+    if (!pixels || w <= 0 || h <= 0) return;
+    const int pitch = (stride > 0) ? stride : (w * 4);
+    const size_t rowBytes = static_cast<size_t>(w) * 4;
+    if (pitch <= 0 || static_cast<size_t>(pitch) < rowBytes) return;
 
-    /* 用像素尺寸做边界检查（imgW_/imgH_ 是 DIP，高 DPI 下不同） */
-    auto pxSz = bitmap_->GetPixelSize();
-    int pxW = static_cast<int>(pxSz.width);
-    int pxH = static_cast<int>(pxSz.height);
+    auto res = GlobalResourceStore().Acquire(bitmapResourceKey_);
+    if (!res || !res->bytes || res->format != PixelFormat::BgraPremul ||
+        res->stride < res->width * 4) {
+        return;
+    }
+    const int pxW = res->width;
+    const int pxH = res->height;
+
     if (x < 0 || y < 0 || x + w > pxW || y + h > pxH) return;
+    std::vector<uint8_t> updated = *res->bytes;
+    const uint8_t* src = static_cast<const uint8_t*>(pixels);
+    for (int row = 0; row < h; ++row) {
+        uint8_t* dst = updated.data() + static_cast<size_t>(y + row) * res->stride + static_cast<size_t>(x) * 4;
+        std::memcpy(dst, src + static_cast<size_t>(row) * pitch, rowBytes);
+    }
 
-    D2D1_RECT_U destRect = { static_cast<UINT32>(x), static_cast<UINT32>(y),
-                              static_cast<UINT32>(x + w), static_cast<UINT32>(y + h) };
-    UINT32 pitch = (stride > 0) ? static_cast<UINT32>(stride) : static_cast<UINT32>(w * 4);
-    bitmap_->CopyFromMemory(&destRect, pixels, pitch);
+    const uint64_t nextGeneration = bitmapGeneration_ + 1;
+    ResourceKey newKey = GlobalResourceStore().AddImage(
+        ResourceKind::Bitmap, nextGeneration, res->width, res->height, res->stride,
+        res->format, updated.data(), true);
+    if (!newKey.IsValid()) return;
+    GlobalResourceStore().Remove(bitmapResourceKey_);
+    bitmapResourceKey_ = newKey;
+    bitmapGeneration_ = nextGeneration;
+    bitmap_.Reset();
 }
 
 void ImageViewWidget::SetZoom(float z) {
@@ -2883,9 +2933,24 @@ void ImageViewWidget::NotifyViewport() {
 
 void ImageViewWidget::EnsureCheckerboardTile(Renderer& r) {
     int curTheme = (int)theme::CurrentMode();
-    if (checkerTile_ && checkerTheme_ == curTheme) return;
+    if (checkerTileResourceKey_.IsValid() && checkerTheme_ == curTheme) {
+        if (!checkerTile_) {
+            auto res = GlobalResourceStore().Acquire(checkerTileResourceKey_);
+            if (res && res->bytes) {
+                checkerTile_ = r.CreateBitmapFromPixels(
+                    res->bytes->data(), res->width, res->height, res->stride);
+            }
+        }
+        return;
+    }
 
     /* 生成 16x16 棋盘格位图（2x2 个 8px 格子） */
+    if (checkerTileResourceKey_.IsValid()) {
+        GlobalResourceStore().Remove(checkerTileResourceKey_);
+        checkerTileResourceKey_ = {};
+    }
+    checkerTile_.Reset();
+
     const int sz = 16;
     uint8_t pixels[sz * sz * 4];
     uint32_t c1, c2;
@@ -2906,14 +2971,27 @@ void ImageViewWidget::EnsureCheckerboardTile(Renderer& r) {
             memcpy(pixels + (y * sz + x) * 4, &c, 4);
         }
     }
-    checkerTile_ = r.CreateBitmapFromPixels(pixels, sz, sz, 0);
+
+    const uint64_t nextGeneration = checkerTileGeneration_ + 1;
+    ResourceKey resourceKey = GlobalResourceStore().AddImage(
+        ResourceKind::Bitmap, nextGeneration, sz, sz, sz * 4,
+        PixelFormat::BgraPremul, pixels, true);
+    if (!resourceKey.IsValid()) return;
+
+    checkerTileResourceKey_ = resourceKey;
+    checkerTileGeneration_ = nextGeneration;
+    auto res = GlobalResourceStore().Acquire(checkerTileResourceKey_);
+    if (res && res->bytes) {
+        checkerTile_ = r.CreateBitmapFromPixels(
+            res->bytes->data(), res->width, res->height, res->stride);
+    }
     checkerTheme_ = curTheme;
 }
 
 void ImageViewWidget::DrawCheckerboard(Renderer& r, const D2D1_RECT_F& area) {
     EnsureCheckerboardTile(r);
-    if (!checkerTile_) return;
-    r.FillRectWithBitmap(checkerTile_.Get(), area);
+    if (!checkerTile_ && !checkerTileResourceKey_.IsValid()) return;
+    r.FillRectWithImagePattern(checkerTileResourceKey_, checkerTile_.Get(), area);
 }
 
 /* ---- GIF 动画 timer ---- */
@@ -2937,14 +3015,18 @@ void CALLBACK ImageViewWidget::AnimTimerProc(HWND, UINT, UINT_PTR id, DWORD) {
 }
 
 void ImageViewWidget::AdvanceFrame() {
-    if (!gif_ || gif_->FrameCount() <= 1 || !bitmap_) return;
+    if (!gif_ || gif_->FrameCount() <= 1 ||
+        (!bitmap_ && !bitmapResourceKey_.IsValid())) {
+        return;
+    }
     currentFrame_ = (currentFrame_ + 1) % gif_->FrameCount();
 
-    /* 合成下一帧并上传到唯一 GPU 位图 */
+    /* 合成下一帧并同步到 CPU resource；GPU 位图有缓存时由 UpdateRegion 顺带更新。 */
     const uint8_t* px = gif_->ComposeTo(currentFrame_);
     if (px) {
-        UINT stride = (UINT)gif_->CanvasWidth() * 4;
-        bitmap_->CopyFromMemory(nullptr, px, stride);
+        int w = gif_->CanvasWidth();
+        int h = gif_->CanvasHeight();
+        UpdateRegion(0, 0, px, w, h, w * 4);
     }
 
     /* 设下一帧的 delay */
@@ -3017,47 +3099,30 @@ void ImageViewWidget::SetLoading(bool on) {
 
 static void DrawSpinner(Renderer& r, float cx, float cy, float radius,
                         float angle, const D2D1_COLOR_F& color, float strokeW) {
-    auto* rt = r.RT();
-    auto* factory = r.Factory();
-    if (!rt || !factory) return;
-
-    ComPtr<ID2D1PathGeometry> path;
-    factory->CreatePathGeometry(path.GetAddressOf());
-    if (!path) return;
-
-    ComPtr<ID2D1GeometrySink> sink;
-    path->Open(sink.GetAddressOf());
-    if (!sink) return;
-
-    /* 画 270° 圆弧 */
-    float startAngle = angle;
-    float sweepAngle = 270.0f;
-    float startRad = startAngle * 3.14159265f / 180.0f;
-    float endRad = (startAngle + sweepAngle) * 3.14159265f / 180.0f;
-
-    D2D1_POINT_2F startPt = {cx + radius * cosf(startRad), cy + radius * sinf(startRad)};
-    D2D1_POINT_2F endPt = {cx + radius * cosf(endRad), cy + radius * sinf(endRad)};
-
-    sink->BeginFigure(startPt, D2D1_FIGURE_BEGIN_HOLLOW);
-    D2D1_ARC_SEGMENT arc = {};
-    arc.point = endPt;
-    arc.size = {radius, radius};
-    arc.rotationAngle = 0;
-    arc.sweepDirection = D2D1_SWEEP_DIRECTION_CLOCKWISE;
-    arc.arcSize = D2D1_ARC_SIZE_LARGE;
-    sink->AddArc(arc);
-    sink->EndFigure(D2D1_FIGURE_END_OPEN);
-    sink->Close();
-
-    ComPtr<ID2D1SolidColorBrush> brush;
-    rt->CreateSolidColorBrush(color, brush.GetAddressOf());
-    if (brush) {
-        rt->DrawGeometry(path.Get(), brush.Get(), strokeW);
+    constexpr int kSegments = 18;
+    constexpr float kSweep = 270.0f;
+    constexpr float kPi = 3.14159265f;
+    D2D1_POINT_2F prev{};
+    for (int i = 0; i <= kSegments; ++i) {
+        const float t = static_cast<float>(i) / static_cast<float>(kSegments);
+        const float a = (angle + kSweep * t) * kPi / 180.0f;
+        D2D1_POINT_2F pt = {cx + radius * cosf(a), cy + radius * sinf(a)};
+        if (i > 0) {
+            D2D1_COLOR_F c = color;
+            c.a *= 0.35f + 0.65f * t;
+            r.DrawLine(prev.x, prev.y, pt.x, pt.y, c, strokeW);
+        }
+        prev = pt;
     }
 }
 
 void ImageViewWidget::SetTiled(int fullW, int fullH, int tileSize, Renderer& r) {
     ClearTiles();
+    ClearBitmapResource();
+    StopAnimation();
+    gif_.reset();
+    currentFrame_ = 0;
+    ++tiledGeneration_;
     bitmap_.Reset();
     imgW_ = 0; imgH_ = 0;
     tiledMode_ = true;
@@ -3069,24 +3134,70 @@ void ImageViewWidget::SetTiled(int fullW, int fullH, int tileSize, Renderer& r) 
 void ImageViewWidget::SetTile(int tx, int ty, const void* pixels, int w, int h, int stride, Renderer& r) {
     if (!tiledMode_ || !pixels || w <= 0 || h <= 0) return;
     auto key = std::make_pair(tx, ty);
-    auto bmp = r.CreateBitmapFromPixels(pixels, w, h, stride);
-    if (bmp) {
-        tiles_[key] = { bmp, w, h };
+    ResourceKey resourceKey = GlobalResourceStore().AddImage(
+        ResourceKind::Tile, tiledGeneration_, w, h, stride,
+        PixelFormat::BgraPremul, pixels, true);
+    auto res = GlobalResourceStore().Acquire(resourceKey);
+    if (!res || !res->bytes) {
+        if (resourceKey.IsValid()) GlobalResourceStore().Remove(resourceKey);
+        return;
     }
+
+    auto bmp = r.CreateBitmapFromPixels(res->bytes->data(), res->width, res->height, res->stride);
+
+    auto old = tiles_.find(key);
+    if (old != tiles_.end()) GlobalResourceStore().Remove(old->second.resourceKey);
+    tiles_[key] = { bmp, resourceKey, w, h };
 }
 
-void ImageViewWidget::SetTilePreview(ComPtr<ID2D1Bitmap> bmp, int w, int h) {
+void ImageViewWidget::SetTilePreview(const void* pixels, int w, int h, int stride, Renderer& r) {
+    if (!tiledMode_ || !pixels || w <= 0 || h <= 0) {
+        if (tiledPreviewResourceKey_.IsValid()) {
+            GlobalResourceStore().Remove(tiledPreviewResourceKey_);
+            tiledPreviewResourceKey_ = {};
+        }
+        tiledPreview_.Reset();
+        tiledPreviewW_ = 0;
+        tiledPreviewH_ = 0;
+        return;
+    }
+
+    ResourceKey resourceKey = GlobalResourceStore().AddImage(
+        ResourceKind::Preview, tiledGeneration_, w, h, stride,
+        PixelFormat::BgraPremul, pixels, true);
+    auto res = GlobalResourceStore().Acquire(resourceKey);
+    if (!res || !res->bytes) {
+        if (resourceKey.IsValid()) GlobalResourceStore().Remove(resourceKey);
+        return;
+    }
+
+    auto bmp = r.CreateBitmapFromPixels(res->bytes->data(), res->width, res->height, res->stride);
+
+    if (tiledPreviewResourceKey_.IsValid()) {
+        GlobalResourceStore().Remove(tiledPreviewResourceKey_);
+    }
     tiledPreview_ = bmp;
+    tiledPreviewResourceKey_ = resourceKey;
     tiledPreviewW_ = w;
     tiledPreviewH_ = h;
 }
 
 void ImageViewWidget::EvictTile(int tx, int ty) {
-    tiles_.erase(std::make_pair(tx, ty));
+    auto it = tiles_.find(std::make_pair(tx, ty));
+    if (it == tiles_.end()) return;
+    GlobalResourceStore().Remove(it->second.resourceKey);
+    tiles_.erase(it);
 }
 
 void ImageViewWidget::ClearTiles() {
+    for (const auto& kv : tiles_) {
+        GlobalResourceStore().Remove(kv.second.resourceKey);
+    }
     tiles_.clear();
+    if (tiledPreviewResourceKey_.IsValid()) {
+        GlobalResourceStore().Remove(tiledPreviewResourceKey_);
+        tiledPreviewResourceKey_ = {};
+    }
     tiledPreview_.Reset();
     tiledPreviewW_ = 0;
     tiledPreviewH_ = 0;
@@ -3108,14 +3219,18 @@ void ImageViewWidget::DrawTiled(Renderer& r) {
     float imgLeft = cx - drawW / 2.0f;
     float imgTop = cy - drawH / 2.0f;
 
-    /* 如果有预览位图，先画全图预览兜底 */
-    if (tiledPreview_) {
+    /* 如果有预览 resource，先画全图预览兜底 */
+    if (tiledPreviewResourceKey_.IsValid() || tiledPreview_) {
         D2D1_RECT_F dest = { imgLeft, imgTop, imgLeft + drawW, imgTop + drawH };
         if (checkerboard_) DrawCheckerboard(r, dest);
         auto interp = (!antialias_ && zoom_ >= 4.0f)
             ? D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
             : D2D1_BITMAP_INTERPOLATION_MODE_LINEAR;
-        r.DrawBitmap(tiledPreview_.Get(), dest, 1.0f, interp);
+        r.RecordImage(tiledPreviewResourceKey_, dest,
+                      interp == D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+                          ? ImageSampling::Nearest
+                          : ImageSampling::Linear);
+        if (tiledPreview_) r.DrawBitmap(tiledPreview_.Get(), dest, 1.0f, interp);
     }
 
     /* 计算可见瓦片范围 */
@@ -3150,7 +3265,8 @@ void ImageViewWidget::DrawTiled(Renderer& r) {
             float y1 = std::ceil (imgTop  + (ty * ts + th) * zoom_) + 1.0f;
 
             D2D1_RECT_F dest = { x0, y0, x1, y1 };
-            r.DrawBitmap(it->second.bmp.Get(), dest, 1.0f, interp);
+            r.RecordImage(it->second.resourceKey, dest, ImageSampling::Nearest);
+            if (it->second.bmp) r.DrawBitmap(it->second.bmp.Get(), dest, 1.0f, interp);
         }
     }
 }
@@ -3177,7 +3293,7 @@ void ImageViewWidget::OnDraw(Renderer& r) {
         return;
     }
 
-    if (!bitmap_) {
+    if (!bitmap_ && !bitmapResourceKey_.IsValid()) {
         return;
     }
 
@@ -3209,20 +3325,18 @@ void ImageViewWidget::OnDraw(Renderer& r) {
     auto interp = (!antialias_ && zoom_ >= 1.0f)
         ? D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
         : D2D1_BITMAP_INTERPOLATION_MODE_LINEAR;
+    const ImageSampling sampling = SamplingForBitmap(useHQ, interp);
 
     if (rotation_ == 0) {
-        if (useHQ) {
+        r.RecordImage(bitmapResourceKey_, dest, sampling);
+        if (useHQ && bitmap_) {
             r.DrawBitmapHQ(bitmap_.Get(), dest, 1.0f,
                            D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
-        } else {
+        } else if (bitmap_) {
             r.DrawBitmap(bitmap_.Get(), dest, 1.0f, interp);
         }
     } else {
         /* 旋转绘制：先在原点绘制原始尺寸位图，通过变换矩阵旋转+缩放+平移到目标位置 */
-        auto* rt = r.RT();
-        D2D1_MATRIX_3X2_F oldXform;
-        rt->GetTransform(&oldXform);
-
         /* 目标中心 */
         float dcx = (dest.left + dest.right) / 2.0f;
         float dcy = (dest.top + dest.bottom) / 2.0f;
@@ -3236,20 +3350,18 @@ void ImageViewWidget::OnDraw(Renderer& r) {
             D2D1::Matrix3x2F::Translation(-(float)imgW_ / 2.0f, -(float)imgH_ / 2.0f) *
             D2D1::Matrix3x2F::Rotation((float)rotation_) *
             D2D1::Matrix3x2F::Scale(sx, sy) *
-            D2D1::Matrix3x2F::Translation(dcx, dcy) *
-            oldXform;
-
-        rt->SetTransform(xform);
+            D2D1::Matrix3x2F::Translation(dcx, dcy);
+        r.PushTransform(xform);
 
         D2D1_RECT_F src = {0, 0, (float)imgW_, (float)imgH_};
-        if (useHQ) {
-            rt->DrawBitmap(bitmap_.Get(), src, 1.0f,
-                           D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr);
-        } else {
-            rt->DrawBitmap(bitmap_.Get(), &src, 1.0f, (D2D1_BITMAP_INTERPOLATION_MODE)interp);
+        r.RecordImage(bitmapResourceKey_, src, sampling);
+        if (useHQ && bitmap_) {
+            r.DrawBitmapHQ(bitmap_.Get(), src, 1.0f,
+                           D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+        } else if (bitmap_) {
+            r.DrawBitmap(bitmap_.Get(), src, 1.0f, interp);
         }
-
-        rt->SetTransform(oldXform);
+        r.PopTransform();
     }
 
     // Crop overlay
@@ -3259,7 +3371,7 @@ void ImageViewWidget::OnDraw(Renderer& r) {
 }
 
 bool ImageViewWidget::OnMouseDown(const MouseEvent& e) {
-    if (!Contains(e.x, e.y) || (!bitmap_ && !tiledMode_)) return false;
+    if (!Contains(e.x, e.y) || !HasImage()) return false;
 
     /* 外部钩子：可在此拦截走拖出等特殊流程；返回 true 表示已处理不进默认 pan */
     if (onMouseDownHook && onMouseDownHook(e.x, e.y, e.leftBtn ? 1 : 0)) return true;
@@ -3396,7 +3508,7 @@ void ImageViewWidget::ConstrainPan() {
 }
 
 bool ImageViewWidget::OnMouseWheel(const MouseEvent& e) {
-    if (!Contains(e.x, e.y) || (!bitmap_ && !tiledMode_)) return false;
+    if (!Contains(e.x, e.y) || !HasImage()) return false;
 
     float factor = (e.delta > 0) ? 1.15f : (1.0f / 1.15f);
     float oldZoom = zoom_;
@@ -3525,7 +3637,7 @@ void ImageViewWidget::DrawCropOverlay(Renderer& r) {
 
     // Switch to aliased mode for mask rectangles to avoid antialiased seams
     auto* rt = r.RT();
-    rt->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+    if (rt) rt->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
 
     // Draw darkened regions outside crop rect (4 rectangles)
     r.FillRect({rect.left, rect.top, rect.right, cr.top}, mask);       // top
@@ -3534,7 +3646,7 @@ void ImageViewWidget::DrawCropOverlay(Renderer& r) {
     r.FillRect({cr.right, cr.top, rect.right, cr.bottom}, mask);       // right
 
     // Restore antialiased mode
-    rt->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    if (rt) rt->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
     // Crop border
     D2D1_COLOR_F borderColor = theme::white;
@@ -3575,6 +3687,18 @@ IconButtonWidget::IconButtonWidget(const std::string& svgContent, bool ghost)
     /* L148-4: 图标按钮默认手型 (跟 ButtonWidget 一致)。 */
     cursor = CursorKind::Pointer;}
 
+static D2D1_COLOR_F ResolveIconButtonColorRole(int role) {
+    switch (role) {
+        case 1:  return theme::kTitleBarText();
+        case 2:  return theme::kContentText();
+        case 3:  return theme::kAccent();
+        case 4:  return theme::status::danger;
+        case 5:  return theme::kDivider();
+        case 0:
+        default: return theme::kBtnText();
+    }
+}
+
 void IconButtonWidget::SetSvg(const std::string& svgContent) {
     svgContent_ = svgContent;
     iconParsed_ = false;
@@ -3609,7 +3733,8 @@ void IconButtonWidget::OnDraw(Renderer& r) {
     }
 
     // Icon
-    D2D1_COLOR_F iconC = customColor_ ? iconColor_ : theme::kBtnText();
+    D2D1_COLOR_F iconC = fixedColor_ ? iconColor_
+                                      : ResolveIconButtonColorRole(iconColorRole_);
     D2D1_RECT_F iconRect = {
         rect.left + iconPad_, rect.top + iconPad_,
         rect.right - iconPad_, rect.bottom - iconPad_
@@ -3684,33 +3809,65 @@ TitleBarWidget::TitleBarWidget(const std::wstring& title) : title_(title) {
     AddChild(closeBtn_);
 }
 
+TitleBarWidget::~TitleBarWidget() {
+    if (userIconResourceKey_.IsValid()) {
+        GlobalResourceStore().Remove(userIconResourceKey_);
+    }
+    if (exeIconResourceKey_.IsValid()) {
+        GlobalResourceStore().Remove(exeIconResourceKey_);
+    }
+}
+
 void TitleBarWidget::OnDraw(Renderer& r) {
     // Background
-    r.FillRect(rect, hasCustomBg_ ? customBg_ : theme::kTitleBarBg());
+    D2D1_COLOR_F bg = hasCustomBg_
+        ? customBg_
+        : ((bgColor.a > 0.0f) ? bgColor : theme::kTitleBarBg());
+    r.FillRect(rect, bg);
 
     // 三段图标查找：1) 用户显式设的 RGBA  2) EXE 嵌入资源 ID=1  3) 不画
     float titleLeft = rect.left + 12;
     if (showIcon_) {
-        // 懒加载 user-set 像素 → D2D 位图
-        if (!iconBitmap_ && !userIconRgba_.empty()) {
-            iconBitmap_ = r.CreateBitmapFromPixels(
-                userIconRgba_.data(), userIconW_, userIconH_, userIconW_ * 4);
-        }
-        // 懒加载 EXE 资源（只尝试一次，失败就不再 retry）
-        if (!iconBitmap_ && userIconRgba_.empty() && !exeIconAttempted_) {
+        // 懒加载 EXE 资源到 CPU store（只尝试一次，失败就不再 retry）
+        if (!userIconResourceKey_.IsValid() && !exeIconResourceKey_.IsValid() && !exeIconAttempted_) {
             exeIconAttempted_ = true;
             HICON h = (HICON)LoadImageW(GetModuleHandleW(nullptr),
                                         MAKEINTRESOURCEW(1), IMAGE_ICON,
                                         24, 24, LR_DEFAULTCOLOR);
             if (h) {
-                iconBitmap_ = r.CreateBitmapFromHICON(h);
+                std::vector<uint8_t> pixels;
+                int w = 0, hgt = 0, stride = 0;
+                if (r.DecodeHICONToBgraPremul(h, pixels, w, hgt, stride)) {
+                    const uint64_t nextGeneration = exeIconGeneration_ + 1;
+                    ResourceKey resourceKey = GlobalResourceStore().AddImage(
+                        ResourceKind::Icon, nextGeneration, w, hgt, stride,
+                        PixelFormat::BgraPremul, pixels.data(), true);
+                    if (resourceKey.IsValid()) {
+                        exeIconResourceKey_ = resourceKey;
+                        exeIconGeneration_ = nextGeneration;
+                    }
+                }
                 DestroyIcon(h);
             }
         }
-        if (iconBitmap_) {
+
+        const ResourceKey iconResourceKey = userIconResourceKey_.IsValid()
+            ? userIconResourceKey_
+            : exeIconResourceKey_;
+
+        // 懒加载 icon resource → D2D 位图；纯录制阶段没有 RT 时只保留 ResourceKey。
+        if (!iconBitmap_ && iconResourceKey.IsValid()) {
+            auto res = GlobalResourceStore().Acquire(iconResourceKey);
+            if (res && res->bytes) {
+                iconBitmap_ = r.CreateBitmapFromPixels(
+                    res->bytes->data(), res->width, res->height, res->stride);
+            }
+        }
+        if (iconBitmap_ || iconResourceKey.IsValid()) {
             D2D1_RECT_F iconRect = {rect.left + 10, rect.top + 8,
                                     rect.left + 28, rect.top + 28};
-            r.DrawBitmap(iconBitmap_.Get(), iconRect, 1.0f);
+            r.RecordImage(iconResourceKey, iconRect, ImageSampling::Linear);
+            if (iconBitmap_) r.DrawBitmap(iconBitmap_.Get(), iconRect, 1.0f);
             titleLeft = rect.left + 36;
         }
         // 没图就什么都不画，title 留在 left+12
@@ -3729,15 +3886,28 @@ void TitleBarWidget::OnDraw(Renderer& r) {
 
 void TitleBarWidget::SetIconFromPixels(const uint8_t* rgba, int w, int h) {
     iconBitmap_.Reset();          // 旧位图作废，下次 OnDraw 懒重建
+    if (userIconResourceKey_.IsValid()) {
+        GlobalResourceStore().Remove(userIconResourceKey_);
+        userIconResourceKey_ = {};
+    }
     if (!rgba || w <= 0 || h <= 0) {
-        userIconRgba_.clear();
         userIconW_ = userIconH_ = 0;
         exeIconAttempted_ = false; // 允许下次 OnDraw 再去试 EXE 图标
         return;
     }
+
+    const uint64_t nextGeneration = userIconGeneration_ + 1;
+    ResourceKey resourceKey = GlobalResourceStore().AddImage(
+        ResourceKind::Icon, nextGeneration, w, h, w * 4,
+        PixelFormat::Rgba, rgba, true);
+    if (!resourceKey.IsValid()) {
+        userIconW_ = userIconH_ = 0;
+        return;
+    }
+    userIconResourceKey_ = resourceKey;
+    userIconGeneration_ = nextGeneration;
     userIconW_ = w;
     userIconH_ = h;
-    userIconRgba_.assign(rgba, rgba + (size_t)w * h * 4);
 }
 
 void TitleBarWidget::DoLayout() {
@@ -3777,7 +3947,13 @@ D2D1_SIZE_F TitleBarWidget::SizeHint() const {
 void CustomWidget::OnDraw(Renderer& r) {
     Widget::OnDraw(r);
     if (drawCb) {
-        drawCb(apiHandle, (void*)&r, ToUiRect(), drawUd);
+        if (auto* recorder = r.DisplayListRecorderTarget()) {
+            DrawApiContext drawCtx(nullptr, recorder);
+            drawCb(apiHandle, &drawCtx, ToUiRect(), drawUd);
+            return;
+        }
+        DrawApiContext drawCtx(r);
+        drawCb(apiHandle, &drawCtx, ToUiRect(), drawUd);
     }
 }
 
@@ -4107,28 +4283,19 @@ ExpanderWidget::ExpanderWidget(const std::wstring& header) : headerText_(header)
 void ExpanderWidget::SetExpanded(bool v) {
     if (expanded_ == v) return;
     expanded_ = v;
-    animating_ = true;
-    animLastTick_ = 0;
+    expandAnim_.Retarget(expanded_ ? 1.0f : 0.0f,
+                         AnimationSpec{180.0f, EasingFunction::EaseOutCubic});
+    animating_ = expandAnim_.Active();
+    ui::GetContext().RegisterAnimatingWidget(
+        this, AnimationInvalidation::Paint | AnimationInvalidation::Layout |
+                  AnimationInvalidation::HitTest);
     if (onExpandedChanged) onExpandedChanged(expanded_);
 }
 
 void ExpanderWidget::UpdateAnimation() {
-    float target = expanded_ ? 1.0f : 0.0f;
-    if (!animating_) { animProgress_ = target; return; }
-
-    uint64_t now = GetTickCount64();
-    if (animLastTick_ == 0) animLastTick_ = now;
-    float dtMs = (float)(now - animLastTick_);
-    animLastTick_ = now;
-
-    float diff = target - animProgress_;
-    if (std::abs(diff) < 0.001f) {
-        animProgress_ = target;
-        animating_ = false;
-        return;
-    }
-    float factor = 1.0f - std::exp(-dtMs / 30.0f);
-    animProgress_ += diff * factor;
+    expandAnim_.SetIdleTarget(expanded_ ? 1.0f : 0.0f);
+    expandAnim_.SampleFrame(GetTickCount64());
+    animating_ = expandAnim_.Active();
 }
 
 void ExpanderWidget::DoLayout() {
@@ -4152,7 +4319,8 @@ void ExpanderWidget::DoLayout() {
     measuredContentH_ = contentH;
 
     // Animated visible content height
-    float visibleH = measuredContentH_ * animProgress_;
+    float progress = expandAnim_.Current();
+    float visibleH = measuredContentH_ * progress;
 
     // Layout children within visible area
     float y = cy;
@@ -4199,7 +4367,8 @@ void ExpanderWidget::DrawTree(Renderer& r) {
     float chevronX = rect.left + 12;
     float chevronY = rect.top + (headerHeight_ - chevronSize) / 2;
     D2D1_COLOR_F chevronColor = fg;
-    float angle = animProgress_ * 90.0f;
+    float progress = expandAnim_.Current();
+    float angle = progress * 90.0f;
     float ccx = chevronX + chevronSize / 2, ccy = chevronY + chevronSize / 2;
     float halfH = 4.0f, halfW = 2.5f;
     float rad = angle * 3.14159f / 180.0f;
@@ -4225,8 +4394,8 @@ void ExpanderWidget::DrawTree(Renderer& r) {
     r.DrawLine(rect.left, rect.top + headerHeight_, rect.right, rect.top + headerHeight_, border);
 
     // Children: clip to animated content area
-    if (animProgress_ > 0.001f) {
-        float visibleH = measuredContentH_ * animProgress_;
+    if (progress > 0.001f) {
+        float visibleH = measuredContentH_ * progress;
         D2D1_RECT_F clipRect = {rect.left, rect.top + headerHeight_, rect.right,
                                  rect.top + headerHeight_ + visibleH + padT + padB};
         r.PushClip(clipRect);
@@ -4242,7 +4411,7 @@ bool ExpanderWidget::OnMouseDown(const MouseEvent& e) {
         return true;
     }
     // Forward to children if expanded
-    if (animProgress_ > 0.5f) {
+    if (expandAnim_.Current() > 0.5f) {
         for (auto& child : children_) {
             if (child->visible && child->Contains(e.x, e.y)) return child->OnMouseDown(e);
         }
@@ -4252,7 +4421,7 @@ bool ExpanderWidget::OnMouseDown(const MouseEvent& e) {
 
 bool ExpanderWidget::OnMouseMove(const MouseEvent& e) {
     headerHovered_ = (e.y >= rect.top && e.y < rect.top + headerHeight_ && e.x >= rect.left && e.x < rect.right);
-    if (animProgress_ > 0.5f) {
+    if (expandAnim_.Current() > 0.5f) {
         for (auto& child : children_) {
             if (child->visible) child->OnMouseMove(e);
         }
@@ -4265,7 +4434,7 @@ bool ExpanderWidget::OnMouseUp(const MouseEvent& e) {
         Toggle();
         return true;
     }
-    if (animProgress_ > 0.5f) {
+    if (expandAnim_.Current() > 0.5f) {
         for (auto& child : children_) {
             if (child->visible && child->Contains(e.x, e.y)) return child->OnMouseUp(e);
         }
@@ -4281,7 +4450,7 @@ D2D1_SIZE_F ExpanderWidget::SizeHint() const {
             contentH += (h > 0 ? h : 24.0f) + 4.0f;
         }
     }
-    float totalH = headerHeight_ + contentH * animProgress_;
+    float totalH = headerHeight_ + contentH * expandAnim_.Current();
     return {fixedW > 0 ? fixedW : 300.0f, fixedH > 0 ? fixedH : totalH};
 }
 
@@ -4333,7 +4502,6 @@ void NumberBoxWidget::CommitEdit() {
 }
 
 void NumberBoxWidget::OnDraw(Renderer& r) {
-    cachedRenderer_ = &r;
     bool dark = theme::IsDark();
     float cr = (css.borderRadius >= 0) ? css.borderRadius : theme::radius::medium;
     float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
@@ -4791,8 +4959,13 @@ SplitViewWidget::SplitViewWidget() {
 void SplitViewWidget::SetPaneOpen(bool open) {
     if (paneOpen_ == open) return;
     paneOpen_ = open;
-    animating_ = true;
-    animLastTick_ = 0;
+    AnimationSpec spec{paneOpen_ ? 200.0f : 100.0f,
+                       paneOpen_ ? EasingFunction::EaseOutCubic : EasingFunction::EaseInQuad};
+    paneAnim_.Retarget(paneOpen_ ? 1.0f : 0.0f, spec);
+    animating_ = paneAnim_.Active();
+    ui::GetContext().RegisterAnimatingWidget(
+        this, AnimationInvalidation::Paint | AnimationInvalidation::Layout |
+                  AnimationInvalidation::HitTest);
     if (onPaneChanged) onPaneChanged(paneOpen_);
 }
 
@@ -4805,36 +4978,13 @@ float SplitViewWidget::CurrentPaneWidth() const {
 
     // For Inline/CompactInline: pane width affects layout
     // For Overlay/CompactOverlay: pane overlays, but we still need the visual width
-    return closedW + animProgress_ * (openW - closedW);
+    return closedW + paneAnim_.Current() * (openW - closedW);
 }
 
 void SplitViewWidget::UpdateAnimation() {
-    float target = paneOpen_ ? 1.0f : 0.0f;
-    if (!animating_) { animProgress_ = target; return; }
-
-    uint64_t now = GetTickCount64();
-    if (animLastTick_ == 0) animLastTick_ = now;
-    float dtMs = (float)(now - animLastTick_);
-    animLastTick_ = now;
-
-    // WinUI 3: open=200ms decelerate, close=100ms accelerate
-    float durationMs = paneOpen_ ? 200.0f : 100.0f;
-    float diff = target - animProgress_;
-
-    if (std::abs(diff) < 0.001f) {
-        animProgress_ = target;
-        animating_ = false;
-        return;
-    }
-
-    // Exponential ease-out for smooth feel
-    float factor = 1.0f - std::exp(-dtMs / (durationMs * 0.2f));
-    animProgress_ += diff * factor;
-
-    if ((paneOpen_ && animProgress_ >= 0.999f) || (!paneOpen_ && animProgress_ <= 0.001f)) {
-        animProgress_ = target;
-        animating_ = false;
-    }
+    paneAnim_.SetIdleTarget(paneOpen_ ? 1.0f : 0.0f);
+    paneAnim_.SampleFrame(GetTickCount64());
+    animating_ = paneAnim_.Active();
 }
 
 void SplitViewWidget::DoLayout() {
@@ -4898,10 +5048,11 @@ void SplitViewWidget::DrawTree(Renderer& r) {
     }
 
     // In overlay mode, draw dimming overlay behind pane when open
-    if (isOverlay && animProgress_ > 0.01f) {
+    float progress = paneAnim_.Current();
+    if (isOverlay && progress > 0.01f) {
         float compactW = (mode_ == SplitViewMode::CompactOverlay) ? compactPaneLength_ : 0;
         D2D1_RECT_F overlayRect = {rect.left + compactW, rect.top, rect.right, rect.bottom};
-        D2D1_COLOR_F overlayColor = {0, 0, 0, 0.3f * animProgress_};
+        D2D1_COLOR_F overlayColor = {0, 0, 0, 0.3f * progress};
         r.FillRect(overlayRect, overlayColor);
     }
 

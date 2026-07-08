@@ -122,6 +122,8 @@ public:
     std::function<void()> recomputeShapes;
 
 private:
+    std::string BuildDocumentXml() const;
+
     std::vector<SvgShape> shapes_;
     std::unordered_map<std::string, SvgGradient> gradients_;
 

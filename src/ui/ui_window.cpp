@@ -5,19 +5,23 @@
 #include "gh_img_view.h"
 #include "theme.h"
 #include "animation.h"
+#include "debug_trace.h"
+#include "overlay_service.h"
+#include "render_thread.h"
 #include <windowsx.h>
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <wrl/client.h>
 #include <wincodec.h>
-#include <timeapi.h>   /* timeBeginPeriod/timeEndPeriod — WIN32_LEAN_AND_MEAN 下 windows.h 不带 mmsystem */
+#include <algorithm>
+#include <cstdint>
 #include <cmath>
 #include <unordered_set>
+#include <utility>
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "shlwapi.lib")
-#pragma comment(lib, "winmm.lib")   /* timeBeginPeriod/timeEndPeriod — toast 叠加窗 16ms timer 提精度 */
 
 #if !defined(_WIN32_WINNT) || _WIN32_WINNT < 0x0A00
 static inline UINT GetDpiForWindow(HWND hwnd) {
@@ -65,7 +69,6 @@ struct UiInvokeReq {
 };
 
 bool UiWindowImpl::classRegistered_ = false;
-bool UiWindowImpl::s_toastClassRegistered_ = false;
 
 #ifndef DWMWA_TRANSITIONS_FORCEDISABLED
 #define DWMWA_TRANSITIONS_FORCEDISABLED 3
@@ -73,23 +76,55 @@ bool UiWindowImpl::s_toastClassRegistered_ = false;
 
 namespace {
 constexpr UINT kMsgStartupReveal = WM_APP + 101;
+constexpr UINT kMsgRenderFrame = WM_APP + 130;
+constexpr UINT kMsgRenderDeviceLost = kUiCoreRenderDeviceLostMessage;
 constexpr UINT_PTR kCaretBlinkTimerId = 0xCA11;
+
+class ActiveMeasureContextScope {
+public:
+    ActiveMeasureContextScope(MeasureContext& measure, Renderer& renderer)
+        : previous_(g_activeMeasureContext) {
+        measure.BindRenderer(&renderer);
+        g_activeMeasureContext = &measure;
+    }
+
+    ~ActiveMeasureContextScope() {
+        g_activeMeasureContext = previous_;
+    }
+
+private:
+    MeasureContext* previous_ = nullptr;
+};
+
 constexpr UINT_PTR kToggleAnimTimerId = 0xCA12;
 constexpr UINT_PTR kWindowOpenAnimTimerId = 0xCA13;
 constexpr UINT_PTR kWindowCloseAnimTimerId = 0xCA14;
 constexpr UINT kToggleAnimIntervalMs = 16;
 constexpr UINT kWindowAnimIntervalMs = 16;
-constexpr UINT_PTR kToastFadeTimerId = 0xCA15;
-constexpr UINT kToastFadeIntervalMs = 16;
-/* Build 68+ (L18): toast phase 时长 (ms), time-based 推进的参数. */
-constexpr int kToastSlideInMs  = 200;
-constexpr int kToastSlideOutMs = 250;
 
 constexpr float kPopPeakScale = 1.02f;       // 关闭动画微弹峰值
 constexpr float kClosePeakPhase = 0.18f;
 constexpr float kCloseEndScale = 0.88f;
 constexpr float kCloseFadeStart = 0.40f;
 constexpr int   kOpenSlideOffset = 12;       // 开场上滑偏移（像素）
+constexpr LONG  kCanvasMaxTrackPx = 14000;
+
+static void EnsureLayeredForAlpha(HWND hwnd) {
+    LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if ((exStyle & WS_EX_LAYERED) == 0) {
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, exStyle | WS_EX_LAYERED);
+    }
+}
+
+static void ClearLayeredAfterAlpha(HWND hwnd) {
+    LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if ((exStyle & WS_EX_LAYERED) == 0) return;
+
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, exStyle & ~WS_EX_LAYERED);
+    SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                 SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
 
 static float Clamp01(float v) {
     if (v < 0.0f) return 0.0f;
@@ -139,17 +174,12 @@ static void ForEachWidget(Widget* w, const std::function<void(Widget*)>& fn) {
     for (auto& c : w->Children()) ForEachWidget(c.get(), fn);
 }
 
-static void ForEachToggleWidget(Widget* w, const std::function<void(ToggleWidget*)>& fn) {
-    auto* tw = dynamic_cast<ToggleWidget*>(w);
-    if (tw) fn(tw);
-    for (auto& c : w->Children()) ForEachToggleWidget(c.get(), fn);
-}
-
 UiWindowImpl::UiWindowImpl() = default;
 UiWindowImpl::~UiWindowImpl() {
     /* toast 叠加窗 owner = hwnd_, DestroyWindow(hwnd_) 会连带销毁它, 但仍要
      * 显式 KillTimer + timeEndPeriod 配对 (DestroyToast 负责), 防泄漏时钟精度. */
     DestroyToast();
+    UnregisterRenderWindow();
     if (hwnd_) DestroyWindow(hwnd_);
     if (hIcon_) DestroyIcon(hIcon_);
 }
@@ -187,7 +217,7 @@ bool UiWindowImpl::Create(const wchar_t* title, int width, int height,
      * 该 flag (给子窗自下而上双缓冲 alpha 用) 在此零收益, 却让 DWM 每次合成多走
      * 一层重定向双缓冲, 拖动/缩放时平添开销。WS_EX_LAYERED 仍单独保留给开场动画/
      * 透明路径 (走 SetLayeredWindowAttributes), 不受影响。 */
-    DWORD exStyle = WS_EX_LAYERED;
+    DWORD exStyle = 0;
     if (toolWindow) exStyle |= WS_EX_TOOLWINDOW;
     /* Build 65+ (L14): owner 窗不上 Alt+Tab / 不单独 taskbar 项. owned 顶级窗
      * 用 WS_EX_APPWINDOW 跟 owner 语义冲突 (强制出现在 taskbar), 撤掉. */
@@ -240,6 +270,7 @@ bool UiWindowImpl::Create(const wchar_t* title, int width, int height,
                             winX, winY, physW, physH,
                             ownerHwnd, nullptr, GetModuleHandleW(nullptr), this);
     if (!hwnd_) return false;
+    ++hwndGeneration_;
 
     if (!skipOpenAnimation_) {
         SetLayeredWindowAttributes(hwnd_, 0, 0, LWA_ALPHA);
@@ -252,6 +283,7 @@ bool UiWindowImpl::Create(const wchar_t* title, int width, int height,
 
     dpi_ = GetDpiForWindow(hwnd_);
     dpiScale_ = (float)dpi_ / 96.0f;
+    RefreshClientSizeCache();
 
     if (borderless) {
         MARGINS margins = {0, 0, 1, 0};
@@ -263,6 +295,22 @@ bool UiWindowImpl::Create(const wchar_t* title, int width, int height,
     // CreateRenderTarget deferred to Show() — ensures client rect is final
 
     return true;
+}
+
+void UiWindowImpl::RegisterRenderWindow(uint64_t id) {
+    windowId = id;
+    if (!hwnd_ || id == 0 || hwndGeneration_ == 0) return;
+    renderWindowId_ = RenderWindowId{id, hwndGeneration_};
+    renderThreadPresentActive_ = false;
+    RenderThread::Instance().Start();
+    RenderThread::Instance().RegisterWindow(renderWindowId_, hwnd_);
+}
+
+void UiWindowImpl::UnregisterRenderWindow() {
+    if (!renderWindowId_.IsValid()) return;
+    RenderThread::Instance().UnregisterWindow(renderWindowId_);
+    renderWindowId_ = {};
+    renderThreadPresentActive_ = false;
 }
 
 void UiWindowImpl::SetIconFromPixels(const uint8_t* rgba, int w, int h) {
@@ -356,10 +404,7 @@ void UiWindowImpl::Show() {
     DwmSetWindowAttribute(hwnd_, DWMWA_TRANSITIONS_FORCEDISABLED,
                           &disableTransitions, sizeof(disableTransitions));
 
-    LONG_PTR exStyle = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
-    if ((exStyle & WS_EX_LAYERED) == 0) {
-        SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, exStyle | WS_EX_LAYERED);
-    }
+    EnsureLayeredForAlpha(hwnd_);
 
     startupRevealPending_ = false;
     startupRevealPosted_ = false;
@@ -379,13 +424,14 @@ void UiWindowImpl::Show() {
             SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         }
-        if (!renderer_.RT()) renderer_.CreateRenderTarget(hwnd_);
+        RefreshClientSizeCache();
         LayoutRoot();
-        OnPaint();
+        SubmitRenderThreadFrameNow(FrameReason::Startup, PresentPolicy::Immediate);
         ValidateRect(hwnd_, nullptr);
         /* 直接以最大化态显示，不走 slide 动画 */
         SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA);
         ShowWindow(hwnd_, SW_SHOWMAXIMIZED);
+        ClearLayeredAfterAlpha(hwnd_);
         if (!toolWindow_) SetForegroundWindow(hwnd_);
         return;
     }
@@ -394,12 +440,10 @@ void UiWindowImpl::Show() {
     SetWindowPos(hwnd_, nullptr, windowTargetX_, windowTargetY_,
                  (int)windowTargetWidth_, (int)windowTargetHeight_,
                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-
-    // Now create render target — client rect is accurate after NCCALCSIZE
-    if (!renderer_.RT()) renderer_.CreateRenderTarget(hwnd_);
+    RefreshClientSizeCache();
 
     LayoutRoot();
-    OnPaint();
+    SubmitRenderThreadFrameNow(FrameReason::Startup, PresentPolicy::Immediate);
     ValidateRect(hwnd_, nullptr);
 
     StartWindowOpenAnimation();
@@ -458,11 +502,11 @@ void UiWindowImpl::PrepareRT() {
         framePrepared_ = true;
     }
 
-    if (!renderer_.RT()) renderer_.CreateRenderTarget(hwnd_);
+    RefreshClientSizeCache();
     LayoutRoot();
 }
 
-void UiWindowImpl::ShowImmediate() {
+void UiWindowImpl::ShowImmediate(bool activate) {
     if (!hwnd_) return;
 
     /* Build 105+ (L25): start_maximized hint 走 SW_SHOWMAXIMIZED, 首帧
@@ -476,13 +520,10 @@ void UiWindowImpl::ShowImmediate() {
         SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     }
-
-    if (!renderer_.RT()) renderer_.CreateRenderTarget(hwnd_);
+    RefreshClientSizeCache();
 
     LayoutRoot();
-    /* 首帧 Present 不等 vsync，避免 ShowWindow 触发的 WM_PAINT 阻塞 100ms+ */
-    renderer_.skipVSync = true;
-    OnPaint();
+    SubmitRenderThreadFrameNow(FrameReason::Startup, PresentPolicy::Immediate);
     ValidateRect(hwnd_, nullptr);
 
     if (startMax) {
@@ -490,11 +531,12 @@ void UiWindowImpl::ShowImmediate() {
          * client=工作区, rcNormalPosition=常规)。OnPaint 已把内容绘进 RT, 这里一次
          * alpha→255 揭示 → 首帧即全屏 + 有内容, 无黑底/白边/先小后大闪。 */
         SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA);
+        ClearLayeredAfterAlpha(hwnd_);
     } else {
         /* SW_SHOWNA 显示但不激活 → 不触发 WM_ACTIVATE 的 DWM 首帧同步(部分机器 200-300ms)。 */
         ShowWindow(hwnd_, SW_SHOWNA);
     }
-    if (!toolWindow_) {
+    if (activate && !toolWindow_) {
         BringWindowToTop(hwnd_);
         SetForegroundWindow(hwnd_);
     }
@@ -510,22 +552,322 @@ void UiWindowImpl::NotifyWidgetDestroyed(Widget* w) {
     if (pressedWidget_ == w) pressedWidget_ = nullptr;
     if (focusedWidget_ == w) focusedWidget_ = nullptr;
     if (tooltipWidget_ == w) tooltipWidget_ = nullptr;
+    animationHost_.RemoveWidget(w);
+    propertyAnimations_.Cancel(w);
+}
+
+void UiWindowImpl::ActivateForMouseInput() {
+    if (!hwnd_ || toolWindow_) return;
+
+    BringWindowToTop(hwnd_);
+    SetForegroundWindow(hwnd_);
+    SetActiveWindow(hwnd_);
+    ::SetFocus(hwnd_);
 }
 
 void UiWindowImpl::Invalidate() {
-    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+    if (!hwnd_) return;
+    if (visualUpdateDepth_ > 0) {
+        visualPaintDirty_ = true;
+        return;
+    }
+    if (!IsWindowVisible(hwnd_) || IsIconic(hwnd_)) {
+        if (IsTraceEnabled()) {
+            TraceEvent("core_window", "invalidate_skipped_hidden",
+                       {TraceU64("hwnd", static_cast<uint64_t>(
+                                      reinterpret_cast<uintptr_t>(hwnd_))),
+                        TraceBool("iconic", IsIconic(hwnd_) != FALSE)});
+        }
+        return;
+    }
+    RequestRenderFrame(FrameReason::Paint, PresentPolicy::Deferred);
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void UiWindowImpl::InvalidateNow() {
+    if (!hwnd_) return;
+    Invalidate();
+    if (visualUpdateDepth_ <= 0) {
+        const bool visibleForPaint = IsWindowVisible(hwnd_) && !IsIconic(hwnd_);
+        if (visibleForPaint) {
+            RequestRenderFrame(FrameReason::Paint, PresentPolicy::Immediate);
+        }
+        UpdateWindow(hwnd_);
+        if (visibleForPaint) {
+            FlushRenderFrameNow(FrameReason::Paint, PresentPolicy::Immediate);
+        }
+    }
+}
+
+bool UiWindowImpl::HasPendingPaint() const {
+    if (!hwnd_) return false;
+    return GetUpdateRect(hwnd_, nullptr, FALSE) != FALSE;
+}
+
+void UiWindowImpl::RequestRenderFrame(FrameReason reason, PresentPolicy policy) {
+    if (!hwnd_) return;
+    frameScheduler_.Request(reason, policy);
+    if (renderFramePosted_) return;
+    renderFramePosted_ = true;
+    PostMessageW(hwnd_, kMsgRenderFrame, 0, 0);
+}
+
+void UiWindowImpl::FlushRenderFrameNow(FrameReason reason, PresentPolicy policy) {
+    if (!hwnd_) return;
+    if (reason != FrameReason::None) {
+        RequestRenderFrame(reason, policy);
+    }
+    renderFramePosted_ = false;
+    if (!frameScheduler_.HasPending()) return;
+    PaintAndValidate();
+}
+
+void UiWindowImpl::SubmitFrameJob(const FrameRequest& frame, DisplayList displayList) {
+    if (!hwnd_ || !renderWindowId_.IsValid() || frame.generation == 0) return;
+    FrameJob job;
+    job.window = renderWindowId_;
+    job.hwnd = hwnd_;
+    job.generation = frame.generation;
+    job.width_px = static_cast<int>(clientWidthPx_);
+    job.height_px = static_cast<int>(clientHeightPx_);
+    job.dpi_scale = dpiScale_;
+    job.policy = frame.policy;
+    job.priority = static_cast<int>(frame.policy);
+    job.render_thread_present = renderThreadPresentActive_;
+    job.defer_present = deferNextFramePresent_ && FrameRequiresPresentBarrier(frame);
+    job.display_list = std::move(displayList);
+    TraceEvent("core_window", "frame_job_submitted",
+               {TraceU64("frame_generation", frame.generation),
+                TraceI64("policy", static_cast<int64_t>(frame.policy)),
+                TraceI64("width_px", job.width_px),
+                TraceI64("height_px", job.height_px),
+                TraceBool("render_thread_present", job.render_thread_present),
+                TraceBool("defer_present", job.defer_present),
+                TraceI64("display_list_commands", static_cast<int64_t>(job.display_list.commands.size()))});
+    RenderThread::Instance().Submit(std::move(job));
+}
+
+void UiWindowImpl::ActivateRenderThreadPresent() {
+    if (renderThreadPresentActive_ || !renderWindowId_.IsValid()) return;
+    renderer_.ReleaseRenderTarget();
+    renderThreadPresentActive_ = true;
+    TraceEvent("core_window", "render_thread_present_activated",
+               {TraceU64("window_id", renderWindowId_.window_id),
+                TraceU64("hwnd_generation", renderWindowId_.hwnd_generation)});
+}
+
+bool UiWindowImpl::WaitForRenderGeneration(const FrameRequest& frame, bool force, bool prepared) {
+    if (!hwnd_ || !renderWindowId_.IsValid() || frame.generation == 0) return false;
+    if (!renderThreadPresentActive_) return false;
+    if (!force && !FrameRequiresPresentBarrier(frame)) return false;
+    const bool completed = RenderThread::Instance().WaitForGeneration(
+        renderWindowId_.window_id, frame.generation, 1000);
+    TraceEvent("core_window",
+               completed ? (prepared ? "render_generation_prepared"
+                                     : "render_generation_presented")
+                         : "render_generation_wait_incomplete",
+               {TraceU64("frame_generation", frame.generation),
+                TraceBool("forced", force),
+                TraceBool("prepared", prepared),
+                TraceBool("completed", completed)});
+    return completed;
+}
+
+void UiWindowImpl::SubmitRenderThreadFrameNow(FrameReason reason, PresentPolicy policy) {
+    if (!hwnd_ || !renderWindowId_.IsValid()) return;
+    frameScheduler_.Request(reason, policy);
+    auto frame = frameScheduler_.BeginFrame();
+    if (frame.generation == 0) return;
+    ActivateRenderThreadPresent();
+    DisplayList displayList = OnPaint(frame.generation);
+    SubmitFrameJob(frame, std::move(displayList));
+    frameScheduler_.CompleteFrame(frame.generation);
+    TraceEvent("core_window", "frame_scheduler_complete",
+               {TraceU64("frame_generation", frame.generation)});
+    WaitForRenderGeneration(frame, true);
+}
+
+bool UiWindowImpl::FlushVisualTransactionFrame(bool resizeDirty,
+                                               bool paintDirty,
+                                               bool final,
+                                               bool deferPresent) {
+    if (!hwnd_) return false;
+    if (!resizeDirty && !paintDirty && !final) return false;
+    if (resizeDirty) renderer_.skipVSync = true;
+    frameScheduler_.RequestVisualTransaction(resizeDirty, paintDirty, final);
+    deferredPresentGeneration_ = 0;
+    deferredPresentPrepared_ = false;
+    deferNextFramePresent_ = deferPresent;
+    FlushRenderFrameNow(FrameReason::None, PresentPolicy::Deferred);
+    deferNextFramePresent_ = false;
+    return deferPresent && deferredPresentPrepared_;
+}
+
+void UiWindowImpl::PrepareDeferredVisualWindowRect(int xScreen, int yScreen,
+                                                   int wDip, int hDip,
+                                                   int wPx, int hPx) {
+    if (!hwnd_) return;
+    deferredVisualWindowRectPending_ = true;
+    deferredVisualWindowXScreen_ = xScreen;
+    deferredVisualWindowYScreen_ = yScreen;
+    deferredVisualWindowWDip_ = wDip;
+    deferredVisualWindowHDip_ = hDip;
+    deferredVisualWindowWPx_ = wPx;
+    deferredVisualWindowHPx_ = hPx;
+
+    RECT wr{};
+    RECT cr{};
+    int nonClientW = 0;
+    int nonClientH = 0;
+    if (GetWindowRect(hwnd_, &wr) && GetClientRect(hwnd_, &cr)) {
+        nonClientW = (wr.right - wr.left) - (cr.right - cr.left);
+        nonClientH = (wr.bottom - wr.top) - (cr.bottom - cr.top);
+    }
+    const UINT oldClientW = clientWidthPx_;
+    const UINT oldClientH = clientHeightPx_;
+    const UINT targetClientW = static_cast<UINT>((std::max)(1, wPx - nonClientW));
+    const UINT targetClientH = static_cast<UINT>((std::max)(1, hPx - nonClientH));
+    UpdateClientSizeCache(targetClientW, targetClientH);
+    LayoutRoot();
+    const bool sizeChanged = oldClientW != targetClientW || oldClientH != targetClientH;
+    const bool notifyPreparedResize = sizeChanged && onResize != nullptr;
+    if (notifyPreparedResize) {
+        preparedVisualResizeNotified_ = true;
+        preparedVisualResizeWPx_ = targetClientW;
+        preparedVisualResizeHPx_ = targetClientH;
+        TraceEvent("core_window", "prepared_visual_resize_callback",
+                   {TraceU64("client_w_px", targetClientW),
+                    TraceU64("client_h_px", targetClientH)});
+        NotifyResizeCallback(targetClientW, targetClientH);
+    }
+    TraceEvent("core_window", "set_window_rect_deferred",
+               {TraceI64("x", xScreen),
+                TraceI64("y", yScreen),
+                TraceI64("w_dip", wDip),
+                TraceI64("h_dip", hDip),
+                TraceI64("w_px", wPx),
+                TraceI64("h_px", hPx),
+                TraceU64("client_w_px", targetClientW),
+                TraceU64("client_h_px", targetClientH),
+                TraceBool("resize_callback", notifyPreparedResize),
+                TraceI64("depth", visualUpdateDepth_)});
+}
+
+bool UiWindowImpl::WaitForVisualTransactionDwmBarrier(uint64_t generation) {
+    if (!hwnd_ || !IsWindowVisible(hwnd_) || IsIconic(hwnd_)) return false;
+    HRESULT hr = S_OK;
+    {
+        TraceScope scope("core_window", "visual_transaction_dwm_flush_duration");
+        hr = DwmFlush();
+    }
+    TraceEvent("core_window", "visual_transaction_dwm_flush",
+               {TraceU64("frame_generation", generation),
+                TraceI64("hr", static_cast<int64_t>(hr)),
+                TraceBool("ok", SUCCEEDED(hr))});
+    return SUCCEEDED(hr);
+}
+
+void UiWindowImpl::CommitDeferredVisualWindowRect() {
+    if (!hwnd_ || !deferredVisualWindowRectPending_) return;
+    const int x = deferredVisualWindowXScreen_;
+    const int y = deferredVisualWindowYScreen_;
+    const int wDip = deferredVisualWindowWDip_;
+    const int hDip = deferredVisualWindowHDip_;
+    const int wPx = deferredVisualWindowWPx_;
+    const int hPx = deferredVisualWindowHPx_;
+    deferredVisualWindowRectPending_ = false;
+
+    TraceEvent("core_window", "set_window_rect_commit_after_prepare",
+               {TraceI64("x", x),
+                TraceI64("y", y),
+                TraceI64("w_dip", wDip),
+                TraceI64("h_dip", hDip),
+                TraceI64("w_px", wPx),
+                TraceI64("h_px", hPx)});
+    {
+        TraceScope scope("core_window", "set_window_rect_commit_duration");
+        SetWindowPos(hwnd_, nullptr, x, y, wPx, hPx,
+                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+    }
+}
+
+bool UiWindowImpl::PresentPreparedVisualWindowFrame(uint64_t generation) {
+    if (!hwnd_ || !renderWindowId_.IsValid() || !renderThreadPresentActive_) return false;
+    const bool presented = RenderThread::Instance().PresentPrepared(renderWindowId_, true, 1000);
+    TraceEvent("core_window",
+               presented ? "visual_transaction_prepared_presented"
+                         : "visual_transaction_prepared_present_failed",
+               {TraceU64("frame_generation", generation),
+                TraceBool("presented", presented)});
+    return presented;
+}
+
+void UiWindowImpl::BeginCanvasVisualTransaction() {
+    ++visualUpdateDepth_;
+    TraceEvent("core_window", "begin_canvas_visual_transaction");
+}
+
+void UiWindowImpl::EndCanvasVisualTransaction() {
+    if (visualUpdateDepth_ <= 0) return;
+    --visualUpdateDepth_;
+    if (visualUpdateDepth_ != 0) return;
+
+    const bool needPaint = visualPaintDirty_ || visualResizeDirty_;
+    const bool paintDirty = visualPaintDirty_;
+    const bool resizeDirty = visualResizeDirty_;
+    TraceEvent("core_window", "end_canvas_visual_transaction",
+               {TraceBool("need_paint", needPaint),
+                TraceBool("resize_dirty", resizeDirty)});
+    visualPaintDirty_ = false;
+    visualResizeDirty_ = false;
+    if (!needPaint || !hwnd_) return;
+
+    const bool deferPresent = deferredVisualWindowRectPending_ && resizeDirty;
+    const bool prepared = FlushVisualTransactionFrame(resizeDirty, paintDirty, false,
+                                                     deferPresent);
+    const uint64_t preparedGeneration = deferredPresentGeneration_;
+    if (deferPresent && prepared) {
+        WaitForVisualTransactionDwmBarrier(preparedGeneration);
+    }
+    CommitDeferredVisualWindowRect();
+    if (deferPresent && prepared) {
+        if (!PresentPreparedVisualWindowFrame(preparedGeneration)) {
+            SubmitRenderThreadFrameNow(FrameReason::Resize | FrameReason::Paint,
+                                       PresentPolicy::Immediate);
+        }
+    } else if (deferPresent) {
+        TraceEvent("core_window", "visual_transaction_prepare_fallback",
+                   {TraceU64("frame_generation", preparedGeneration),
+                    TraceBool("prepared", prepared)});
+        SubmitRenderThreadFrameNow(FrameReason::Resize | FrameReason::Paint,
+                                   PresentPolicy::Immediate);
+    }
 }
 
 // ---- 窗口几何（DIP-native） ----
 
 void UiWindowImpl::SetWindowRect(int xScreen, int yScreen, int wDip, int hDip) {
     if (!hwnd_) return;
-    int pw = (int)(wDip * dpiScale_);
-    int ph = (int)(hDip * dpiScale_);
-    /* SetWindowPos 之后强制立刻重绘。对画布模式（bgMode=1）很关键 —— 扩大窗口
-     * 时新暴露区域没有 Clear 介入，如果不主动 UpdateWindow 一把，那段时间会看到
-     * 前一帧甚至系统默认色的残留。SWP_NOCOPYBITS 防止 Windows 把旧客户区内容
-     * 整块位移，强迫全量重绘。 */
+    int pw = MulDiv(wDip, dpi_, 96);
+    int ph = MulDiv(hDip, dpi_, 96);
+    {
+        TraceEvent("core_window", "set_window_rect_before",
+                   {TraceI64("x", xScreen),
+                    TraceI64("y", yScreen),
+                    TraceI64("w_dip", wDip),
+                    TraceI64("h_dip", hDip),
+                    TraceI64("w_px", pw),
+                    TraceI64("h_px", ph),
+                    TraceI64("depth", visualUpdateDepth_)});
+    }
+    if (visualUpdateDepth_ > 0) {
+        visualResizeDirty_ = true;
+        visualPaintDirty_ = true;
+        PrepareDeferredVisualWindowRect(xScreen, yScreen, wDip, hDip, pw, ph);
+        ValidateRect(hwnd_, nullptr);
+        return;
+    }
+    /* SWP_NOCOPYBITS 防止 Windows 把旧客户区内容整块位移。 */
     SetWindowPos(hwnd_, nullptr, xScreen, yScreen, pw, ph,
                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
     InvalidateRect(hwnd_, nullptr, FALSE);
@@ -607,7 +949,27 @@ void UiWindowImpl::SetFrameless(bool frameless) {
     Invalidate();
 }
 
+void UiWindowImpl::SetResizable(bool resizable) {
+    if (resizable_ == resizable) return;
+    resizable_ = resizable;
+    if (!hwnd_) return;
+
+    DWORD style = (DWORD)GetWindowLongPtrW(hwnd_, GWL_STYLE);
+    if (resizable_) {
+        style |= WS_THICKFRAME | WS_MAXIMIZEBOX;
+    } else {
+        style &= ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
+    }
+
+    SetWindowLongPtrW(hwnd_, GWL_STYLE, style);
+    SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                 SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    Invalidate();
+}
+
 void UiWindowImpl::EnableCanvasMode(bool enable) {
+    canvasMode_ = enable;
     if (enable) {
         SetMinSize(32, 32);
         SetBackgroundMode(1);
@@ -634,6 +996,14 @@ void UiWindowImpl::EnableCanvasMode(bool enable) {
     }
     if (root_) LayoutRoot();
     Invalidate();
+}
+
+static void UpdateMaxButtonIcon(Widget* w, bool maximized);
+
+void UiWindowImpl::UpdateDwmFrameMargins() {
+    if (!borderless_) return;
+    MARGINS margins = maximized_ ? MARGINS{0, 0, 0, 0} : MARGINS{0, 0, 1, 0};
+    DwmExtendFrameIntoClientArea(hwnd_, &margins);
 }
 
 static void UpdateMaxButtonIcon(Widget* w, bool maximized) {
@@ -676,6 +1046,16 @@ void UiWindowImpl::SetRoot(WidgetPtr root) {
     root_ = std::move(root);
     // Auto-wire any TitleBarWidget to this window's HWND
     if (root_ && hwnd_) WireTitleBar(root_.get(), hwnd_);
+    if (root_ && canvasMode_) {
+        root_->dragWindow = true;
+        std::function<bool(Widget*)> hideTitleBar = [&](Widget* w) -> bool {
+            if (!w) return false;
+            if (dynamic_cast<TitleBarWidget*>(w)) { w->visible = false; return true; }
+            for (auto& c : w->Children()) if (hideTitleBar(c.get())) return true;
+            return false;
+        };
+        hideTitleBar(root_.get());
+    }
     LayoutRoot();
     UpdateCaretBlinkTimer();
     UpdateToggleAnimTimer();
@@ -690,6 +1070,7 @@ void UiWindowImpl::StartWindowOpenAnimation() {
     windowAnimProgress_ = 0.0f;
 
     // 窗口直接放在目标尺寸，不缩放，仅用透明度 + Y 偏移做动画
+    EnsureLayeredForAlpha(hwnd_);
     SetWindowPos(hwnd_, nullptr, windowTargetX_, windowTargetY_ + kOpenSlideOffset,
                  (int)windowTargetWidth_, (int)windowTargetHeight_,
                  SWP_NOZORDER | SWP_NOACTIVATE);
@@ -704,6 +1085,7 @@ void UiWindowImpl::StartWindowOpenAnimation() {
         SetWindowPos(hwnd_, nullptr, windowTargetX_, windowTargetY_,
                      (int)windowTargetWidth_, (int)windowTargetHeight_,
                      SWP_NOZORDER | SWP_NOACTIVATE);
+        ClearLayeredAfterAlpha(hwnd_);
         ShowOwnedPopups(hwnd_, TRUE);
         if (!toolWindow_) SetForegroundWindow(hwnd_);
         return;
@@ -718,6 +1100,8 @@ void UiWindowImpl::StartWindowCloseAnimation() {
     windowClosing_ = true;
     windowAnimating_ = true;
     windowAnimProgress_ = 0.0f;
+    EnsureLayeredForAlpha(hwnd_);
+    SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA);
 
     RECT rect;
     GetWindowRect(hwnd_, &rect);
@@ -735,61 +1119,99 @@ void UiWindowImpl::StartWindowCloseAnimation() {
     }
 }
 
+bool UiWindowImpl::HasAnimationFrameWork() const {
+    return !animationHost_.Empty() || propertyAnimations_.HasActive();
+}
+
+void UiWindowImpl::EnsureAnimationTimer() {
+    if (!hwnd_ || toggleAnimTimerRunning_ || !HasAnimationFrameWork()) return;
+    if (SetTimer(hwnd_, kToggleAnimTimerId, kToggleAnimIntervalMs, nullptr) != 0) {
+        toggleAnimTimerRunning_ = true;
+    }
+}
+
+void UiWindowImpl::StopAnimationTimer() {
+    if (!hwnd_ || !toggleAnimTimerRunning_) return;
+    KillTimer(hwnd_, kToggleAnimTimerId);
+    toggleAnimTimerRunning_ = false;
+}
+
 void UiWindowImpl::UpdateToggleAnimTimer() {
     if (!hwnd_) return;
 
-    bool needsTimer = false;
+    animationHost_.Clear();
     if (root_) {
-        ForEachToggleWidget(root_.get(), [&](ToggleWidget* tw) {
-            if (tw->animating_) {
-                needsTimer = true;
-            }
-        });
-
         ForEachWidget(root_.get(), [&](Widget* w) {
+            bool needsWidgetTimer = false;
+            AnimationInvalidation invalidation = AnimationInvalidation::Paint;
+
+            auto* tw = dynamic_cast<ToggleWidget*>(w);
+            if (tw && tw->animating_) {
+                needsWidgetTimer = true;
+            }
             auto* cb = dynamic_cast<CheckBoxWidget*>(w);
             if (cb && cb->animating_) {
-                needsTimer = true;
+                needsWidgetTimer = true;
             }
             auto* rb = dynamic_cast<RadioButtonWidget*>(w);
             if (rb && rb->animating_) {
-                needsTimer = true;
+                needsWidgetTimer = true;
             }
             auto* pb = dynamic_cast<ProgressBarWidget*>(w);
             if (pb && (pb->animating_ || pb->IsIndeterminate())) {
-                needsTimer = true;
+                needsWidgetTimer = true;
             }
             auto* sl = dynamic_cast<SliderWidget*>(w);
-            if (sl && std::abs(sl->thumbScaleCurrent_ - sl->thumbScaleTarget_) > 0.001f) {
-                needsTimer = true;
+            if (sl && sl->ThumbAnimating()) {
+                needsWidgetTimer = true;
             }
             auto* sv = dynamic_cast<SplitViewWidget*>(w);
             if (sv && sv->animating_) {
-                needsTimer = true;
+                needsWidgetTimer = true;
+                invalidation |= AnimationInvalidation::Layout;
+                invalidation |= AnimationInvalidation::HitTest;
             }
             auto* ex = dynamic_cast<ExpanderWidget*>(w);
             if (ex && ex->animating_) {
-                needsTimer = true;
+                needsWidgetTimer = true;
+                invalidation |= AnimationInvalidation::Layout;
+                invalidation |= AnimationInvalidation::HitTest;
             }
             auto* iv = dynamic_cast<ImageViewWidget*>(w);
             if (iv && iv->IsLoading()) {
-                needsTimer = true;
+                needsWidgetTimer = true;
             }
             auto* ov = dynamic_cast<OverlayWidget*>(w);
             if (ov && ov->IsActive() && ov->ShowSpinner()) {
-                needsTimer = true;
+                needsWidgetTimer = true;
             }
+            if (needsWidgetTimer) animationHost_.RegisterWidget(w, invalidation);
         });
     }
 
-    if (needsTimer && !toggleAnimTimerRunning_) {
-        if (SetTimer(hwnd_, kToggleAnimTimerId, kToggleAnimIntervalMs, nullptr) != 0) {
-            toggleAnimTimerRunning_ = true;
-        }
-    } else if (!needsTimer && toggleAnimTimerRunning_) {
-        KillTimer(hwnd_, kToggleAnimTimerId);
-        toggleAnimTimerRunning_ = false;
+    bool needsTimer = HasAnimationFrameWork();
+    if (needsTimer) {
+        EnsureAnimationTimer();
+        Invalidate();
+    } else {
+        StopAnimationTimer();
     }
+}
+
+void UiWindowImpl::RegisterAnimatingWidget(Widget* w, AnimationInvalidation invalidation) {
+    if (!hwnd_ || !w) return;
+
+    animationHost_.RegisterWidget(w, invalidation);
+    EnsureAnimationTimer();
+    Invalidate();
+}
+
+void UiWindowImpl::AnimateProperty(Widget* target, AnimProperty prop, float from, float to,
+                                   float durationMs, EasingFunction easing,
+                                   std::function<void()> onComplete) {
+    propertyAnimations_.Animate(target, prop, from, to, durationMs, easing, std::move(onComplete));
+    EnsureAnimationTimer();
+    Invalidate();
 }
 
 void UiWindowImpl::SetTitle(const std::wstring& title) {
@@ -797,16 +1219,47 @@ void UiWindowImpl::SetTitle(const std::wstring& title) {
     if (hwnd_) SetWindowTextW(hwnd_, title_.c_str());
 }
 
-Renderer* g_activeRenderer = nullptr;
+void UiWindowImpl::UpdateClientSizeCache(UINT widthPx, UINT heightPx) {
+    clientWidthPx_ = widthPx;
+    clientHeightPx_ = heightPx;
+    const float s = dpiScale_ > 0.0f ? dpiScale_ : 1.0f;
+    clientWidthDip_ = static_cast<float>(widthPx) / s;
+    clientHeightDip_ = static_cast<float>(heightPx) / s;
+}
+
+void UiWindowImpl::RefreshClientSizeCache() {
+    if (!hwnd_) {
+        UpdateClientSizeCache(0, 0);
+        return;
+    }
+    RECT rc{};
+    if (!GetClientRect(hwnd_, &rc)) return;
+    const int w = std::max<int>(0, static_cast<int>(rc.right - rc.left));
+    const int h = std::max<int>(0, static_cast<int>(rc.bottom - rc.top));
+    UpdateClientSizeCache(static_cast<UINT>(w), static_cast<UINT>(h));
+}
+
+D2D1_SIZE_F UiWindowImpl::CachedClientSizeDip() const {
+    return D2D1::SizeF(clientWidthDip_, clientHeightDip_);
+}
+
+MeasureContext* g_activeMeasureContext = nullptr;
 
 void UiWindowImpl::LayoutRoot() {
-    if (!renderer_.RT() || !root_) return;
-    D2D1_SIZE_F size = renderer_.RT()->GetSize();
+    if (!root_) return;
+    if ((clientWidthPx_ == 0 || clientHeightPx_ == 0) && hwnd_) {
+        RefreshClientSizeCache();
+    }
+    TraceScope scope("core_window", "layout_root_duration");
+    D2D1_SIZE_F size = CachedClientSizeDip();
+    if (size.width <= 0.0f || size.height <= 0.0f) return;
+    TraceEvent("core_window", "layout_root_begin",
+               {TraceF64("client_w", size.width),
+                TraceF64("client_h", size.height)});
     root_->rect = {0, 0, size.width, size.height};
     Viewport() = root_->rect;
-    g_activeRenderer = &renderer_;
+    ActiveMeasureContextScope measureScope(measureContext_, renderer_);
     root_->DoLayout();
-    g_activeRenderer = nullptr;
 }
 
 // ---- WndProc ----
@@ -829,24 +1282,36 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_PAINT:
     case WM_DISPLAYCHANGE:
-        /* L175/L177: 隐藏/最小化窗口的 WM_PAINT —— DWM 不合成这类窗口, 其
-         * flip-model swapchain Present 等不到 back buffer 释放, 在某些 GPU 驱动
-         * (实测 AMD) 的 IDXGISwapChain::Present1 永久死锁, 卡死消息循环。
-         * L175(build 166) 当时整帧跳过(ValidateRect+return), 但那让"预创建隐藏窗 +
-         * ui_run 渐进上屏"的 caller 因 widget 永不绘制而被瓦片交付反复 invalidate
-         * → WM_PAINT 洪流 (GuoheView 超长图缓存命中启动卡死, bug-075)。
-         * L177 改为"绘制但不 present": skipPresent 让 OnPaint 照常 BeginDraw/
-         * DrawTree/EndDraw(flush 到 back buffer → widget 状态落定不再 invalidate),
-         * 只跳 swapChain flip(不撞驱动死锁)。窗口 show 后由 ShowImmediate/正常
-         * WM_PAINT present 揭示。ShowImmediate 直调 OnPaint 不设此标志, 上屏零影响。 */
-        if (!IsWindowVisible(hwnd_) || IsIconic(hwnd_)) {
-            renderer_.skipPresent = true;
-            OnPaint();
-            renderer_.skipPresent = false;
-            ValidateRect(hwnd_, nullptr);
+        if (visualUpdateDepth_ > 0) {
+            visualPaintDirty_ = true;
+            if (msg == WM_PAINT) {
+                PAINTSTRUCT ps{};
+                BeginPaint(hwnd_, &ps);
+                EndPaint(hwnd_, &ps);
+            } else {
+                ValidateRect(hwnd_, nullptr);
+            }
             return 0;
         }
-        OnPaint(); ValidateRect(hwnd_, nullptr); return 0;
+        if (!IsWindowVisible(hwnd_) || IsIconic(hwnd_)) {
+            if (msg == WM_PAINT) {
+                PAINTSTRUCT ps{};
+                BeginPaint(hwnd_, &ps);
+                EndPaint(hwnd_, &ps);
+            } else {
+                ValidateRect(hwnd_, nullptr);
+            }
+            return 0;
+        }
+        if (msg == WM_PAINT) {
+            PAINTSTRUCT ps{};
+            BeginPaint(hwnd_, &ps);
+            EndPaint(hwnd_, &ps);
+        } else {
+            ValidateRect(hwnd_, nullptr);
+        }
+        RequestRenderFrame(FrameReason::Paint, PresentPolicy::Deferred);
+        return 0;
 
     case WM_ENTERSIZEMOVE:
         isMoving_ = true;
@@ -910,30 +1375,64 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_EXITSIZEMOVE:
+    {
+        const bool wasResizing = isResizing_;
         isMoving_ = false;
         isResizing_ = false;
+        if (wasResizing && renderThreadPresentActive_) {
+            TraceEvent("core_window", "wm_exitsizemove_final_resize_frame");
+            RequestRenderFrame(FrameReason::Resize | FrameReason::Final, PresentPolicy::Final);
+            ValidateRect(hwnd_, nullptr);
+            return 0;
+        }
         Invalidate();
         break;
+    }
 
-    case WM_SIZE:
+    case WM_SIZE: {
+        TraceScope wmSizeScope("core_window", "wm_size_duration");
+        {
+            TraceEvent("core_window", "wm_size",
+                       {TraceU64("w_px", (unsigned)LOWORD(lParam)),
+                        TraceU64("h_px", (unsigned)HIWORD(lParam)),
+                        TraceI64("depth", visualUpdateDepth_),
+                        TraceU64("wparam", (unsigned)wParam)});
+        }
         // 动画期间跳过 resize/layout/repaint，DWM 会自动缩放已有内容
         if (windowAnimating_) {
             maximized_ = (wParam == SIZE_MAXIMIZED);
             return 0;
         }
-        OnResize(LOWORD(lParam), HIWORD(lParam));
+        const UINT sizeW = LOWORD(lParam);
+        const UINT sizeH = HIWORD(lParam);
+        UpdateClientSizeCache(sizeW, sizeH);
+        OnResize(sizeW, sizeH);
         maximized_ = (wParam == SIZE_MAXIMIZED);
         // 更新最大化按钮图标：最大化 → 还原图标，非最大化 → 最大化图标
         UpdateMaxButtonIcon(root_.get(), maximized_);
-        if (borderless_) {
-            MARGINS margins = maximized_ ? MARGINS{0, 0, 0, 0} : MARGINS{0, 0, 1, 0};
-            DwmExtendFrameIntoClientArea(hwnd_, &margins);
+        {
+            TraceScope frameScope("core_window", "update_dwm_frame_margins_duration");
+            UpdateDwmFrameMargins();
         }
-        // 立即重绘并 Present，不等 WM_PAINT —— 消除 DWM 拉伸旧帧的果冻效果
-        renderer_.skipVSync = true;  // resize 期间不等 VSync，减少延迟
-        OnPaint();
+        if (visualUpdateDepth_ > 0) {
+            visualResizeDirty_ = true;
+            visualPaintDirty_ = true;
+            ValidateRect(hwnd_, nullptr);
+            return 0;
+        }
+        const bool interactiveResize = isMoving_ && isResizing_;
+        const PresentPolicy resizePolicy = interactiveResize
+            ? PresentPolicy::Immediate
+            : PresentPolicy::Final;
+        FrameReason resizeReason = FrameReason::Resize;
+        if (resizePolicy == PresentPolicy::Final) resizeReason |= FrameReason::Final;
+        TraceEvent("core_window", "wm_size_request_resize_frame",
+                   {TraceBool("interactive", interactiveResize),
+                    TraceI64("policy", static_cast<int64_t>(resizePolicy))});
+        RequestRenderFrame(resizeReason, resizePolicy);
         ValidateRect(hwnd_, nullptr);
         return 0;
+    }
 
     case WM_DPICHANGED:
         OnDpiChanged(HIWORD(wParam), reinterpret_cast<const RECT*>(lParam)); return 0;
@@ -941,7 +1440,53 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_GETMINMAXINFO:
         OnGetMinMaxInfo(reinterpret_cast<MINMAXINFO*>(lParam)); return 0;
 
+    case WM_MOUSEACTIVATE:
+        if (!toolWindow_) {
+            ActivateForMouseInput();
+            return MA_ACTIVATE;
+        }
+        break;
+
     case WM_MOUSEMOVE:
+        if (canvasDragTracking_) {
+            POINT cur;
+            GetCursorPos(&cur);
+            int newLeft = canvasDragStartRect_.left + (cur.x - canvasDragStartScreen_.x);
+            int newTop = canvasDragStartRect_.top + (cur.y - canvasDragStartScreen_.y);
+            SetWindowPos(hwnd_, nullptr, newLeft, newTop, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            return 0;
+        }
+        if (tbDragTracking_) {
+            /* L219: 标题栏拦截拖动 —— 按下后跟踪位移, 超过系统拖动阈值视为"拖动"。
+             * 没超阈值的纯点击在 WM_LBUTTONUP 复位、不触发。超阈值后模仿 Windows
+             * "拖最大化窗口标题栏 → 还原并跟随光标": 记抓取点在(全屏)标题栏的水平比例
+             * + 垂直偏移 → fire onTitleBarDrag(宿主退出全屏/还原窗口大小) → 把还原后的
+             * 窗口摆到光标下(光标落回标题栏同一相对位置) → 重发系统移动循环跟随光标。 */
+            POINT cur; GetCursorPos(&cur);
+            if (std::abs(cur.x - tbDragStartScreen_.x) > GetSystemMetrics(SM_CXDRAG) ||
+                std::abs(cur.y - tbDragStartScreen_.y) > GetSystemMetrics(SM_CYDRAG)) {
+                tbDragTracking_ = false;
+                RECT fr; GetWindowRect(hwnd_, &fr);
+                float fx = (fr.right > fr.left)
+                    ? float(tbDragStartScreen_.x - fr.left) / float(fr.right - fr.left)
+                    : 0.5f;
+                int grabY = tbDragStartScreen_.y - fr.top;
+                if (onTitleBarDrag) onTitleBarDrag();   // 宿主退出全屏 → 窗口还原成窗口态
+                RECT wr; GetWindowRect(hwnd_, &wr);
+                int nw = wr.right - wr.left;
+                int newLeft = cur.x - int(fx * nw);
+                int newTop  = cur.y - grabY;
+                SetWindowPos(hwnd_, nullptr, newLeft, newTop, 0, 0,
+                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                ReleaseCapture();
+                /* intercept 此刻已被宿主在 exit_fullscreen 里关掉 → 这次 NCLBUTTONDOWN
+                 * 不再被拦截, 进系统移动循环, 窗口跟随光标直到松手。 */
+                SendMessageW(hwnd_, WM_NCLBUTTONDOWN, HTCAPTION,
+                             MAKELPARAM(cur.x, cur.y));
+            }
+            return 0;
+        }
         OnMouseMove((float)GET_X_LPARAM(lParam), (float)GET_Y_LPARAM(lParam)); return 0;
     case WM_MOUSELEAVE:
         if (hoveredWidget_) {
@@ -953,12 +1498,24 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             hoveredWidget_ = nullptr;
         }
         tooltipVisible_ = false; tooltipWidget_ = nullptr;
-        Invalidate(); return 0;
+        InvalidateNow(); return 0;
     case WM_LBUTTONDOWN:
         OnMouseDown((float)GET_X_LPARAM(lParam), (float)GET_Y_LPARAM(lParam)); return 0;
     case WM_LBUTTONUP:
+        if (canvasDragTracking_) {
+            canvasDragTracking_ = false;
+            ReleaseCapture();
+            return 0;
+        }
+        if (tbDragTracking_) {   /* L219: 标题栏只是点击(没拖过阈值), 复位、不退全屏 */
+            tbDragTracking_ = false;
+            ReleaseCapture();
+            return 0;
+        }
         OnMouseUp((float)GET_X_LPARAM(lParam), (float)GET_Y_LPARAM(lParam)); return 0;
     case WM_CAPTURECHANGED:
+        canvasDragTracking_ = false;
+        tbDragTracking_ = false;   /* L219: capture 被夺走时复位标题栏拖动跟踪 */
         // 鼠标 capture 被夺走 (DoDragDrop 起拖 / 系统). press 中的 widget 收不到
         // WM_LBUTTONUP, 复位它避免卡在 drag 态. CancelMouseCapture 自守 pressedWidget_
         // 为空时 no-op (正常 ReleaseCapture 流程已先清空, 不会重复触发).
@@ -992,9 +1549,6 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
         }
-        /* Build 165+ (L172 follow-up): toast 的 kToastFadeTimerId 现在跑在
-         * 独立的 toast 叠加窗 (toastHwnd_) 上, 由 ToastWndProc 处理 —— 主窗
-         * WndProc 不再有 toast timer 分支 (淡变只重渲那个小窗, 不碰主窗 RT). */
         if (wParam == kCaretBlinkTimerId) {
             if (HasFocusedTextInput()) {
                 Invalidate();
@@ -1004,66 +1558,10 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         if (wParam == kToggleAnimTimerId) {
-            if (root_) {
-                bool anyAnimating = false;
-                ForEachToggleWidget(root_.get(), [&](ToggleWidget* tw) {
-                    if (tw->animating_) {
-                        tw->UpdateAnimation();
-                    }
-                    if (tw->animating_) anyAnimating = true;
-                });
-
-                ForEachWidget(root_.get(), [&](Widget* w) {
-                    auto* cb = dynamic_cast<CheckBoxWidget*>(w);
-                    if (cb && cb->animating_) {
-                        cb->UpdateAnimation();
-                        if (cb->animating_) anyAnimating = true;
-                    }
-                    auto* rb = dynamic_cast<RadioButtonWidget*>(w);
-                    if (rb && rb->animating_) {
-                        rb->UpdateAnimation();
-                        if (rb->animating_) anyAnimating = true;
-                    }
-                    auto* pb = dynamic_cast<ProgressBarWidget*>(w);
-                    if (pb && pb->animating_) {
-                        pb->UpdateAnimation();
-                        if (pb->animating_) anyAnimating = true;
-                    }
-                    if (pb && pb->IsIndeterminate()) {
-                        anyAnimating = true;  // keep timer alive for continuous animation
-                    }
-                    auto* sl = dynamic_cast<SliderWidget*>(w);
-                    if (sl && std::abs(sl->thumbScaleCurrent_ - sl->thumbScaleTarget_) > 0.001f) {
-                        anyAnimating = true;
-                    }
-                    auto* sv = dynamic_cast<SplitViewWidget*>(w);
-                    if (sv && sv->animating_) {
-                        sv->UpdateAnimation();
-                        sv->DoLayout();
-                        if (sv->animating_) anyAnimating = true;
-                    }
-                    auto* ex = dynamic_cast<ExpanderWidget*>(w);
-                    if (ex && ex->animating_) {
-                        ex->UpdateAnimation();
-                        LayoutRoot();  // Expander size changed, re-layout parent chain
-                        if (ex->animating_) anyAnimating = true;
-                    }
-                    auto* iv = dynamic_cast<ImageViewWidget*>(w);
-                    if (iv && iv->IsLoading()) {
-                        anyAnimating = true;  // angle increments inside OnDraw
-                    }
-                    auto* ov = dynamic_cast<OverlayWidget*>(w);
-                    if (ov && ov->IsActive() && ov->ShowSpinner()) {
-                        anyAnimating = true;  // spinner uses GetTickCount64-based phase
-                    }
-                });
-
+            if (HasAnimationFrameWork()) {
                 Invalidate();
-
-                if (!anyAnimating && toggleAnimTimerRunning_) {
-                    KillTimer(hwnd_, kToggleAnimTimerId);
-                    toggleAnimTimerRunning_ = false;
-                }
+            } else {
+                StopAnimationTimer();
             }
             return 0;
         }
@@ -1094,6 +1592,7 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                          SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE);
 
             if (!windowAnimating_) {
+                ClearLayeredAfterAlpha(hwnd_);
                 ShowOwnedPopups(hwnd_, TRUE);
                 if (!toolWindow_) SetForegroundWindow(hwnd_);
                 Invalidate();
@@ -1147,7 +1646,7 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             });
         }
         UpdateCaretBlinkTimer();
-        Invalidate();
+        InvalidateNow();
         return 0;
     case WM_MOUSEWHEEL: {
         POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
@@ -1159,7 +1658,7 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         float dx = (float)GET_X_LPARAM(lParam) / dpiScale_;
         float dy = (float)GET_Y_LPARAM(lParam) / dpiScale_;
         if (onRightClick) onRightClick(dx, dy);
-        Invalidate();
+        InvalidateNow();
         return 0;
     }
 
@@ -1167,9 +1666,12 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         // Don't forward Tab char (handled in WM_KEYDOWN)
         if (wParam == '\t') return 0;
         // Forward to focused widget
-        if (focusedWidget_ && focusedWidget_->OnKeyChar((wchar_t)wParam)) {
-            Invalidate();
-            return 0;
+        if (focusedWidget_) {
+            ActiveMeasureContextScope measureScope(measureContext_, renderer_);
+            if (focusedWidget_->OnKeyChar((wchar_t)wParam)) {
+                InvalidateNow();
+                return 0;
+            }
         }
         break;
 
@@ -1186,7 +1688,18 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             if (real) vk = (int)real;
         }
         if (DispatchKeyDown(vk)) return 0;
-        if (onKey) onKey(vk);
+        if (onKey) {
+            HWND h = hwnd_;
+            onKey(vk);
+            // onKey may destroy this window (for example Esc/close). Do not
+            // touch `this` after the callback; repaint the HWND directly if it
+            // still exists so host-level commands (image navigation, zoom, ...)
+            // are visible immediately.
+            if (h && IsWindow(h)) {
+                InvalidateRect(h, nullptr, FALSE);
+                UpdateWindow(h);
+            }
+        }
         /* return 0 (而非 break) — onKey 回调里可能销毁本窗口 (典型: 自定义
          * 快捷键 close-on-key). break 会 fall-through 到末尾的
          * "return DefWindowProcW(hwnd_, ...)", 解引用 this->hwnd_, 撞 UAF.
@@ -1312,6 +1825,46 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         if (req && req->fn) req->fn(req->ud);
         return 0;
     }
+    case kMsgRenderFrame: {
+        renderFramePosted_ = false;
+        if (!frameScheduler_.HasPending()) {
+            return 0;
+        }
+        if (visualUpdateDepth_ > 0) {
+            visualPaintDirty_ = true;
+            return 0;
+        }
+        if (!IsWindowVisible(hwnd_) || IsIconic(hwnd_)) {
+            return 0;
+        }
+        PaintAndValidate();
+        return 0;
+    }
+    case kMsgRenderDeviceLost: {
+        const uint64_t deviceGeneration = static_cast<uint64_t>(lParam);
+        if (deviceGeneration != 0 &&
+            deviceGeneration == lastDeviceRecoveryGeneration_) {
+            return 0;
+        }
+        lastDeviceRecoveryGeneration_ = deviceGeneration;
+        TraceEvent("core_window", "render_device_lost_recovery_requested",
+                   {TraceU64("window_id", renderWindowId_.window_id),
+                    TraceU64("hwnd_generation", renderWindowId_.hwnd_generation),
+                    TraceU64("device_generation", deviceGeneration),
+                    TraceI64("status", static_cast<int64_t>(wParam))});
+        if (!hwnd_ || !renderWindowId_.IsValid() ||
+            !IsWindowVisible(hwnd_) || IsIconic(hwnd_)) {
+            return 0;
+        }
+        if (visualUpdateDepth_ > 0) {
+            visualPaintDirty_ = true;
+            visualResizeDirty_ = true;
+            return 0;
+        }
+        RequestRenderFrame(FrameReason::Paint | FrameReason::Final,
+                           PresentPolicy::Final);
+        return 0;
+    }
     case kMsgStartupReveal: {
         if (startupRevealPending_) {
             SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA);
@@ -1332,6 +1885,7 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_CLOSE:
+        if (onCloseRequest && !onCloseRequest()) return 0;
         if (onClose) onClose();
         DestroyWindow(hwnd_);
         return 0;
@@ -1344,6 +1898,7 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         /* 主窗销毁前先收掉 toast 叠加窗 + 其 timer + timeEndPeriod 配对
          * (this 在 RemoveWindow 后失效, 不能拖到那之后). */
         DestroyToast();
+        UnregisterRenderWindow();
         HWND oldHwnd = hwnd_;
         hwnd_ = nullptr;
         auto& ctx = GetContext();
@@ -1372,10 +1927,34 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             /* L90: 菜单开着时, 点窗口非客户区 (含 canvas mode 下 OnNcHitTest 把
              * 整窗/画布判成 HTCAPTION 的可拖区) 先关菜单并消掉本次点击 —— 对齐
              * HTCLIENT 路径 OnMouseDown→CloseMenu 的行为. 否则 borderless 看图
-             * 左键点画布走 WM_NCLBUTTONDOWN → DefWindowProc 进窗口移动 modal
-             * loop, 完全不经 OnMouseDown, 菜单关不掉. 无菜单时 fall through 照常
-             * 拖窗 / 系统行为. */
-            if (activeMenu_) { CloseMenu(); return 0; }
+             * 左键点画布走 WM_NCLBUTTONDOWN, 完全不经 OnMouseDown, 菜单关不掉.
+             * 无菜单时 canvas mode 走库内自由拖动, 其它标题栏命中仍按系统行为. */
+            if (activeMenu_) { ActivateForMouseInput(); CloseMenu(); return 0; }
+            /* L219: 标题栏拖动拦截(宿主开启, 如全屏态)。命中点是 TitleBar 背景
+             * (非按钮: 按钮命中是其自身 HTCLIENT, 不是 HTCAPTION)且 onTitleBarDrag
+             * 已注册时, 不进系统移动循环, 改为自己 SetCapture + 跟踪位移(见 WM_MOUSEMOVE),
+             * 超阈值才退出全屏。intercept=false(普通态)则 fall-through 走系统拖窗。 */
+            if (wParam == HTCAPTION && titlebarDragIntercept_ && onTitleBarDrag && root_) {
+                POINT spt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };  // screen
+                POINT cpt = spt; ScreenToClient(hwnd_, &cpt);
+                Widget* hit = root_->HitTest((float)cpt.x / dpiScale_,
+                                             (float)cpt.y / dpiScale_);
+                if (hit && dynamic_cast<TitleBarWidget*>(hit)) {
+                    ActivateForMouseInput();
+                    tbDragTracking_ = true;
+                    tbDragStartScreen_ = spt;
+                    SetCapture(hwnd_);
+                    return 0;
+                }
+            }
+            if (wParam == HTCAPTION && IsCanvasDragHit(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam))) {
+                ActivateForMouseInput();
+                canvasDragTracking_ = true;
+                canvasDragStartScreen_ = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+                GetWindowRect(hwnd_, &canvasDragStartRect_);
+                SetCapture(hwnd_);
+                return 0;
+            }
             break;
         case WM_NCLBUTTONDBLCLK:
             if (wParam == HTCAPTION) {
@@ -1413,41 +1992,228 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 
 // ---- Paint ----
 
-void UiWindowImpl::OnPaint() {
-    if (!renderer_.RT()) return;
+void UiWindowImpl::BeginAnimationFrame() {
+    if (animationHost_.Empty()) return;
+
+    uint64_t frameTick = GetTickCount64();
+    double frameIntervalMs = lastAnimationFrameTick_ != 0
+        ? static_cast<double>(frameTick - lastAnimationFrameTick_)
+        : 0.0;
+    lastAnimationFrameTick_ = frameTick;
+
+    TraceScope frameScope("core_window", "animation_frame_duration");
+    bool anyAnimating = false;
+    bool needsLayout = false;
+    int inputWidgets = (int)animationHost_.Size();
+    int tickedWidgets = 0;
+    std::vector<AnimationTarget> stillAnimating;
+    const auto activeTargets = animationHost_.Targets();
+    stillAnimating.reserve(activeTargets.size());
+
+    for (const AnimationTarget& target : activeTargets) {
+        Widget* w = target.widget;
+        if (!w) continue;
+        bool keep = false;
+        bool ticked = false;
+
+        auto* tw = dynamic_cast<ToggleWidget*>(w);
+        if (tw && tw->animating_) {
+            tw->UpdateAnimation();
+            ticked = true;
+        }
+        if (tw && tw->animating_) keep = true;
+
+        auto* cb = dynamic_cast<CheckBoxWidget*>(w);
+        if (cb && cb->animating_) {
+            cb->UpdateAnimation();
+            ticked = true;
+            if (cb->animating_) keep = true;
+        }
+        auto* rb = dynamic_cast<RadioButtonWidget*>(w);
+        if (rb && rb->animating_) {
+            rb->UpdateAnimation();
+            ticked = true;
+            if (rb->animating_) keep = true;
+        }
+        auto* pb = dynamic_cast<ProgressBarWidget*>(w);
+        if (pb && pb->animating_) {
+            pb->UpdateAnimation();
+            ticked = true;
+            if (pb->animating_) keep = true;
+        }
+        if (pb && pb->IsIndeterminate()) {
+            keep = true;
+        }
+        auto* sl = dynamic_cast<SliderWidget*>(w);
+        if (sl) {
+            sl->UpdateThumbAnimation();
+            ticked = true;
+            if (sl->ThumbAnimating()) keep = true;
+        }
+        auto* sv = dynamic_cast<SplitViewWidget*>(w);
+        if (sv && sv->animating_) {
+            sv->UpdateAnimation();
+            ticked = true;
+            if (sv->animating_) keep = true;
+        }
+        auto* ex = dynamic_cast<ExpanderWidget*>(w);
+        if (ex && ex->animating_) {
+            ex->UpdateAnimation();
+            ticked = true;
+            if (ex->animating_) keep = true;
+        }
+        auto* iv = dynamic_cast<ImageViewWidget*>(w);
+        if (iv && iv->IsLoading()) {
+            keep = true;
+        }
+        auto* ov = dynamic_cast<OverlayWidget*>(w);
+        if (ov && ov->IsActive() && ov->ShowSpinner()) {
+            keep = true;
+        }
+
+        if (keep) {
+            anyAnimating = true;
+            stillAnimating.push_back(target);
+            if (HasAnimationInvalidation(target.invalidation, AnimationInvalidation::Layout)) {
+                needsLayout = true;
+            }
+        }
+        if (ticked) ++tickedWidgets;
+    }
+
+    animationHost_.ReplaceTargets(std::move(stillAnimating));
+
+    if (needsLayout) {
+        LayoutRoot();
+    }
+
+    if (IsTraceEnabled()) {
+        TraceEvent("core_window", "animation_frame",
+                   {TraceI64("input_count", inputWidgets),
+                    TraceI64("ticked_count", tickedWidgets),
+                    TraceI64("remaining_count", (int64_t)animationHost_.Size()),
+                    TraceBool("any_animating", anyAnimating),
+                    TraceBool("needs_layout", needsLayout),
+                    TraceF64("frame_interval_ms", frameIntervalMs),
+                    TraceBool("dropped_frame_estimate", frameIntervalMs > 25.0)});
+    }
+
+    if (!anyAnimating) {
+        animationHost_.Clear();
+        lastAnimationFrameTick_ = 0;
+        StopAnimationTimer();
+    }
+}
+
+void UiWindowImpl::PaintAndValidate() {
+    if (!hwnd_) return;
+    auto frame = frameScheduler_.BeginFrame();
+    TraceEvent("core_window", "paint_and_validate",
+               {TraceI64("frame_reasons", static_cast<int64_t>(frame.reasons)),
+                TraceI64("present_policy", static_cast<int64_t>(frame.policy)),
+                TraceU64("frame_generation", frame.generation)});
+    auto completeFrame = [&]() {
+        if (frame.generation == 0) return;
+        frameScheduler_.CompleteFrame(frame.generation);
+        TraceEvent("core_window", "frame_scheduler_complete",
+                   {TraceU64("frame_generation", frame.generation)});
+    };
+    if (frame.generation == 0) {
+        ValidateRect(hwnd_, nullptr);
+        return;
+    }
+    ActivateRenderThreadPresent();
+    const bool prepared = deferNextFramePresent_ && FrameRequiresPresentBarrier(frame);
+    DisplayList displayList = OnPaint(frame.generation);
+    SubmitFrameJob(frame, std::move(displayList));
+    ValidateRect(hwnd_, nullptr);
+    completeFrame();
+    const bool completed = WaitForRenderGeneration(frame, false, prepared);
+    if (prepared) {
+        deferredPresentGeneration_ = frame.generation;
+        deferredPresentPrepared_ = completed;
+    }
+}
+
+DisplayList UiWindowImpl::OnPaint(uint64_t frameGeneration) {
+    const bool canRecordDisplayList = frameGeneration != 0 && renderWindowId_.IsValid();
+    if (!canRecordDisplayList) return {};
+    TraceScope paintScope("core_window", "on_paint_duration");
+    if (IsTraceEnabled()) {
+        D2D1_SIZE_F size = CachedClientSizeDip();
+        TraceEvent("core_window", "on_paint_begin",
+                   {TraceF64("client_w", size.width),
+                    TraceF64("client_h", size.height),
+                    TraceI64("depth", visualUpdateDepth_),
+                    TraceBool("skip_vsync", renderer_.skipVSync)});
+    }
 
     // 窗口开/关动画期间不重绘，DWM 负责缩放已有内容
     if (windowAnimating_) {
         ValidateRect(hwnd_, nullptr);
-        return;
+        return {};
     }
 
     // Consume any pending layout request from dynamic widget mutations
     // (v-if mount, v-for re-key, etc.) before drawing the new state.
     if (ui::LayoutDirtyFlag()) {
+        TraceScope scope("core_window", "paint_dirty_layout_duration");
         ui::LayoutDirtyFlag() = false;
         LayoutRoot();
     }
 
+    BeginAnimationFrame();
+
     // 移动期间正常渲染（不跳过）
 
     // Tick property animations
-    bool animsRunning = Animations().Tick();
+    size_t propertyAnimInput = propertyAnimations_.Count();
+    bool animsRunning = propertyAnimations_.Tick();
+    if (IsTraceEnabled() && propertyAnimInput > 0) {
+        TraceEvent("core_window", "property_animation_frame",
+                   {TraceI64("input_count", (int64_t)propertyAnimInput),
+                    TraceI64("remaining_count", (int64_t)propertyAnimations_.Count()),
+                    TraceBool("any_animating", animsRunning)});
+    }
+    if (ui::LayoutDirtyFlag()) {
+        TraceScope scope("core_window", "paint_post_animation_layout_duration");
+        ui::LayoutDirtyFlag() = false;
+        LayoutRoot();
+    }
+    if (animsRunning) EnsureAnimationTimer();
 
-    // 正常绘制
-    renderer_.BeginDraw();
+    const bool recordDisplayList = canRecordDisplayList;
+    DisplayListRecorder recorder;
+    DisplayListRecorder* previousRecorder = nullptr;
+    if (recordDisplayList) {
+        DisplayList base;
+        base.window_id = renderWindowId_.window_id;
+        base.generation = frameGeneration;
+        base.width_px = static_cast<int>(clientWidthPx_);
+        base.height_px = static_cast<int>(clientHeightPx_);
+        base.dpi_scale = dpiScale_;
+        recorder.Reset(std::move(base));
+        previousRecorder = renderer_.DisplayListRecorderTarget();
+        renderer_.SetDisplayListRecorder(&recorder);
+    }
+
     if (bgMode_ == 0) {
         renderer_.Clear(theme::kWindowBg());
     } else {
-        /* 无背景擦除模式：透明清空，依赖 widget 自己画满整个客户区。
-         * SetWindowPos 扩大窗口时不会闪主题色。 */
         renderer_.Clear({0, 0, 0, 0});
     }
 
     if (root_) {
         Viewport() = root_->rect;
-        root_->DrawTree(renderer_);
-        root_->DrawOverlays(renderer_);
+        ActiveMeasureContextScope measureScope(measureContext_, renderer_);
+        {
+            TraceScope scope("core_window", "draw_tree_duration");
+            root_->DrawTree(renderer_);
+        }
+        {
+            TraceScope scope("core_window", "draw_overlays_duration");
+            root_->DrawOverlays(renderer_);
+        }
     }
 
     // Debug highlight: draw red border around widget with matching ID
@@ -1504,7 +2270,7 @@ void UiWindowImpl::OnPaint() {
         float tipY = tooltipWidget_->rect.bottom + 4.0f;
 
         /* 确保不超出窗口 */
-        D2D1_SIZE_F winSize = renderer_.RT()->GetSize();
+        D2D1_SIZE_F winSize = CachedClientSizeDip();
         if (tipX + tipW > winSize.width - 4) tipX = winSize.width - 4 - tipW;
         if (tipX < 4) tipX = 4;
         if (tipY + tipH > winSize.height - 4) {
@@ -1530,22 +2296,16 @@ void UiWindowImpl::OnPaint() {
     }
 
     if (borderless_ && !maximized_) {
-        D2D1_SIZE_F size = renderer_.RT()->GetSize();
+        D2D1_SIZE_F size = CachedClientSizeDip();
         D2D1_RECT_F border = {0, 0, size.width, size.height};
         renderer_.DrawRect(border, theme::kWindowBorder(), theme::kBorderWidth);
     }
 
-    // Toast notification — Build 165+ (L172 follow-up): 移到独立 DComp 叠加窗
-    // (toastHwnd_ / PaintToast), 不再画进主窗 RT. 这里不画.
+    // Toast notification is owned by OverlayService and is not recorded into the main window.
 
-    HRESULT hr = renderer_.EndDraw();
-    if (hr == D2DERR_RECREATE_TARGET) renderer_.CreateRenderTarget(hwnd_);
-
-    // Keep painting while property animations are active
-    if (animsRunning) Invalidate();
-
-    // Ensure timer is running for continuous animations (indeterminate progress, etc.)
-    UpdateToggleAnimTimer();
+    if (recordDisplayList) {
+        renderer_.SetDisplayListRecorder(previousRecorder);
+    }
 
     /* loading spinner 持续动画：检查是否有 ImageView 处于 loading 状态 */
     if (root_) {
@@ -1559,33 +2319,75 @@ void UiWindowImpl::OnPaint() {
         }
     }
 
-    if (startupRevealPending_ && hr == S_OK && !startupRevealPosted_) {
+    if (startupRevealPending_ && !startupRevealPosted_) {
         startupRevealPosted_ = true;
         PostMessageW(hwnd_, kMsgStartupReveal, 0, 0);
     }
+    TraceEvent("core_window", "on_paint_end");
+    if (recordDisplayList) {
+        return recorder.Finish();
+    }
+    return {};
 }
 
 void UiWindowImpl::OnResize(UINT width, UINT height) {
-    renderer_.Resize(width, height);
-    LayoutRoot();
+    TraceScope resizeScope("core_window", "on_resize_duration");
+    const bool skipPreparedCallback =
+        preparedVisualResizeNotified_ &&
+        preparedVisualResizeWPx_ == width &&
+        preparedVisualResizeHPx_ == height;
+    if (preparedVisualResizeNotified_) {
+        preparedVisualResizeNotified_ = false;
+        preparedVisualResizeWPx_ = 0;
+        preparedVisualResizeHPx_ = 0;
+    }
+    UpdateClientSizeCache(width, height);
+    {
+        TraceEvent("core_window", "on_resize",
+                   {TraceU64("w_px", width),
+                    TraceU64("h_px", height),
+                    TraceBool("skip_prepared_callback", skipPreparedCallback),
+                    TraceI64("depth", visualUpdateDepth_)});
+    }
+    {
+        TraceScope scope("core_window", "on_resize_layout_duration");
+        LayoutRoot();
+    }
+    if (!skipPreparedCallback) {
+        TraceScope scope("core_window", "on_resize_callback_duration");
+        NotifyResizeCallback(width, height);
+    } else {
+        TraceEvent("core_window", "on_resize_callback_skipped_prepared",
+                   {TraceU64("w_px", width),
+                    TraceU64("h_px", height)});
+    }
+}
+
+void UiWindowImpl::NotifyResizeCallback(UINT width, UINT height) {
     /* L91: 回调单位补统一为 DIP. width/height 来自 WM_SIZE = 物理像素, 但
      * ui_window_set_size / ui_widget_get_rect / 窗口几何 API 都已是 DIP
      * (L6/L23 v1.2.0 统一过, 当时漏了本回调). 转成 DIP 跟它们一致, 消费者
      * (如无边框看图记忆窗口长边) 拿到的尺寸跟 set_size 同单位, 高 DPI 屏不再
      * 错乘 dpiScale_. */
     if (onResize) {
+        TraceScope scope("core_window", "notify_resize_callback_duration");
         const float s = dpiScale_ > 0.0f ? dpiScale_ : 1.0f;
         onResize((int)(width / s + 0.5f), (int)(height / s + 0.5f));
+    }
+    if (onPageResize) {
+        TraceScope scope("core_window", "notify_page_resize_duration");
+        const float s = dpiScale_ > 0.0f ? dpiScale_ : 1.0f;
+        onPageResize((int)(width / s + 0.5f), (int)(height / s + 0.5f));
     }
 }
 
 void UiWindowImpl::OnDpiChanged(UINT dpi, const RECT* suggested) {
     dpi_ = dpi;
     dpiScale_ = (float)dpi / 96.0f;
-    renderer_.CreateRenderTarget(hwnd_);
     SetWindowPos(hwnd_, nullptr, suggested->left, suggested->top,
                  suggested->right - suggested->left, suggested->bottom - suggested->top,
                  SWP_NOZORDER | SWP_NOACTIVATE);
+    RefreshClientSizeCache();
 }
 
 // ---- Mouse events ----
@@ -1607,21 +2409,29 @@ void UiWindowImpl::CloseMenu() {
 }
 
 void UiWindowImpl::OnMouseMove(float x, float y) {
+    ActiveMeasureContextScope measureScope(measureContext_, renderer_);
     float dx = x / dpiScale_, dy = y / dpiScale_;
+    bool repaintNow = false;
 
     // If a popup menu is open, clicking in the main window should close it
     // (the popup's WM_ACTIVATE handler closes it when focus shifts)
 
     if (pressedWidget_) {
         MouseEvent e{dx, dy, 0, true};
-        pressedWidget_->OnMouseMove(e);
-        Invalidate();
+        const bool handled = pressedWidget_->OnMouseMove(e);
+        // Captured drags can produce a continuous stream of WM_MOUSEMOVE. If
+        // we only invalidate, WM_PAINT may not run until the mouse stops, so
+        // the visual state jumps to the final position. Keep this generic for
+        // all pressed widgets that explicitly handle drag moves.
+        if (handled) InvalidateNow();
+        else Invalidate();
         return;
     }
 
     if (root_) {
         auto* hit = root_->HitTest(dx, dy);
         if (hoveredWidget_ != hit) {
+            repaintNow = true;
             // Hover propagation: every widget in the new hit's ancestor chain
             // is "hovered", every widget in the old chain that's no longer in
             // the new chain leaves hover. Mirrors CSS :hover semantics so a
@@ -1643,7 +2453,7 @@ void UiWindowImpl::OnMouseMove(float x, float y) {
             }
             if (hoveredWidget_) {
                 MouseEvent leaveE{dx, dy};
-                hoveredWidget_->OnMouseMove(leaveE);
+                if (hoveredWidget_->OnMouseMove(leaveE)) repaintNow = true;
             }
             hoveredWidget_ = hit;
 
@@ -1672,14 +2482,14 @@ void UiWindowImpl::OnMouseMove(float x, float y) {
         if (hit) {
             MouseEvent e{dx, dy};
             if (hit->onMouseMoveHook) hit->onMouseMoveHook(e);
-            hit->OnMouseMove(e);
+            if (hit->OnMouseMove(e)) repaintNow = true;
         }
 
         ForEachWidget(root_.get(), [&](Widget* w) {
             auto* cb = dynamic_cast<ComboBoxWidget*>(w);
             if (cb && cb->IsOpen()) {
                 MouseEvent e{dx, dy};
-                cb->OnMouseMove(e);
+                if (cb->OnMouseMove(e)) repaintNow = true;
             }
         });
 
@@ -1688,11 +2498,12 @@ void UiWindowImpl::OnMouseMove(float x, float y) {
             auto* sv = dynamic_cast<ScrollViewWidget*>(w);
             if (sv && sv->visible && sv->NeedsScrollbar()) {
                 MouseEvent e{dx, dy};
-                sv->OnMouseMove(e);
+                if (sv->OnMouseMove(e)) repaintNow = true;
             }
         });
     }
-    Invalidate();
+    if (repaintNow || HasPendingPaint()) InvalidateNow();
+    else Invalidate();
     UpdateToggleAnimTimer();  // start timer if Slider thumb needs animation
 
     TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd_, 0};
@@ -1700,6 +2511,7 @@ void UiWindowImpl::OnMouseMove(float x, float y) {
 }
 
 void UiWindowImpl::OnMouseDown(float x, float y) {
+    ActiveMeasureContextScope measureScope(measureContext_, renderer_);
     float dx = x / dpiScale_, dy = y / dpiScale_;
 
     // Hide tooltip on click
@@ -1761,7 +2573,7 @@ void UiWindowImpl::OnMouseDown(float x, float y) {
 
         if (handledByDropdown) {
             UpdateCaretBlinkTimer();
-            Invalidate();
+            InvalidateNow();
             return;
         }
     }
@@ -1783,7 +2595,7 @@ void UiWindowImpl::OnMouseDown(float x, float y) {
 
         if (handledByFlyout) {
             UpdateCaretBlinkTimer();
-            Invalidate();
+            InvalidateNow();
             return;
         }
     }
@@ -1809,7 +2621,7 @@ void UiWindowImpl::OnMouseDown(float x, float y) {
 
         if (handledByScrollbar) {
             UpdateCaretBlinkTimer();
-            Invalidate();
+            InvalidateNow();
             return;
         }
     }
@@ -1827,7 +2639,7 @@ void UiWindowImpl::OnMouseDown(float x, float y) {
                 if (sp->OnMouseDown(e)) {
                     pressedWidget_ = sp;
                     SetCapture(hwnd_);
-                    Invalidate();
+                    InvalidateNow();
                     return;
                 }
             }
@@ -1855,7 +2667,7 @@ void UiWindowImpl::OnMouseDown(float x, float y) {
         hit->OnMouseDown(e);
     }
     UpdateCaretBlinkTimer();
-    Invalidate();
+    InvalidateNow();
 }
 
 void UiWindowImpl::CancelMouseCapture() {
@@ -1875,7 +2687,7 @@ void UiWindowImpl::CancelMouseCapture() {
     if (w->onMouseUpHook) w->onMouseUpHook(e);
     w->OnMouseUp(e);
     SetCursor(LoadCursor(nullptr, IDC_ARROW));
-    Invalidate();
+    InvalidateNow();
 }
 
 void UiWindowImpl::OnMouseDoubleClick(float x, float y) {
@@ -1898,7 +2710,7 @@ void UiWindowImpl::OnMouseDoubleClick(float x, float y) {
     for (Widget* w = hit; w; w = w->Parent()) {
         if (w->OnMouseDoubleClick(e)) break;
     }
-    Invalidate();
+    InvalidateNow();
 }
 
 void UiWindowImpl::OnMouseUp(float x, float y) {
@@ -1960,7 +2772,7 @@ void UiWindowImpl::OnMouseUp(float x, float y) {
     }
 
     UpdateToggleAnimTimer();
-    Invalidate();
+    InvalidateNow();
 }
 
 void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
@@ -1970,11 +2782,15 @@ void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
         // HitTest to find deepest widget, then bubble up looking for scroll handler
         Widget* hit = root_->HitTest(dx, dy);
         bool handled = false;
+        bool hookFired = false;
         MouseEvent e{dx, dy, (float)delta};
 
         // Fire @wheel hook on the hit widget (subclass overrides may not
         // forward to Widget::OnMouseWheel).
-        if (hit && hit->onMouseWheelHook) hit->onMouseWheelHook(e);
+        if (hit && hit->onMouseWheelHook) {
+            hookFired = true;
+            hit->onMouseWheelHook(e);
+        }
 
         for (Widget* w = hit; w && !handled; w = w->Parent()) {
             if (auto* ta = dynamic_cast<TextAreaWidget*>(w)) {
@@ -2004,7 +2820,13 @@ void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
                 }
             }
         }
-        if (handled) Invalidate();
+        if (handled || hookFired) {
+            // Wheel handlers can produce a continuous stream of state changes
+            // just like captured drag moves. Force the current window to paint
+            // the latest zoom/scroll state instead of waiting for a later click
+            // or low-priority WM_PAINT dispatch.
+            InvalidateNow();
+        }
     }
 }
 
@@ -2025,7 +2847,7 @@ void UiWindowImpl::SimMouseWheel(float dipX, float dipY, float delta) {
 void UiWindowImpl::SimRightClick(float dipX, float dipY) {
     // Matches WM_RBUTTONUP: just fires onRightClick callback.
     if (onRightClick) onRightClick(dipX, dipY);
-    Invalidate();
+    InvalidateNow();
 }
 void UiWindowImpl::SimKeyDown(int vk) {
     DispatchKeyDown(vk);
@@ -2033,13 +2855,15 @@ void UiWindowImpl::SimKeyDown(int vk) {
 
 // 共用的 WM_KEYDOWN 分发逻辑。返回 true 表示事件被消费。
 bool UiWindowImpl::DispatchKeyDown(int vk) {
+    ActiveMeasureContextScope measureScope(measureContext_, renderer_);
+
     // 1. Tab / Shift+Tab → focus traversal (only when enabled)
     if (vk == VK_TAB && tabNavigationEnabled_) {
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         showFocusRing_ = true;
         ShowFocusRing() = true;
         FocusNext(shift);
-        Invalidate();
+        InvalidateNow();
         return true;
     }
 
@@ -2053,7 +2877,7 @@ bool UiWindowImpl::DispatchKeyDown(int vk) {
         for (auto& sc : shortcuts_) {
             if (sc.vk == vk && sc.modifiers == mods) {
                 sc.callback();
-                Invalidate();
+                InvalidateNow();
                 return true;
             }
         }
@@ -2066,7 +2890,7 @@ bool UiWindowImpl::DispatchKeyDown(int vk) {
                 cb->SetChecked(!cb->Checked());
                 if (cb->onValueChanged) cb->onValueChanged(cb->Checked());
                 UpdateToggleAnimTimer();
-                Invalidate();
+                InvalidateNow();
                 return true;
             }
         }
@@ -2075,13 +2899,13 @@ bool UiWindowImpl::DispatchKeyDown(int vk) {
                 tg->SetOn(!tg->On());
                 if (tg->onValueChanged) tg->onValueChanged(tg->On());
                 UpdateToggleAnimTimer();
-                Invalidate();
+                InvalidateNow();
                 return true;
             }
         }
         if (focusedWidget_->onClick) {
             focusedWidget_->onClick();
-            Invalidate();
+            InvalidateNow();
             return true;
         }
     }
@@ -2092,7 +2916,7 @@ bool UiWindowImpl::DispatchKeyDown(int vk) {
             float step = (vk == VK_RIGHT) ? 1.0f : -1.0f;
             sl->SetValue(sl->Value() + step);
             if (sl->onFloatChanged) sl->onFloatChanged(sl->Value());
-            Invalidate();
+            InvalidateNow();
             return true;
         }
     }
@@ -2116,7 +2940,7 @@ bool UiWindowImpl::DispatchKeyDown(int vk) {
                 if (group[next]->onValueChanged) group[next]->onValueChanged(true);
                 SetFocus(group[next]);
                 UpdateToggleAnimTimer();
-                Invalidate();
+                InvalidateNow();
                 return true;
             }
         }
@@ -2125,13 +2949,13 @@ bool UiWindowImpl::DispatchKeyDown(int vk) {
     // 6. Escape → close ComboBox dropdown
     if (focusedWidget_ && vk == VK_ESCAPE) {
         if (auto* combo = dynamic_cast<ComboBoxWidget*>(focusedWidget_)) {
-            if (combo->IsOpen()) { combo->Close(); Invalidate(); return true; }
+            if (combo->IsOpen()) { combo->Close(); InvalidateNow(); return true; }
         }
     }
 
     // 7. Forward to focused widget's generic OnKeyDown
     if (focusedWidget_ && focusedWidget_->OnKeyDown(vk)) {
-        Invalidate();
+        InvalidateNow();
         return true;
     }
 
@@ -2152,8 +2976,11 @@ void UiWindowImpl::InvokeSync(void (*fn)(void*), void* ud) {
     SendMessageW(hwnd_, WM_APP + 120, 0, reinterpret_cast<LPARAM>(&req));
 }
 void UiWindowImpl::SimKeyChar(wchar_t ch) {
-    if (focusedWidget_ && focusedWidget_->OnKeyChar(ch)) {
-        Invalidate();
+    if (focusedWidget_) {
+        ActiveMeasureContextScope measureScope(measureContext_, renderer_);
+        if (focusedWidget_->OnKeyChar(ch)) {
+            InvalidateNow();
+        }
     }
 }
 
@@ -2182,11 +3009,14 @@ LRESULT UiWindowImpl::OnNcHitTest(int sx, int sy) {
     ScreenToClient(hwnd_, &pt);
     float x = (float)pt.x / dpiScale_;
     float y = (float)pt.y / dpiScale_;
-    D2D1_SIZE_F size = renderer_.RT() ? renderer_.RT()->GetSize() : D2D1::SizeF(0, 0);
+    if ((clientWidthPx_ == 0 || clientHeightPx_ == 0) && hwnd_) {
+        RefreshClientSizeCache();
+    }
+    D2D1_SIZE_F size = CachedClientSizeDip();
     float w = size.width, h = size.height;
     float border = theme::kResizeBorder;
 
-    if (!maximized_ && resizable_) {
+    if (!maximized_ && resizable_ && w > 0.0f && h > 0.0f) {
         bool l = x < border, r = x >= w - border, t = y < border, b = y >= h - border;
 
         // 四角和顶部/左右边缘始终优先 resize
@@ -2209,7 +3039,7 @@ LRESULT UiWindowImpl::OnNcHitTest(int sx, int sy) {
     // Check if hitting a widget
     if (root_) {
         auto* hit = root_->HitTest(x, y);
-        if (hit && hit != root_.get()) {
+        if (hit && (hit != root_.get() || canvasMode_)) {
             if (dynamic_cast<TitleBarWidget*>(hit)) return HTCAPTION;
             /* dragWindow 属性沿 parent chain 向上查 — L53 修复:
              *
@@ -2239,6 +3069,32 @@ LRESULT UiWindowImpl::OnNcHitTest(int sx, int sy) {
     return HTCLIENT;
 }
 
+bool UiWindowImpl::IsCanvasDragHit(int sx, int sy) const {
+    if (!canvasMode_ || !root_ || !hwnd_) return false;
+
+    POINT pt = {sx, sy};
+    ScreenToClient(hwnd_, &pt);
+    float x = (float)pt.x / dpiScale_;
+    float y = (float)pt.y / dpiScale_;
+
+    Widget* hit = root_->HitTest(x, y);
+    if (!hit) {
+        RECT client{};
+        GetClientRect(hwnd_, &client);
+        if (pt.x < client.left || pt.x >= client.right ||
+            pt.y < client.top || pt.y >= client.bottom) {
+            return false;
+        }
+        hit = root_.get();
+    }
+
+    for (Widget* w = hit; w != nullptr; w = w->Parent()) {
+        if (dynamic_cast<TitleBarWidget*>(w)) return false;
+        if (w->dragWindow) return true;
+    }
+    return false;
+}
+
 void UiWindowImpl::OnGetMinMaxInfo(MINMAXINFO* mmi) {
     int minW, minH;
     if (minWOverride_ > 0) {
@@ -2265,6 +3121,18 @@ void UiWindowImpl::OnGetMinMaxInfo(MINMAXINFO* mmi) {
             mmi->ptMaxPosition.y = mi.rcWork.top - mi.rcMonitor.top;
             mmi->ptMaxSize.x = mi.rcWork.right - mi.rcWork.left;
             mmi->ptMaxSize.y = mi.rcWork.bottom - mi.rcWork.top;
+            if (canvasMode_) {
+                LONG virtualW = (LONG)GetSystemMetrics(SM_CXVIRTUALSCREEN);
+                LONG virtualH = (LONG)GetSystemMetrics(SM_CYVIRTUALSCREEN);
+                mmi->ptMaxTrackSize.x = std::max({mmi->ptMaxTrackSize.x,
+                                                  mmi->ptMaxSize.x,
+                                                  virtualW,
+                                                  kCanvasMaxTrackPx});
+                mmi->ptMaxTrackSize.y = std::max({mmi->ptMaxTrackSize.y,
+                                                  mmi->ptMaxSize.y,
+                                                  virtualH,
+                                                  kCanvasMaxTrackPx});
+            }
         }
     }
 }
@@ -2373,302 +3241,13 @@ void UiWindowImpl::RegisterShortcut(int modifiers, int vk, std::function<void()>
 
 // ---- Toast ----
 
-/* Build 165+ (L172 follow-up): toast 改成独立 DirectComposition 透明叠加窗.
- *
- * 旧实现把 toast 画进主窗 D2D RT, 淡变靠主窗 WM_TIMER → Invalidate() 驱动,
- * 每个淡变帧都重渲整个主窗 (含大图) + WM_TIMER 低优先级/15.6ms 粒度 → 卡顿.
- * 现照 ContextMenu 弹窗模式建一个透明叠加小窗, 淡变只重渲该小窗, 不碰主窗.
- *
- * 坐标: ShowToast 用主 renderer_ 量文字算 boxW/boxH(DIP) + 屏幕落位(物理像素),
- * 缓存到 toastBoxW_/H_, toastScreenX_/TargetY_. toast 窗按物理像素建, RT 已
- * SetDpi → PaintToast 用 DIP 画 (0,0)..(boxW,boxH). FADE 窗口位置全程不动只动
- * alpha; SLIDE 用 SetWindowPos 移窗口 Y, phase3 alpha 也衰减. */
-
 void UiWindowImpl::DestroyToast() {
-    if (toastHwnd_) {
-        KillTimer(toastHwnd_, kToastFadeTimerId);
-        DestroyWindow(toastHwnd_);
-        toastHwnd_ = nullptr;
-    }
-    toastTimerId_ = 0;
-    if (toastTimePeriodSet_) {
-        timeEndPeriod(1);
-        toastTimePeriodSet_ = false;
-    }
-    toastPhase_ = 0;
-    toastShownTick_ = 0;
-    toastText_.clear();
+    OverlayService::Instance().DismissOwner(hwnd_);
 }
 
 void UiWindowImpl::ShowToast(const std::wstring& text, int durationMs, int position, int icon, int anim) {
     if (!hwnd_) return;
-
-    /* 多次快速 toast: 先彻底销毁旧的 (窗口/timer/timeEndPeriod 配对), 再重建. */
-    DestroyToast();
-
-    toastText_ = text;
-    toastPos_ = position;
-    toastIcon_ = icon;
-    toastAnim_ = anim;
-    toastSlide_ = 0.0f;
-    toastAlpha_ = 1.0f;
-    toastPhase_ = 1;  /* slideIn (immediately) */
-    holdDurationMs_ = durationMs;
-    holdElapsed_ = 0;
-
-    /* ---- 用主 renderer_ 量文字算 box 尺寸 (DIP) ---- */
-    float fontSize = theme::kFontSizeNormal;
-    float textW = renderer_.MeasureTextWidth(toastText_, fontSize);
-    float iconSize = fontSize + 2.0f;
-    float iconGap = (toastIcon_ > 0) ? 8.0f : 0.0f;
-    float iconSpace = (toastIcon_ > 0) ? (iconSize + iconGap) : 0.0f;
-    float padH = 20.0f, padV = 10.0f;
-    float boxW = textW + iconSpace + padH * 2;
-    float boxH = fontSize + padV * 2;
-    toastBoxW_ = boxW;
-    toastBoxH_ = boxH;
-
-    /* ---- 取主窗客户区, 转屏幕坐标算 toast 落位 (物理像素) ---- */
-    RECT cr{};
-    GetClientRect(hwnd_, &cr);
-    POINT origin{0, 0};
-    ClientToScreen(hwnd_, &origin);                 // 客户区 (0,0) 的屏幕物理坐标
-    float clientW = (float)(cr.right - cr.left) / dpiScale_;   // 客户区宽 (DIP)
-    float clientH = (float)(cr.bottom - cr.top) / dpiScale_;   // 客户区高 (DIP)
-
-    /* X: 主窗客户区水平居中 (DIP) → 物理像素. */
-    float boxXDip = (clientW - boxW) / 2.0f;
-
-    /* Y (DIP) 按 position; 同时算 SLIDE 模式的 hideOffset 像素幅度. */
-    float targetYDip = 0.0f, hideOffsetDip = 0.0f;
-    if (toastPos_ == 0) {            /* 上: 顶 +50 DIP, 从上方滑入 */
-        targetYDip = 50.0f;
-        hideOffsetDip = -(boxH + 60.0f);
-    } else if (toastPos_ == 1) {     /* 中 */
-        targetYDip = (clientH - boxH) / 2.0f;
-        hideOffsetDip = 0.0f;
-    } else {                          /* 下: 底 -boxH-60 DIP, 从下方滑入 */
-        targetYDip = clientH - boxH - 60.0f;
-        hideOffsetDip = boxH + 60.0f;
-    }
-
-    toastScreenX_       = origin.x + (int)(boxXDip * dpiScale_);
-    toastScreenTargetY_ = origin.y + (int)(targetYDip * dpiScale_);
-    toastSlideRangePx_  = (int)(hideOffsetDip * dpiScale_);
-
-    int winW = std::max<int>(1, (int)(boxW * dpiScale_ + 0.5f));
-    int winH = std::max<int>(1, (int)(boxH * dpiScale_ + 0.5f));
-
-    /* SLIDE 模式起始位置在 hideOffset 处; FADE 模式直接落在 target. */
-    int startY = (toastAnim_ == 1) ? toastScreenTargetY_
-                                   : (toastScreenTargetY_ + toastSlideRangePx_);
-
-    /* ---- 注册窗口类 (一次) ---- */
-    if (!s_toastClassRegistered_) {
-        WNDCLASSEXW wc{};
-        wc.cbSize = sizeof(wc);
-        wc.style = CS_HREDRAW | CS_VREDRAW;
-        wc.lpfnWndProc = ToastWndProc;
-        wc.hInstance = GetModuleHandleW(nullptr);
-        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)GetStockObject(NULL_BRUSH);
-        wc.lpszClassName = L"UiCore_ToastOverlay";
-        RegisterClassExW(&wc);
-        s_toastClassRegistered_ = true;
-    }
-
-    /* ---- 建透明叠加窗 (照 CreatePopupWindow). WS_EX_TRANSPARENT 让点击穿透
-     * (toast 不吃事件); WS_EX_NOACTIVATE 不抢焦点; owner = hwnd_ 跟随 z-order
-     * 且主窗销毁时自动清. ---- */
-    toastHwnd_ = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE |
-            WS_EX_NOREDIRECTIONBITMAP | WS_EX_TRANSPARENT,
-        L"UiCore_ToastOverlay", L"",
-        WS_POPUP,
-        toastScreenX_, startY, winW, winH,
-        hwnd_, nullptr, GetModuleHandleW(nullptr), this);
-
-    if (!toastHwnd_) {
-        toastPhase_ = 0;
-        toastText_.clear();
-        return;
-    }
-
-    /* 共享主 renderer_ 的 factories — composition 模式 (透明 swapchain + DComp). */
-    toastRenderer_.Init(renderer_.Factory(), renderer_.DWFactory(), renderer_.WIC());
-    toastRenderer_.CreateRenderTargetForLayered(toastHwnd_);
-    /* 透明叠加窗强制 GRAYSCALE 抗锯齿 (ClearType 在 alpha-aware surface 会出
-     * 红蓝 fringe), 同 ContextMenu popup. */
-    toastRenderer_.SetTextRenderMode(theme::TextRenderMode::Smooth);
-
-    toastShownTick_ = GetTickCount64();   /* time-based 推进锚点 (L18) */
-
-    /* 16ms timer 需 1ms 系统时钟精度 (默认 15.6ms 粒度会让 60fps 淡变卡顿).
-     * timeBeginPeriod/timeEndPeriod 严格配对 — DestroyToast 收尾时 timeEndPeriod. */
-    timeBeginPeriod(1);
-    toastTimePeriodSet_ = true;
-    toastTimerId_ = SetTimer(toastHwnd_, kToastFadeTimerId, kToastFadeIntervalMs, nullptr);
-
-    /* 先 Paint 再 Show, 避免白闪 (同 ContextMenu). */
-    PaintToast();
-    ShowWindow(toastHwnd_, SW_SHOWNOACTIVATE);
-}
-
-void UiWindowImpl::PaintToast() {
-    if (!toastHwnd_ || !toastRenderer_.RT() || toastPhase_ == 0) return;
-
-    Renderer& r = toastRenderer_;
-    const float boxW = toastBoxW_;
-    const float boxH = toastBoxH_;
-    float fontSize = theme::kFontSizeNormal;
-    float iconSize = fontSize + 2.0f;
-    float iconGap = (toastIcon_ > 0) ? 8.0f : 0.0f;
-    float iconSpace = (toastIcon_ > 0) ? (iconSize + iconGap) : 0.0f;
-    float padH = 20.0f;
-
-    /* ease out cubic — 平滑曲线. toastSlide_ 由 ToastWndProc 按 elapsed 推进. */
-    float slide = toastSlide_;
-    float t = 1.0f - (1.0f - slide) * (1.0f - slide) * (1.0f - slide);
-
-    /* 窗口位置由 ToastWndProc 用 SetWindowPos 处理 (SLIDE), 这里只算 alpha.
-     * FADE: phase1/3 alpha 走 ease 曲线, phase2 满; SLIDE: 仅 phase3 衰减. */
-    float alpha;
-    if (toastAnim_ == 1 /* UI_TOAST_ANIM_FADE */) {
-        alpha = (toastPhase_ == 1 || toastPhase_ == 3) ? t : 1.0f;
-    } else {
-        alpha = (toastPhase_ == 3) ? slide : 1.0f;
-    }
-
-    r.BeginDraw();
-    r.Clear({0, 0, 0, 0});   /* 透明背景 — alpha=0 处 DWM 合成穿透 */
-
-    /* alpha < 1/255 视为不可见, 跳过整次绘制省 GPU. */
-    if (alpha < (1.0f / 255.0f)) {
-        r.EndDraw();
-        return;
-    }
-
-    /* box 填满 toast 窗 (0,0)..(boxW,boxH). */
-    D2D1_RECT_F boxRect = { 0.0f, 0.0f, boxW, boxH };
-    D2D1_COLOR_F bgColor = {0.15f, 0.15f, 0.18f, 0.92f * alpha};
-    D2D1_COLOR_F textColor = {0.95f, 0.95f, 0.97f, alpha};
-
-    r.FillRoundedRect(boxRect, 8.0f, 8.0f, bgColor);
-
-    /* 绘制图标 */
-    if (toastIcon_ > 0) {
-        float ix = boxRect.left + padH;
-        float iy = (boxH - iconSize) / 2.0f;
-        float icx = ix + iconSize / 2.0f;
-        float icy = iy + iconSize / 2.0f;
-        float rad = iconSize / 2.0f;
-
-        if (toastIcon_ == 1) {
-            /* 绿色圆圈 + ✓ */
-            D2D1_COLOR_F green = {0.3f, 0.85f, 0.4f, alpha};
-            D2D1_RECT_F circleR = {icx - rad, icy - rad, icx + rad, icy + rad};
-            r.DrawRoundedRect(circleR, rad, rad, green, 1.5f);
-            r.DrawLine(icx - rad*0.3f, icy + rad*0.05f, icx - rad*0.0f, icy + rad*0.35f, green, 2.0f);
-            r.DrawLine(icx - rad*0.0f, icy + rad*0.35f, icx + rad*0.4f, icy - rad*0.25f, green, 2.0f);
-        } else if (toastIcon_ == 2) {
-            /* 红色圆圈 + ✕ */
-            D2D1_COLOR_F red = {0.95f, 0.35f, 0.35f, alpha};
-            D2D1_RECT_F circleR = {icx - rad, icy - rad, icx + rad, icy + rad};
-            r.DrawRoundedRect(circleR, rad, rad, red, 1.5f);
-            float d = rad * 0.3f;
-            r.DrawLine(icx - d, icy - d, icx + d, icy + d, red, 2.0f);
-            r.DrawLine(icx + d, icy - d, icx - d, icy + d, red, 2.0f);
-        } else if (toastIcon_ == 3) {
-            /* 黄色三角 + ! */
-            D2D1_COLOR_F yellow = {1.0f, 0.82f, 0.2f, alpha};
-            r.DrawLine(icx, icy - rad*0.5f, icx - rad*0.5f, icy + rad*0.4f, yellow, 1.8f);
-            r.DrawLine(icx - rad*0.5f, icy + rad*0.4f, icx + rad*0.5f, icy + rad*0.4f, yellow, 1.8f);
-            r.DrawLine(icx + rad*0.5f, icy + rad*0.4f, icx, icy - rad*0.5f, yellow, 1.8f);
-            r.DrawLine(icx, icy - rad*0.15f, icx, icy + rad*0.15f, yellow, 2.0f);
-            r.DrawLine(icx, icy + rad*0.28f, icx + 0.1f, icy + rad*0.32f, yellow, 2.0f);
-        }
-    }
-
-    /* 文字区域（图标右边） */
-    D2D1_RECT_F textRect = {
-        boxRect.left + padH + iconSpace, boxRect.top,
-        boxRect.right - padH, boxRect.bottom
-    };
-    r.DrawText(toastText_, textRect, textColor, fontSize,
-               DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_FONT_WEIGHT_NORMAL,
-               DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-
-    r.EndDraw();
-}
-
-LRESULT CALLBACK UiWindowImpl::ToastWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    UiWindowImpl* self = nullptr;
-    if (msg == WM_NCCREATE) {
-        auto cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
-        self = static_cast<UiWindowImpl*>(cs->lpCreateParams);
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
-    } else {
-        self = reinterpret_cast<UiWindowImpl*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-    }
-    if (!self) return DefWindowProcW(hwnd, msg, wParam, lParam);
-
-    switch (msg) {
-    case WM_PAINT:
-        self->PaintToast();
-        ValidateRect(hwnd, nullptr);
-        return 0;
-    case WM_TIMER:
-        if (wParam == kToastFadeTimerId) {
-            /* time-based 推进 (L18): phase / slide 都从 elapsed 派生, WM_TIMER
-             * 合并 / 丢 tick 也没事 — 下次 tick elapsed 跳跃, slide catch-up. */
-            const uint64_t now = GetTickCount64();
-            const uint64_t elapsed = (self->toastShownTick_ != 0 && now >= self->toastShownTick_)
-                                         ? (now - self->toastShownTick_) : 0;
-            const uint64_t t1 = kToastSlideInMs;
-            const uint64_t t2 = t1 + self->holdDurationMs_;
-            const uint64_t t3 = t2 + kToastSlideOutMs;
-
-            if (elapsed < t1) {
-                self->toastPhase_ = 1;
-                self->toastSlide_ = static_cast<float>(elapsed) / kToastSlideInMs;
-            } else if (elapsed < t2) {
-                self->toastPhase_ = 2;
-                self->toastSlide_ = 1.0f;
-            } else if (elapsed < t3) {
-                self->toastPhase_ = 3;
-                self->toastSlide_ = 1.0f - static_cast<float>(elapsed - t2) / kToastSlideOutMs;
-            } else {
-                /* 结束: 销毁叠加窗 + KillTimer + timeEndPeriod 配对, 清状态. */
-                self->DestroyToast();
-                return 0;   /* DestroyToast 已 DestroyWindow(hwnd), 不能再碰 self->toast* */
-            }
-
-            /* SLIDE 模式: 按 ease 曲线移窗口 Y (起点 = target + range, 终点 = target).
-             * FADE 模式: 窗口位置全程不动, 只 PaintToast 改 alpha. */
-            if (self->toastAnim_ != 1) {
-                float slide = self->toastSlide_;
-                float t = 1.0f - (1.0f - slide) * (1.0f - slide) * (1.0f - slide);
-                int y = self->toastScreenTargetY_ +
-                        (int)(self->toastSlideRangePx_ * (1.0f - t));
-                SetWindowPos(hwnd, nullptr, self->toastScreenX_, y, 0, 0,
-                             SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER);
-            }
-            self->PaintToast();
-            return 0;
-        }
-        break;
-    case WM_NCCALCSIZE:
-        if (wParam) return 0;   /* 去掉非客户区 */
-        break;
-    case WM_NCHITTEST:
-        return HTTRANSPARENT;   /* 点击穿透 (配合 WS_EX_TRANSPARENT) */
-    case WM_SIZE:
-        if (self->toastRenderer_.RT()) {
-            self->toastRenderer_.Resize(LOWORD(lParam), HIWORD(lParam));
-        }
-        return 0;
-    }
-    return DefWindowProcW(hwnd, msg, wParam, lParam);
+    OverlayService::Instance().ShowToast(hwnd_, text, durationMs, position, icon, anim);
 }
 
 // ---- Debug: Highlight ----
@@ -2683,90 +3262,11 @@ int UiWindowImpl::Screenshot(const wchar_t* outPath) {
 }
 
 int UiWindowImpl::ScreenshotRegion(D2D1_RECT_F region, const wchar_t* outPath) {
-    if (!renderer_.RT() || !root_) return -1;
+    if (!root_ || !outPath) return -1;
 
-    // Force every buffer in the DXGI flip chain to hold the latest frame
-    // before we read pixels back. `ctx->GetTarget()` returns the *current*
-    // back buffer — which, right after a Present, is a stale buffer that
-    // will be drawn into next. Painting twice synchronously ensures that
-    // whichever buffer GetTarget lands on has the current UI (including
-    // just-opened overlays like combo dropdowns).
-    OnPaint();
-    OnPaint();
-
-    auto* ctx = renderer_.RT();
-    auto pixelSize = ctx->GetPixelSize();
-    int fullW = (int)pixelSize.width, fullH = (int)pixelSize.height;
-    if (fullW <= 0 || fullH <= 0) return -2;
-
-    // Convert DIP region → pixel region; clamp to window bounds.
-    // Empty region (e.g. {0,0,0,0}) means full window.
-    int px0 = 0, py0 = 0, pxw = fullW, pyh = fullH;
-    if (region.right > region.left && region.bottom > region.top) {
-        auto roundi = [](float f) { return (int)(f + 0.5f); };
-        px0 = std::max(0, roundi(region.left   * dpiScale_));
-        py0 = std::max(0, roundi(region.top    * dpiScale_));
-        int px1 = std::min(fullW, roundi(region.right  * dpiScale_));
-        int py1 = std::min(fullH, roundi(region.bottom * dpiScale_));
-        pxw = px1 - px0;
-        pyh = py1 - py0;
-        if (pxw <= 0 || pyh <= 0) return -18;  // region completely outside
-    }
-
-    /* 创建 CPU 可读位图（按裁剪后的尺寸） */
-    D2D1_BITMAP_PROPERTIES1 cpuProps = {};
-    cpuProps.pixelFormat = D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED);
-    cpuProps.bitmapOptions = D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
-    ComPtr<ID2D1Bitmap1> cpuBmp;
-    HRESULT hr = ctx->CreateBitmap(D2D1::SizeU(pxw, pyh), nullptr, 0, cpuProps, &cpuBmp);
-    if (FAILED(hr)) return -3;
-
-    /* 从 swap chain 回读 region */
-    ComPtr<ID2D1Bitmap1> target;
-    ctx->GetTarget(reinterpret_cast<ID2D1Image**>(target.GetAddressOf()));
-    if (!target) return -4;
-
-    D2D1_POINT_2U dst = {0, 0};
-    D2D1_RECT_U srcRc = {(UINT32)px0, (UINT32)py0, (UINT32)(px0 + pxw), (UINT32)(py0 + pyh)};
-    hr = cpuBmp->CopyFromBitmap(&dst, target.Get(), &srcRc);
-    if (FAILED(hr)) return -5;
-
-    D2D1_MAPPED_RECT mapped;
-    hr = cpuBmp->Map(D2D1_MAP_OPTIONS_READ, &mapped);
-    if (FAILED(hr)) return -6;
-
-    /* 用 WIC 编码为 PNG */
-    auto& gctx = GetContext();
-    ComPtr<IWICBitmapEncoder> encoder;
-    ComPtr<IWICBitmapFrameEncode> frame;
-    ComPtr<IWICStream> stream;
-
-    hr = gctx.WICFactory()->CreateStream(&stream);
-    if (FAILED(hr)) { cpuBmp->Unmap(); return -7; }
-    hr = stream->InitializeFromFilename(outPath, GENERIC_WRITE);
-    if (FAILED(hr)) { cpuBmp->Unmap(); return -8; }
-    hr = gctx.WICFactory()->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
-    if (FAILED(hr)) { cpuBmp->Unmap(); return -9; }
-    hr = encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache);
-    if (FAILED(hr)) { cpuBmp->Unmap(); return -10; }
-    hr = encoder->CreateNewFrame(&frame, nullptr);
-    if (FAILED(hr)) { cpuBmp->Unmap(); return -11; }
-    hr = frame->Initialize(nullptr);
-    if (FAILED(hr)) { cpuBmp->Unmap(); return -12; }
-    hr = frame->SetSize(pxw, pyh);
-    if (FAILED(hr)) { cpuBmp->Unmap(); return -13; }
-    WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
-    hr = frame->SetPixelFormat(&fmt);
-    if (FAILED(hr)) { cpuBmp->Unmap(); return -14; }
-    hr = frame->WritePixels(pyh, mapped.pitch, mapped.pitch * pyh, mapped.bits);
-    cpuBmp->Unmap();
-    if (FAILED(hr)) return -15;
-    hr = frame->Commit();
-    if (FAILED(hr)) return -16;
-    hr = encoder->Commit();
-    if (FAILED(hr)) return -17;
-
-    return 0; /* success */
+    FlushRenderFrameNow(FrameReason::Screenshot, PresentPolicy::Screenshot);
+    if (!renderThreadPresentActive_ || !renderWindowId_.IsValid()) return -1;
+    return RenderThread::Instance().ScreenshotRegion(renderWindowId_, region, outPath, dpiScale_);
 }
 
 } // namespace ui

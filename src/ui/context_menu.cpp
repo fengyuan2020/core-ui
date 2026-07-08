@@ -1,7 +1,11 @@
 #include "context_menu.h"
-#include "ui_context.h"
+#include "resource_store.h"
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <cstring>
 #include <windowsx.h>
+#include <dcomp.h>
 #include <dwmapi.h>
 
 /* Windows 10 1607+ 提供 GetDpiForWindow。本项目 CMakeLists 定义 _WIN32_WINNT=0x0A00
@@ -28,8 +32,128 @@ static inline UINT GetDpiForWindow(HWND hwnd) {
 
 namespace ui {
 
-bool ContextMenu::popupClassRegistered_ = false;
 bool ContextMenu::g_debugSuppressAutoClose = false;
+
+namespace {
+
+uint64_t NextPopupBackdropGeneration() {
+    static std::atomic<uint64_t> next{1ull << 61};
+    return next.fetch_add(1, std::memory_order_relaxed);
+}
+
+ComPtr<ID3D11Device> CreateOverlayD3DDevice() {
+    ComPtr<ID3D11Device> dev;
+    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT |
+                 D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS;
+    D3D_FEATURE_LEVEL levels[] = {
+        D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0
+    };
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                                   flags, levels, _countof(levels),
+                                   D3D11_SDK_VERSION, dev.GetAddressOf(),
+                                   nullptr, nullptr);
+    if (FAILED(hr)) {
+        hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr,
+                               flags, levels, _countof(levels),
+                               D3D11_SDK_VERSION, dev.GetAddressOf(),
+                               nullptr, nullptr);
+        if (FAILED(hr)) {
+            dev.Reset();
+        }
+    }
+    return dev;
+}
+
+bool CaptureScreenBgra(int screenX, int screenY, int width, int height,
+                       std::vector<uint8_t>& out) {
+    if (width <= 0 || height <= 0) return false;
+    out.assign((size_t)width * (size_t)height * 4, 0);
+
+    HDC screen = GetDC(nullptr);
+    if (!screen) return false;
+    HDC mem = CreateCompatibleDC(screen);
+    if (!mem) {
+        ReleaseDC(nullptr, screen);
+        return false;
+    }
+
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = width;
+    bi.bmiHeader.biHeight = -height;  // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    void* bits = nullptr;
+    HBITMAP bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bmp || !bits) {
+        if (bmp) DeleteObject(bmp);
+        DeleteDC(mem);
+        ReleaseDC(nullptr, screen);
+        return false;
+    }
+
+    HGDIOBJ old = SelectObject(mem, bmp);
+    BOOL ok = BitBlt(mem, 0, 0, width, height, screen, screenX, screenY,
+                     SRCCOPY | CAPTUREBLT);
+    if (ok) {
+        std::memcpy(out.data(), bits, out.size());
+        for (size_t i = 3; i < out.size(); i += 4) out[i] = 255;
+    }
+
+    SelectObject(mem, old);
+    DeleteObject(bmp);
+    DeleteDC(mem);
+    ReleaseDC(nullptr, screen);
+    return ok == TRUE;
+}
+
+void BoxBlurBgra(std::vector<uint8_t>& pixels, int width, int height, int radius) {
+    if (width <= 0 || height <= 0 || radius <= 0 || pixels.empty()) return;
+    std::vector<uint8_t> tmp(pixels.size());
+    auto idx = [width](int x, int y) { return ((size_t)y * (size_t)width + (size_t)x) * 4; };
+    const int diameter = radius * 2 + 1;
+
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            int sb = 0, sg = 0, sr = 0;
+            for (int k = -radius; k <= radius; ++k) {
+                int sx = std::clamp(x + k, 0, width - 1);
+                size_t p = idx(sx, y);
+                sb += pixels[p + 0];
+                sg += pixels[p + 1];
+                sr += pixels[p + 2];
+            }
+            size_t d = idx(x, y);
+            tmp[d + 0] = (uint8_t)(sb / diameter);
+            tmp[d + 1] = (uint8_t)(sg / diameter);
+            tmp[d + 2] = (uint8_t)(sr / diameter);
+            tmp[d + 3] = 255;
+        }
+    }
+
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            int sb = 0, sg = 0, sr = 0;
+            for (int k = -radius; k <= radius; ++k) {
+                int sy = std::clamp(y + k, 0, height - 1);
+                size_t p = idx(x, sy);
+                sb += tmp[p + 0];
+                sg += tmp[p + 1];
+                sr += tmp[p + 2];
+            }
+            size_t d = idx(x, y);
+            pixels[d + 0] = (uint8_t)(sb / diameter);
+            pixels[d + 1] = (uint8_t)(sg / diameter);
+            pixels[d + 2] = (uint8_t)(sr / diameter);
+            pixels[d + 3] = 255;
+        }
+    }
+}
+
+}  // namespace
 
 // ---- Build (build 75 BREAKING: widget-tree based items) ----
 
@@ -40,6 +164,7 @@ void ContextMenu::AddItemContent(int id, const std::wstring& shortcut,
     item.shortcut = shortcut;
     item.customContent = std::move(content);
     items_.push_back(std::move(item));
+    InvalidateLayout();
 }
 
 void ContextMenu::SetLastItemMeta(std::string strId,
@@ -53,6 +178,7 @@ void ContextMenu::AddSeparator() {
     MenuItem item;
     item.isSeparator = true;
     items_.push_back(std::move(item));
+    InvalidateLayout();
 }
 
 void ContextMenu::AddSubmenu(WidgetPtr entryContent, ContextMenuPtr submenu) {
@@ -61,6 +187,7 @@ void ContextMenu::AddSubmenu(WidgetPtr entryContent, ContextMenuPtr submenu) {
     item.customContent = std::move(entryContent);
     item.submenu = std::move(submenu);
     items_.push_back(std::move(item));
+    InvalidateLayout();
 }
 
 void ContextMenu::SetEnabled(int id, bool enabled) {
@@ -116,6 +243,7 @@ void ContextMenu::Clear() {
     hoveredIndex_ = -1;
     openSubmenuIndex_ = -1;
     clickedId_ = -1;
+    InvalidateLayout();
 }
 
 // ---- Show / Hide ----
@@ -136,6 +264,7 @@ void ContextMenu::Show(float x, float y, const D2D1_RECT_F& viewport) {
     hoveredIndex_ = -1;
     openSubmenuIndex_ = -1;
     clickedId_ = -1;
+    LayoutItems();
 }
 
 void ContextMenu::ShowPopup(HWND parentHwnd, int screenX, int screenY) {
@@ -183,6 +312,7 @@ void ContextMenu::ShowPopup(HWND parentHwnd, int screenX, int screenY) {
     hoveredIndex_ = -1;
     openSubmenuIndex_ = -1;
     clickedId_ = -1;
+    LayoutItems();
 
     // Position the hwnd offset by -kShadowMargin so the visible card lands
     // at the requested screen coordinate.
@@ -238,7 +368,7 @@ bool ContextMenu::SimulateClickIndex(int index) {
     clickedId_ = it.id;
     clickedStrId_ = it.strId;
     clickedAttrs_ = it.attrs;
-    // 复刻 PopupWndProc 里 WM_LBUTTONUP 的分派路径：把 item id + 属性载荷回传父窗口
+    // 复刻 overlay popup 鼠标释放分派路径：把 item id + 属性载荷回传父窗口
     if (parentHwnd_) {
         PostMessageW(parentHwnd_, WM_APP + 100, (WPARAM)it.id,
                      (LPARAM)new MenuClickInfo{it.strId, it.attrs});
@@ -318,85 +448,352 @@ bool ContextMenu::SimulateClickPath(const int* path, int depth) {
 // ---- Popup Window ----
 
 void ContextMenu::CreatePopupWindow(HWND parent, int screenX, int screenY) {
-    if (!popupClassRegistered_) {
-        WNDCLASSEXW wc{};
-        wc.cbSize = sizeof(wc);
-        wc.style = CS_HREDRAW | CS_VREDRAW;
-        wc.lpfnWndProc = PopupWndProc;
-        wc.hInstance = GetModuleHandleW(nullptr);
-        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)GetStockObject(NULL_BRUSH);
-        wc.lpszClassName = L"UiCore_MenuPopup";
-        RegisterClassExW(&wc);
-        popupClassRegistered_ = true;
-    }
-
     UINT dpi = parent ? GetDpiForWindow(parent) : 96;
     float dpiScale = (float)dpi / 96.0f;
     // Hwnd encompasses both the menu card and the surrounding shadow halo.
     int w = (int)((MenuWidth()  + 2 * kShadowMargin) * dpiScale);
     int h = (int)((MenuHeight() + 2 * kShadowMargin) * dpiScale);
+    int marginPx = (int)(kShadowMargin * dpiScale);
+    int cardW = std::max<int>(1, (int)(MenuWidth() * dpiScale));
+    int cardH = std::max<int>(1, (int)(MenuHeight() * dpiScale));
 
-    // Plain WS_POPUP with no NC frame, no thickframe — DirectComposition
-    // owns the visual presentation, the hwnd is just a hit-test surface.
-    popupHwnd_ = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
-        L"UiCore_MenuPopup", L"",
-        WS_POPUP,
-        screenX, screenY, w, h,
-        parent, nullptr, GetModuleHandleW(nullptr), this);
+    OverlayWindowOptions options;
+    options.owner = parent;
+    options.exStyle = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE |
+                      WS_EX_NOREDIRECTIONBITMAP;
+    options.style = WS_POPUP;
+    options.x = screenX;
+    options.y = screenY;
+    options.width = w;
+    options.height = h;
+    options.title = L"";
+    popupHwnd_ = OverlayService::Instance().CreateHostWindowSync(this, options);
 
     if (!popupHwnd_) return;
+    CaptureBackdrop(screenX + marginPx, screenY + marginPx, cardW, cardH, dpiScale);
 
-    // Init renderer with shared factories — composition mode (transparent
-    // swap chain + DComp) so anti-aliased round corners just work via D2D.
-    auto& ctx = GetContext();
-    popupRenderer_.Init(ctx.D2DFactory(), ctx.DWFactory(), ctx.WICFactory());
-    popupRenderer_.CreateRenderTargetForLayered(popupHwnd_);
-    // Force GRAYSCALE text antialias on the popup regardless of the global
-    // theme mode. ClearType assumes an opaque background and produces
-    // red/blue subpixel fringes when composited onto an alpha-aware surface;
-    // Smooth (= GRAYSCALE) is the only safe choice for transparent popups.
-    popupRenderer_.SetTextRenderMode(theme::TextRenderMode::Smooth);
-
-    // Paint BEFORE showing to avoid white flash
-    PaintPopup();
-    ShowWindow(popupHwnd_, SW_SHOWNOACTIVATE);
-    SetTimer(popupHwnd_, 1, 50, nullptr);
+    OverlayService::Instance().InvokeSync([this]() {
+        ShowWindow(popupHwnd_, SW_SHOWNOACTIVATE);
+        RenderPopupFrame();
+        SetTimer(popupHwnd_, 1, 50, nullptr);
+    });
 }
 
 void ContextMenu::DestroyPopupWindow() {
     if (popupHwnd_) {
-        DestroyWindow(popupHwnd_);
+        HWND hwnd = popupHwnd_;
+        OverlayService::Instance().InvokeSync([this, hwnd]() {
+            if (IsWindow(hwnd)) {
+                KillTimer(hwnd, 1);
+            }
+            ReleasePopupRenderer();
+        });
+        OverlayService::Instance().DestroyHostWindowSync(popupHwnd_);
         popupHwnd_ = nullptr;
     }
+    ReleaseBackdropResource();
 }
 
-void ContextMenu::PaintPopup() {
-    if (!popupHwnd_ || !popupRenderer_.RT()) return;
+void ContextMenu::CaptureBackdrop(int screenX, int screenY, int width, int height,
+                                  float dpiScale) {
+    ReleaseBackdropResource();
+    if (!frostedMaterial_) return;
+    if (backdropBlurRadius_ == 0.0f) return;
+
+    std::vector<uint8_t> pixels;
+    if (!CaptureScreenBgra(screenX, screenY, width, height, pixels)) return;
+
+    int radius = 0;
+    if (backdropBlurRadius_ < 0.0f) {
+        radius = std::clamp(std::min(width, height) / 18, 8, 18);
+    } else {
+        radius = std::clamp((int)(backdropBlurRadius_ * dpiScale + 0.5f), 1, 64);
+    }
+    BoxBlurBgra(pixels, width, height, radius);
+    BoxBlurBgra(pixels, width, height, radius);
+    backdropResourceKey_ = GlobalResourceStore().AddImage(
+        ResourceKind::Bitmap,
+        NextPopupBackdropGeneration(),
+        width,
+        height,
+        width * 4,
+        PixelFormat::BgraPremul,
+        pixels.data());
+}
+
+void ContextMenu::ReleaseBackdropResource() {
+    if (!backdropResourceKey_.IsValid()) return;
+    GlobalResourceStore().Remove(backdropResourceKey_);
+    backdropResourceKey_ = {};
+}
+
+bool ContextMenu::EnsurePopupRenderer(int widthPx, int heightPx) {
+    if (!popupHwnd_) return false;
+
+    if (!popupRendererReady_) {
+        ReleasePopupRenderer();
+
+        if (!popupRenderer_.Init()) {
+            return false;
+        }
+        popupRenderer_.SetTextRenderMode(theme::TextRenderMode::Smooth);
+
+        popupD3DDevice_ = CreateOverlayD3DDevice();
+        if (!popupD3DDevice_) {
+            ReleasePopupRenderer();
+            return false;
+        }
+
+        ComPtr<IDXGIDevice> dxgiDevice;
+        if (FAILED(popupD3DDevice_.As(&dxgiDevice)) || !dxgiDevice) {
+            ReleasePopupRenderer();
+            return false;
+        }
+
+        if (FAILED(popupRenderer_.Factory()->CreateDevice(dxgiDevice.Get(),
+                                                          popupD2DDevice_.GetAddressOf())) ||
+            !popupD2DDevice_) {
+            ReleasePopupRenderer();
+            return false;
+        }
+
+        if (FAILED(popupD2DDevice_->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+                                                        popupD2DContext_.GetAddressOf())) ||
+            !popupD2DContext_) {
+            ReleasePopupRenderer();
+            return false;
+        }
+
+        ComPtr<IDXGIAdapter> adapter;
+        if (FAILED(dxgiDevice->GetAdapter(adapter.GetAddressOf())) || !adapter) {
+            ReleasePopupRenderer();
+            return false;
+        }
+        ComPtr<IDXGIFactory2> dxgiFactory;
+        if (FAILED(adapter->GetParent(__uuidof(IDXGIFactory2),
+                                      reinterpret_cast<void**>(dxgiFactory.GetAddressOf()))) ||
+            !dxgiFactory) {
+            ReleasePopupRenderer();
+            return false;
+        }
+
+        DXGI_SWAP_CHAIN_DESC1 desc{};
+        desc.Width = std::max(1, widthPx);
+        desc.Height = std::max(1, heightPx);
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        desc.BufferCount = 2;
+        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+
+        if (FAILED(dxgiFactory->CreateSwapChainForComposition(
+                popupD3DDevice_.Get(), &desc, nullptr, popupSwapChain_.GetAddressOf())) ||
+            !popupSwapChain_) {
+            ReleasePopupRenderer();
+            return false;
+        }
+
+        ComPtr<IDCompositionDevice> dcomp;
+        if (FAILED(DCompositionCreateDevice(dxgiDevice.Get(), __uuidof(IDCompositionDevice),
+                                            reinterpret_cast<void**>(dcomp.GetAddressOf()))) ||
+            !dcomp) {
+            ReleasePopupRenderer();
+            return false;
+        }
+        ComPtr<IDCompositionTarget> target;
+        if (FAILED(dcomp->CreateTargetForHwnd(popupHwnd_, TRUE, target.GetAddressOf())) ||
+            !target) {
+            ReleasePopupRenderer();
+            return false;
+        }
+        ComPtr<IDCompositionVisual> visual;
+        if (FAILED(dcomp->CreateVisual(visual.GetAddressOf())) || !visual) {
+            ReleasePopupRenderer();
+            return false;
+        }
+        visual->SetContent(popupSwapChain_.Get());
+        target->SetRoot(visual.Get());
+        dcomp->Commit();
+        dcomp.As(&popupDcompDevice_);
+        target.As(&popupDcompTarget_);
+        visual.As(&popupDcompVisual_);
+
+        popupRendererReady_ = true;
+        popupWidthPx_ = 0;
+        popupHeightPx_ = 0;
+    }
+
+    return BindPopupTarget(widthPx, heightPx);
+}
+
+bool ContextMenu::BindPopupTarget(int widthPx, int heightPx) {
+    if (!popupRendererReady_ || !popupD2DContext_ || !popupSwapChain_) return false;
+
+    widthPx = std::max(1, widthPx);
+    heightPx = std::max(1, heightPx);
+
+    if (!popupTargetBitmap_ || popupWidthPx_ != widthPx || popupHeightPx_ != heightPx) {
+        popupD2DContext_->SetTarget(nullptr);
+        popupTargetBitmap_.Reset();
+
+        if (popupWidthPx_ != 0 || popupHeightPx_ != 0) {
+            HRESULT resizeHr = popupSwapChain_->ResizeBuffers(0, widthPx, heightPx,
+                                                              DXGI_FORMAT_UNKNOWN, 0);
+            if (FAILED(resizeHr)) {
+                ReleasePopupRenderer();
+                return false;
+            }
+        }
+
+        ComPtr<IDXGISurface> surface;
+        if (FAILED(popupSwapChain_->GetBuffer(0, __uuidof(IDXGISurface),
+                                              reinterpret_cast<void**>(surface.GetAddressOf()))) ||
+            !surface) {
+            ReleasePopupRenderer();
+            return false;
+        }
+
+        UINT dpi = popupHwnd_ ? GetDpiForWindow(popupHwnd_) : 96;
+        D2D1_BITMAP_PROPERTIES1 props{};
+        props.pixelFormat = D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                                              D2D1_ALPHA_MODE_PREMULTIPLIED);
+        props.dpiX = static_cast<float>(dpi);
+        props.dpiY = static_cast<float>(dpi);
+        props.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
+
+        if (FAILED(popupD2DContext_->CreateBitmapFromDxgiSurface(
+                surface.Get(), props, popupTargetBitmap_.GetAddressOf())) ||
+            !popupTargetBitmap_) {
+            ReleasePopupRenderer();
+            return false;
+        }
+
+        popupD2DContext_->SetTarget(popupTargetBitmap_.Get());
+        popupD2DContext_->SetDpi(static_cast<float>(dpi), static_cast<float>(dpi));
+        popupD2DContext_->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        popupRenderer_.SetTarget(popupD2DContext_.Get());
+        popupRenderer_.ApplyTextRenderMode();
+        popupWidthPx_ = widthPx;
+        popupHeightPx_ = heightPx;
+    }
+
+    return true;
+}
+
+void ContextMenu::ReleasePopupRenderer() {
+    popupRenderer_.SetTarget(nullptr);
+    if (popupD2DContext_) {
+        popupD2DContext_->SetTarget(nullptr);
+    }
+    popupTargetBitmap_.Reset();
+    popupSwapChain_.Reset();
+    popupD2DContext_.Reset();
+    popupD2DDevice_.Reset();
+    popupD3DDevice_.Reset();
+    popupDcompVisual_.Reset();
+    popupDcompTarget_.Reset();
+    popupDcompDevice_.Reset();
+    popupRenderer_.ReleaseRenderTarget();
+    popupRendererReady_ = false;
+    popupWidthPx_ = 0;
+    popupHeightPx_ = 0;
+}
+
+void ContextMenu::RenderPopupFrame() {
+    if (!visible_ || !popupHwnd_ || !IsWindow(popupHwnd_)) return;
+
+    RECT rc{};
+    GetClientRect(popupHwnd_, &rc);
+    int widthPx = std::max<int>(1, rc.right - rc.left);
+    int heightPx = std::max<int>(1, rc.bottom - rc.top);
+    if (!EnsurePopupRenderer(widthPx, heightPx)) return;
+
     popupRenderer_.BeginDraw();
-    // Transparent surface — Draw() then paints the rounded card on top.
-    // Anything outside the rounded shape stays alpha=0 and the desktop
-    // composer punches through cleanly (no aliased GDI region clip).
     popupRenderer_.Clear({0, 0, 0, 0});
     Draw(popupRenderer_);
-    popupRenderer_.EndDraw();
+    HRESULT hr = popupRenderer_.EndDraw();
+    if (FAILED(hr)) {
+        ReleasePopupRenderer();
+        return;
+    }
+
+    DXGI_PRESENT_PARAMETERS params{};
+    HRESULT presentHr = popupSwapChain_ ? popupSwapChain_->Present1(0, 0, &params) : E_FAIL;
+    if (FAILED(presentHr)) {
+        ReleasePopupRenderer();
+    }
 }
 
-LRESULT CALLBACK ContextMenu::PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    ContextMenu* self = nullptr;
-    if (msg == WM_NCCREATE) {
-        auto cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
-        self = static_cast<ContextMenu*>(cs->lpCreateParams);
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
-    } else {
-        self = reinterpret_cast<ContextMenu*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-    }
-    if (!self) return DefWindowProcW(hwnd, msg, wParam, lParam);
+int ContextMenu::WritePopupScreenshot(const wchar_t* outPath) {
+    if (!popupRenderer_.RT() || !popupTargetBitmap_ || !outPath) return -1;
+
+    auto pixelSize = popupRenderer_.RT()->GetPixelSize();
+    int width = static_cast<int>(pixelSize.width);
+    int height = static_cast<int>(pixelSize.height);
+    if (width <= 0 || height <= 0) return -2;
+
+    D2D1_BITMAP_PROPERTIES1 cpuProps{};
+    cpuProps.pixelFormat = D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                                             D2D1_ALPHA_MODE_PREMULTIPLIED);
+    cpuProps.bitmapOptions = D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
+    ComPtr<ID2D1Bitmap1> cpuBitmap;
+    HRESULT hr = popupRenderer_.RT()->CreateBitmap(D2D1::SizeU(width, height), nullptr, 0,
+                                                   cpuProps, cpuBitmap.GetAddressOf());
+    if (FAILED(hr) || !cpuBitmap) return -3;
+
+    D2D1_POINT_2U dst{0, 0};
+    D2D1_RECT_U src{0, 0, static_cast<UINT32>(width), static_cast<UINT32>(height)};
+    hr = cpuBitmap->CopyFromBitmap(&dst, popupTargetBitmap_.Get(), &src);
+    if (FAILED(hr)) return -4;
+
+    D2D1_MAPPED_RECT mapped{};
+    hr = cpuBitmap->Map(D2D1_MAP_OPTIONS_READ, &mapped);
+    if (FAILED(hr)) return -5;
+
+    auto unmap = [&]() { cpuBitmap->Unmap(); };
+    IWICImagingFactory* wic = popupRenderer_.WIC();
+    if (!wic) { unmap(); return -6; }
+
+    ComPtr<IWICBitmapEncoder> encoder;
+    ComPtr<IWICBitmapFrameEncode> frame;
+    ComPtr<IWICStream> stream;
+
+    hr = wic->CreateStream(stream.GetAddressOf());
+    if (FAILED(hr)) { unmap(); return -7; }
+    hr = stream->InitializeFromFilename(outPath, GENERIC_WRITE);
+    if (FAILED(hr)) { unmap(); return -8; }
+    hr = wic->CreateEncoder(GUID_ContainerFormatPng, nullptr, encoder.GetAddressOf());
+    if (FAILED(hr)) { unmap(); return -9; }
+    hr = encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache);
+    if (FAILED(hr)) { unmap(); return -10; }
+    hr = encoder->CreateNewFrame(frame.GetAddressOf(), nullptr);
+    if (FAILED(hr)) { unmap(); return -11; }
+    hr = frame->Initialize(nullptr);
+    if (FAILED(hr)) { unmap(); return -12; }
+    hr = frame->SetSize(width, height);
+    if (FAILED(hr)) { unmap(); return -13; }
+    WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
+    hr = frame->SetPixelFormat(&fmt);
+    if (FAILED(hr)) { unmap(); return -14; }
+    hr = frame->WritePixels(height, mapped.pitch, mapped.pitch * height, mapped.bits);
+    unmap();
+    if (FAILED(hr)) return -15;
+    hr = frame->Commit();
+    if (FAILED(hr)) return -16;
+    hr = encoder->Commit();
+    if (FAILED(hr)) return -17;
+    return 0;
+}
+
+LRESULT ContextMenu::HandleOverlayMessage(HWND hwnd, UINT msg, WPARAM wParam,
+                                          LPARAM lParam, bool& handled) {
+    ContextMenu* self = this;
+    handled = true;
 
     switch (msg) {
     case WM_PAINT: {
-        self->PaintPopup();
+        self->RenderPopupFrame();
         ValidateRect(hwnd, nullptr);
         return 0;
     }
@@ -406,16 +803,23 @@ LRESULT CALLBACK ContextMenu::PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
         float scale = (float)dpi / 96.0f;
         float x = (float)GET_X_LPARAM(lParam) / scale;
         float y = (float)GET_Y_LPARAM(lParam) / scale;
+        int oldHovered = self->hoveredIndex_;
+        int oldOpenSubmenu = self->openSubmenuIndex_;
         self->HandleMouseMove(x, y);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        if (self->hoveredIndex_ != oldHovered ||
+            self->openSubmenuIndex_ != oldOpenSubmenu) {
+            self->RenderPopupFrame();
+        }
 
         TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0};
         TrackMouseEvent(&tme);
         return 0;
     }
     case WM_MOUSELEAVE:
-        self->hoveredIndex_ = -1;
-        InvalidateRect(hwnd, nullptr, FALSE);
+        if (self->hoveredIndex_ != -1) {
+            self->hoveredIndex_ = -1;
+            self->RenderPopupFrame();
+        }
         return 0;
     case WM_LBUTTONDOWN: {
         UINT dpi = GetDpiForWindow(hwnd);
@@ -454,9 +858,7 @@ LRESULT CALLBACK ContextMenu::PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
     case WM_NCHITTEST:
         return HTCLIENT;
     case WM_SIZE:
-        if (self->popupRenderer_.RT()) {
-            self->popupRenderer_.Resize(LOWORD(lParam), HIWORD(lParam));
-        }
+        self->RenderPopupFrame();
         return 0;
     case WM_ERASEBKGND: return 1;
     case WM_ACTIVATEAPP:
@@ -536,7 +938,8 @@ LRESULT CALLBACK ContextMenu::PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
         }
         return 0;
     }
-    return DefWindowProcW(hwnd, msg, wParam, lParam);
+    handled = false;
+    return 0;
 }
 
 // ---- Geometry ----
@@ -603,8 +1006,44 @@ float ContextMenu::MenuHeight() const {
     return h;
 }
 
+void ContextMenu::InvalidateLayout() {
+    layoutValid_ = false;
+    layoutWidth_ = 0.0f;
+    layoutHeight_ = 0.0f;
+    itemRects_.clear();
+}
+
+void ContextMenu::LayoutItems() {
+    layoutWidth_ = MenuWidth();
+    layoutHeight_ = MenuHeight();
+    itemRects_.assign(items_.size(), D2D1_RECT_F{});
+
+    float iy = y_ + kPadding;
+    for (int i = 0; i < (int)items_.size(); i++) {
+        auto& item = items_[i];
+        float rowH = item.isSeparator ? kSepHeight : kItemHeight;
+        D2D1_RECT_F row = {x_, iy, x_ + layoutWidth_, iy + rowH};
+        itemRects_[i] = row;
+
+        if (!item.isSeparator && item.customContent) {
+            float contentLeft  = x_ + kPadding;
+            float contentRight = x_ + layoutWidth_ - kPadding;
+            if (!item.shortcut.empty()) contentRight -= 100.0f;
+            if (item.submenu) contentRight -= kSubmenuArrowWidth;
+            item.customContent->rect = {contentLeft, row.top, contentRight, row.bottom};
+            item.customContent->DoLayout();
+        }
+
+        iy += rowH;
+    }
+
+    layoutValid_ = true;
+}
+
 D2D1_RECT_F ContextMenu::Bounds() const {
-    return {x_, y_, x_ + MenuWidth(), y_ + MenuHeight()};
+    float w = layoutValid_ ? layoutWidth_ : MenuWidth();
+    float h = layoutValid_ ? layoutHeight_ : MenuHeight();
+    return {x_, y_, x_ + w, y_ + h};
 }
 
 bool ContextMenu::Contains(float x, float y) const {
@@ -613,6 +1052,9 @@ bool ContextMenu::Contains(float x, float y) const {
 }
 
 D2D1_RECT_F ContextMenu::ItemRect(int index) const {
+    if (layoutValid_ && index >= 0 && index < (int)itemRects_.size()) {
+        return itemRects_[index];
+    }
     float y = y_ + kPadding;
     for (int i = 0; i < index && i < (int)items_.size(); i++) {
         y += items_[i].isSeparator ? kSepHeight : kItemHeight;
@@ -623,6 +1065,13 @@ D2D1_RECT_F ContextMenu::ItemRect(int index) const {
 
 int ContextMenu::HitTest(float x, float y) const {
     if (!Contains(x, y)) return -1;
+    if (layoutValid_ && itemRects_.size() == items_.size()) {
+        for (int i = 0; i < (int)itemRects_.size(); i++) {
+            const auto& r = itemRects_[i];
+            if (y >= r.top && y < r.bottom) return i;
+        }
+        return -1;
+    }
     float iy = y_ + kPadding;
     for (int i = 0; i < (int)items_.size(); i++) {
         float h = items_[i].isSeparator ? kSepHeight : kItemHeight;
@@ -636,9 +1085,10 @@ int ContextMenu::HitTest(float x, float y) const {
 
 void ContextMenu::Draw(Renderer& r) {
     if (!visible_) return;
+    if (!layoutValid_) LayoutItems();
 
-    float w = MenuWidth();
-    float h = MenuHeight();
+    float w = layoutWidth_;
+    float h = layoutHeight_;
 
     // Soft drop shadow — concentric semi-transparent rounded rects expand
     // outward in 1 px steps. Each ring is a slightly larger rounded rect
@@ -676,12 +1126,23 @@ void ContextMenu::Draw(Renderer& r) {
     if (hasBgColor_) {
         cardBg = bgColor_;
     } else if (theme::CurrentMode() == theme::Mode::Dark) {
-        cardBg = theme::Rgb(0x2C, 0x2C, 0x2C);   // a touch above background1 (#1F1F1F)
+        float alpha = frostedMaterial_ ? 0.75f : 1.0f;
+        cardBg = D2D1_COLOR_F{0x2C / 255.0f, 0x2C / 255.0f, 0x2C / 255.0f, alpha};
     } else {
-        cardBg = D2D1_COLOR_F{1.0f, 1.0f, 1.0f, 1.0f};
+        float alpha = frostedMaterial_ ? 0.75f : 1.0f;
+        cardBg = D2D1_COLOR_F{1.0f, 1.0f, 1.0f, alpha};
     }
+    float materialAlpha = std::clamp(cardBg.a, 0.0f, 1.0f);
+    D2D1_COLOR_F separatorColor = (theme::CurrentMode() == theme::Mode::Dark)
+        ? D2D1_COLOR_F{1.0f, 1.0f, 1.0f, 0.22f * materialAlpha}
+        : D2D1_COLOR_F{0.0f, 0.0f, 0.0f, 0.18f * materialAlpha};
     {
         const float cr = CornerRadius();
+        if (backdropResourceKey_.IsValid()) {
+            r.PushRoundedClip(bgRect, cr, cr);
+            r.DrawImageResource(backdropResourceKey_, bgRect, ImageSampling::Linear, 1.0f);
+            r.PopRoundedClip();
+        }
         r.FillRoundedRect(bgRect, cr, cr, cardBg);
     }
 
@@ -689,21 +1150,20 @@ void ContextMenu::Draw(Renderer& r) {
     // customContent (WidgetPtr) 在 item 的 content-rect 内 DoLayout + DrawTree.
     // ContextMenu 自己只画: separator / hover 高亮 / shortcut 文字 (右对齐) /
     // submenu arrow. disabled 通过临时 set opacity dim.
-    float iy = y_ + kPadding;
     for (int i = 0; i < (int)items_.size(); i++) {
         auto& item = items_[i];
+        D2D1_RECT_F row = ItemRect(i);
 
         if (item.isSeparator) {
-            float sepY = iy + kSepHeight / 2.0f;
+            float sepY = row.top + (row.bottom - row.top) / 2.0f;
             r.DrawLine(x_ + kPadding, sepY, x_ + w - kPadding, sepY,
-                       theme::kDividerSubtle());
-            iy += kSepHeight;
+                       separatorColor);
             continue;
         }
 
         if (i == hoveredIndex_ && item.enabled) {
-            D2D1_RECT_F hlRect = {x_ + kPadding, iy,
-                                   x_ + w - kPadding, iy + kItemHeight};
+            D2D1_RECT_F hlRect = {x_ + kPadding, row.top,
+                                   x_ + w - kPadding, row.bottom};
             D2D1_COLOR_F hlColor = (theme::CurrentMode() == theme::Mode::Dark)
                 ? D2D1_COLOR_F{1.0f, 1.0f, 1.0f, 0.10f}
                 : D2D1_COLOR_F{0.0f, 0.0f, 0.0f, 0.06f};
@@ -711,14 +1171,8 @@ void ContextMenu::Draw(Renderer& r) {
         }
 
         if (item.customContent) {
-            float contentLeft  = x_ + kPadding;
-            float contentRight = x_ + w - kPadding;
-            if (!item.shortcut.empty()) contentRight -= 100.0f;
-            if (item.submenu) contentRight -= kSubmenuArrowWidth;
-            item.customContent->rect = {contentLeft, iy, contentRight, iy + kItemHeight};
             float savedOpacity = item.customContent->opacity;
             if (!item.enabled) item.customContent->opacity = 0.4f;
-            item.customContent->DoLayout();
             item.customContent->DrawTree(r);
             item.customContent->opacity = savedOpacity;
         }
@@ -726,8 +1180,8 @@ void ContextMenu::Draw(Renderer& r) {
         if (!item.shortcut.empty()) {
             D2D1_COLOR_F base = theme::kForeground3();
             D2D1_COLOR_F shortcutColor = {base.r, base.g, base.b, item.enabled ? 1.0f : 0.4f};
-            D2D1_RECT_F scRect = {x_ + w - kPadding - 100, iy,
-                                   x_ + w - 14, iy + kItemHeight};
+            D2D1_RECT_F scRect = {x_ + w - kPadding - 100, row.top,
+                                   x_ + w - 14, row.bottom};
             r.DrawText(item.shortcut, scRect, shortcutColor, kShortcutFont,
                        DWRITE_TEXT_ALIGNMENT_TRAILING);
         }
@@ -735,16 +1189,14 @@ void ContextMenu::Draw(Renderer& r) {
         if (item.submenu) {
             D2D1_COLOR_F arrowColor = item.enabled
                 ? theme::kBtnText() : D2D1_COLOR_F{0.5f, 0.5f, 0.5f, 0.6f};
-            D2D1_RECT_F arrowRect = {x_ + w - kPadding - 16, iy,
-                                      x_ + w - kPadding - 2, iy + kItemHeight};
+            D2D1_RECT_F arrowRect = {x_ + w - kPadding - 16, row.top,
+                                      x_ + w - kPadding - 2, row.bottom};
             /* Build 86: › "›" (single right-pointing angle quotation) —
              * 跟 macOS / Win11 submenu arrow 同款 outline 风格. 比 ▸ ▸
              * (黑色实心三角) 看着更克制. */
             r.DrawText(L"›", arrowRect, arrowColor, theme::kFontSizeBody,
                        DWRITE_TEXT_ALIGNMENT_CENTER);
         }
-
-        iy += kItemHeight;
     }
 
     // Draw open submenu (only in overlay mode, popup submenus have their own window)
@@ -879,76 +1331,13 @@ bool ContextMenu::HandleMouseUp(float x, float y) {
 }
 
 int ContextMenu::Screenshot(const wchar_t* outPath) {
-    if (!visible_ || !popupRenderer_.RT() || !outPath) return -1;
-    auto* rt = popupRenderer_.RT();
-
-    /* 重画两次保证 swap chain 当前 back buffer 有最新内容 (跟 Window 同款
-       BeginDraw + Draw + EndDraw 走两轮). */
-    auto repaint = [&]() {
-        popupRenderer_.BeginDraw();
-        popupRenderer_.Clear(hasBgColor_ ? bgColor_ : theme::kToolbarBg());
-        Draw(popupRenderer_);
-        popupRenderer_.EndDraw();
-    };
-    repaint();
-    repaint();
-
-    auto pxSize = rt->GetPixelSize();
-    UINT pxw = pxSize.width, pyh = pxSize.height;
-    if (pxw == 0 || pyh == 0) return -2;
-
-    /* CPU-readable bitmap */
-    D2D1_BITMAP_PROPERTIES1 cpuProps = {};
-    cpuProps.pixelFormat = D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
-                                              D2D1_ALPHA_MODE_PREMULTIPLIED);
-    cpuProps.bitmapOptions = D2D1_BITMAP_OPTIONS_CPU_READ |
-                             D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
-    ComPtr<ID2D1Bitmap1> cpuBmp;
-    HRESULT hr = rt->CreateBitmap(D2D1::SizeU(pxw, pyh), nullptr, 0, cpuProps, &cpuBmp);
-    if (FAILED(hr)) return -3;
-
-    ComPtr<ID2D1Bitmap1> target;
-    rt->GetTarget(reinterpret_cast<ID2D1Image**>(target.GetAddressOf()));
-    if (!target) return -4;
-
-    D2D1_POINT_2U dst = {0, 0};
-    D2D1_RECT_U  src = {0, 0, pxw, pyh};
-    hr = cpuBmp->CopyFromBitmap(&dst, target.Get(), &src);
-    if (FAILED(hr)) return -5;
-
-    D2D1_MAPPED_RECT mapped;
-    hr = cpuBmp->Map(D2D1_MAP_OPTIONS_READ, &mapped);
-    if (FAILED(hr)) return -6;
-
-    auto& gctx = GetContext();
-    ComPtr<IWICStream>           stream;
-    ComPtr<IWICBitmapEncoder>    encoder;
-    ComPtr<IWICBitmapFrameEncode> frame;
-
-    hr = gctx.WICFactory()->CreateStream(&stream);
-    if (FAILED(hr)) { cpuBmp->Unmap(); return -7; }
-    hr = stream->InitializeFromFilename(outPath, GENERIC_WRITE);
-    if (FAILED(hr)) { cpuBmp->Unmap(); return -8; }
-    hr = gctx.WICFactory()->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
-    if (FAILED(hr)) { cpuBmp->Unmap(); return -9; }
-    hr = encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache);
-    if (FAILED(hr)) { cpuBmp->Unmap(); return -10; }
-    hr = encoder->CreateNewFrame(&frame, nullptr);
-    if (FAILED(hr)) { cpuBmp->Unmap(); return -11; }
-    hr = frame->Initialize(nullptr);
-    if (FAILED(hr)) { cpuBmp->Unmap(); return -12; }
-    hr = frame->SetSize(pxw, pyh);
-    if (FAILED(hr)) { cpuBmp->Unmap(); return -13; }
-    WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
-    hr = frame->SetPixelFormat(&fmt);
-    if (FAILED(hr)) { cpuBmp->Unmap(); return -14; }
-    hr = frame->WritePixels(pyh, mapped.pitch, mapped.pitch * pyh, mapped.bits);
-    cpuBmp->Unmap();
-    if (FAILED(hr)) return -15;
-    hr = frame->Commit();
-    if (FAILED(hr)) return -16;
-    hr = encoder->Commit();
-    return SUCCEEDED(hr) ? 0 : -17;
+    if (!visible_ || !popupHwnd_ || !outPath) return -1;
+    int result = -1;
+    OverlayService::Instance().InvokeSync([this, outPath, &result]() {
+        RenderPopupFrame();
+        result = WritePopupScreenshot(outPath);
+    });
+    return result;
 }
 
 } // namespace ui

@@ -2,8 +2,8 @@
 //
 // 渲染思路：
 //   1. ComputeDestRect 算出"图像在屏幕上占多大"
-//   2. preview_ 存在则先 StretchBlt 一张兜底（NEAREST）
-//   3. 遍历可见瓦块（active level 网格），有 bitmap 就画上去
+//   2. preview ResourceKey 存在则先画一张兜底
+//   3. 遍历可见瓦块（active level 网格），有 ResourceKey 就画上去
 //   4. 缺的瓦块就让 preview 透出来 → 渐进式 LOD 体验
 //
 // auto-level：zoom 跨越某 level 阈值时自动切 active level，但**不**主动清旧
@@ -12,18 +12,30 @@
 
 #include "gh_img_view.h"
 #include "event.h"
+#include "display_list.h"
+#include "svg_style_inliner.h"
+#include "ui_context.h"
+#include "debug_trace.h"
+#include "resource_store.h"
 
-#include <lunasvg.h>     /* L173 / core-ui Phase 4: 统一 SVG 引擎 (替 D2D
-                          * ID2D1SvgDocument; 原生支持 CSS / filter / text /
-                          * mask, 不再需要 svg_style_inliner 与 text→path 补丁) */
+#include <lunasvg.h>     /* SVG thumbnail/fallback data; main interactive view uses
+                          * D2D ID2D1SvgDocument when it can be created. */
+#include <d2d1effects.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 #include <Windows.h>
 
@@ -52,16 +64,30 @@ inline void RotateCCW(int angle, float x, float y, float& rx, float& ry) {
     }
 }
 
-// Pick D2D interpolation based on draw scale (screen px per source px).
-// HQ_CUBIC 4×4 邻域 + negative-lobe lobe 在 ≥2× 下采时采样窗不够 → 高对比
-// 边缘会 ring 出色边 (灰银/黑 → 白 转换看到的蓝紫边即此). LINEAR 是
-// 2×2 bilinear, 无负权, 永不 ring; 高频细节本来在大幅下采时也保不住, 视觉
-// 损失可忽略. 阈值 0.5 跟 D2D 文档"HQ_CUBIC 推荐 0.5-2× 区间"对齐.
-// (D2D 没有 HIGH_QUALITY_LINEAR 这种常量, LINEAR 即标准 bilinear.)
+// Pick D2D interpolation by draw scale (screen px per source px). 三档 (L190 + L191):
+//   <0.5  大幅缩小  → HQ_CUBIC: D2D 对大幅下采带 prefilter, 抗欠采样。此时源边缘已被
+//         prefilter 抹成渐变, cubic 负权【不会 ring】(ring 只在锐边发生)。若改用 LINEAR,
+//         2×2 双线性在大幅下采漏采源像素 → 文字/细节锯齿发硬 (单层图 / 文档扫描)。
+//   0.5~1.0 适度缩小 → LINEAR: 边缘仍锐, HQ_CUBIC 负权会过冲 ring 出光晕 ("锐化过头");
+//         LINEAR 2×2 无负权不过冲。fit 看图主场景 (金字塔活动层略缩小) 落此档。
+//   >=1.0 放大       → HQ_CUBIC: 上采取其平滑。
+// (D2D 没有 HIGH_QUALITY_LINEAR 常量, LINEAR 即标准 bilinear。)
+//
+// 演进: 初版 <0.5 用 LINEAR (想当然"大幅下采 cubic ring", 实际 prefilter 已抹平锐边,
+// 反而 LINEAR 欠采样发硬); L190 一度把 <1.0 全改 LINEAR (修 0.5~1.0 文字过冲) 顺带把
+// <0.5 也锁死 LINEAR; L191 恢复 <0.5 → HQ_CUBIC, 修文档扫描 / 单层大图 fit 发硬。
 inline D2D1_INTERPOLATION_MODE PickInterp(float screen_per_source) {
-    return screen_per_source < 0.5f
-        ? D2D1_INTERPOLATION_MODE_LINEAR
-        : D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC;
+    if (screen_per_source < 0.5f)
+        return D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC;  // 大幅缩小: prefilter 抗欠采样
+    return screen_per_source < 1.0f
+        ? D2D1_INTERPOLATION_MODE_LINEAR                    // 适度缩小: 无过冲 (L190)
+        : D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC;       // 放大: 平滑
+}
+
+inline ImageSampling SamplingForInterp(D2D1_INTERPOLATION_MODE interp) {
+    if (interp == D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR) return ImageSampling::Nearest;
+    if (interp == D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC) return ImageSampling::HighQualityCubic;
+    return ImageSampling::Linear;
 }
 
 inline int NormalizeAngle(int a) {
@@ -88,31 +114,1610 @@ GhImgViewWidget::GhImgViewWidget() {
 // 线程只碰这个 slot + 自己持有的 Document/HWND (不碰 widget), 故 widget 析构 /
 // 换图都不悬空; slot 在双方都释放后销毁。
 struct SvgRenderSlot {
-    std::mutex            mu;            // 保护 bgra / w / h / ready
+    struct Request {
+        float    srcL = 0.0f;
+        float    srcT = 0.0f;
+        float    srcR = 0.0f;
+        float    srcB = 0.0f;
+        uint32_t w = 0;
+        uint32_t h = 0;
+    };
+
+    std::mutex            mu;            // 保护 bgra / request / ready
     std::vector<uint8_t>  bgra;          // 渲好的紧凑 BGRA premul (w*h*4)
+    Request               readyReq;
+    Request               wantReq;
     uint32_t              w = 0, h = 0;
     bool                  ready = false;
     std::atomic<bool>     inFlight{false};    // 是否有后台线程在渲
-    std::atomic<uint32_t> wantW{0}, wantH{0}; // 最新期望尺寸 (缩放变了 → 渲完再渲最新)
 };
 
-GhImgViewWidget::~GhImgViewWidget() = default;
+namespace {
+
+inline bool SvgReqValid(const SvgRenderSlot::Request& req) {
+    return req.w > 0 && req.h > 0 &&
+           req.srcR > req.srcL && req.srcB > req.srcT;
+}
+
+inline bool SvgReqSame(const SvgRenderSlot::Request& a,
+                       const SvgRenderSlot::Request& b) {
+    return a.w == b.w && a.h == b.h &&
+           std::fabs(a.srcL - b.srcL) < 0.01f &&
+           std::fabs(a.srcT - b.srcT) < 0.01f &&
+           std::fabs(a.srcR - b.srcR) < 0.01f &&
+           std::fabs(a.srcB - b.srcB) < 0.01f;
+}
+
+inline void InvalidateSvgRenderSlot_(const std::shared_ptr<SvgRenderSlot>& slot) {
+    if (!slot) return;
+    std::lock_guard<std::mutex> lk(slot->mu);
+    slot->wantReq = {};
+    slot->ready = false;
+}
+
+inline bool SvgRenderRequestToBgra(const std::shared_ptr<lunasvg::Document>& doc,
+                                   const SvgRenderSlot::Request& req,
+                                   std::vector<uint8_t>& out,
+                                   uint32_t& outW, uint32_t& outH) {
+    if (!doc || !SvgReqValid(req)) return false;
+
+    const float srcW = req.srcR - req.srcL;
+    const float srcH = req.srcB - req.srcT;
+    const float sx = static_cast<float>(req.w) / srcW;
+    const float sy = static_cast<float>(req.h) / srcH;
+    lunasvg::Matrix matrix(sx, 0.0f, 0.0f, sy,
+                           -req.srcL * sx, -req.srcT * sy);
+
+    lunasvg::Bitmap bmp(static_cast<int>(req.w), static_cast<int>(req.h));
+    if (bmp.isNull() || !bmp.data()) return false;
+    doc->render(bmp, matrix);
+
+    const uint32_t bw = static_cast<uint32_t>(std::max(0, bmp.width()));
+    const uint32_t bh = static_cast<uint32_t>(std::max(0, bmp.height()));
+    const int stride = bmp.stride();
+    if (bw == 0 || bh == 0 || stride <= 0) return false;
+
+    out.assign(static_cast<size_t>(bw) * bh * 4, 0);
+    const uint8_t* src = bmp.data();
+    const size_t dstRowBytes = static_cast<size_t>(bw) * 4;
+    const size_t srcRowBytes = std::min(dstRowBytes, static_cast<size_t>(stride));
+    for (uint32_t y = 0; y < bh; ++y) {
+        memcpy(out.data() + static_cast<size_t>(y) * dstRowBytes,
+               src + static_cast<size_t>(y) * stride,
+               srcRowBytes);
+    }
+    outW = bw;
+    outH = bh;
+    return true;
+}
+
+std::string ExtractXmlAttr_(const std::string& tag, const char* name) {
+    std::string key(name);
+    size_t p = tag.find(key);
+    while (p != std::string::npos) {
+        const bool leftOk = (p == 0) || std::isspace(static_cast<unsigned char>(tag[p - 1])) || tag[p - 1] == '<';
+        const size_t q = p + key.size();
+        if (leftOk && q < tag.size() && tag[q] == '=') {
+            size_t v = q + 1;
+            if (v >= tag.size()) return {};
+            char quote = tag[v];
+            if (quote == '"' || quote == '\'') {
+                size_t e = tag.find(quote, v + 1);
+                if (e == std::string::npos) return {};
+                return tag.substr(v + 1, e - v - 1);
+            }
+            size_t e = tag.find_first_of(" \t\r\n/>", v);
+            return tag.substr(v, e == std::string::npos ? std::string::npos : e - v);
+        }
+        p = tag.find(key, p + 1);
+    }
+    return {};
+}
+
+std::string LowerAscii_(std::string s) {
+    for (char& ch : s)
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    return s;
+}
+
+bool IsXmlNameChar_(char ch);
+
+size_t FindMatchingParen_(const std::string& s, size_t open) {
+    int depth = 0;
+    char quote = 0;
+    for (size_t i = open; i < s.size(); ++i) {
+        char ch = s[i];
+        if (quote) {
+            if (ch == quote) quote = 0;
+            continue;
+        }
+        if (ch == '"' || ch == '\'') {
+            quote = ch;
+        } else if (ch == '(') {
+            ++depth;
+        } else if (ch == ')') {
+            --depth;
+            if (depth == 0) return i;
+        }
+    }
+    return std::string::npos;
+}
+
+size_t FindTopLevelComma_(const std::string& s, size_t begin, size_t end) {
+    int depth = 0;
+    char quote = 0;
+    for (size_t i = begin; i < end; ++i) {
+        char ch = s[i];
+        if (quote) {
+            if (ch == quote) quote = 0;
+            continue;
+        }
+        if (ch == '"' || ch == '\'') {
+            quote = ch;
+        } else if (ch == '(') {
+            ++depth;
+        } else if (ch == ')') {
+            --depth;
+        } else if (ch == ',' && depth == 0) {
+            return i;
+        }
+    }
+    return std::string::npos;
+}
+
+std::string TrimAscii_(std::string_view v) {
+    size_t b = 0, e = v.size();
+    while (b < e && std::isspace(static_cast<unsigned char>(v[b]))) ++b;
+    while (e > b && std::isspace(static_cast<unsigned char>(v[e - 1]))) --e;
+    return std::string(v.substr(b, e - b));
+}
+
+std::string ExtractSvgRootTag_(const std::string& xml) {
+    size_t pos = 0;
+    while ((pos = xml.find("<svg", pos)) != std::string::npos) {
+        const size_t nameEnd = pos + 4;
+        if (nameEnd < xml.size() && IsXmlNameChar_(xml[nameEnd])) {
+            pos = nameEnd;
+            continue;
+        }
+        size_t end = xml.find('>', nameEnd);
+        if (end == std::string::npos) return {};
+        return xml.substr(pos, end - pos + 1);
+    }
+    return {};
+}
+
+float ParseSvgCssPxLength_(const std::string& value, float fallback = 0.0f) {
+    std::string s = TrimAscii_(value);
+    if (s.empty()) return fallback;
+    char* end = nullptr;
+    float v = std::strtof(s.c_str(), &end);
+    if (end == s.c_str() || !std::isfinite(v) || v <= 0.0f) return fallback;
+    std::string unit = TrimAscii_(std::string_view(end, s.c_str() + s.size() - end));
+    unit = LowerAscii_(unit);
+    if (unit.empty() || unit == "px") return v;
+    if (unit == "pt") return v * (96.0f / 72.0f);
+    if (unit == "pc") return v * 16.0f;
+    if (unit == "in") return v * 96.0f;
+    if (unit == "cm") return v * (96.0f / 2.54f);
+    if (unit == "mm") return v * (96.0f / 25.4f);
+    if (unit == "q")  return v * (96.0f / 101.6f);
+    return fallback;
+}
+
+bool ParseSvgViewBoxSize_(const std::string& tag, float& w, float& h) {
+    std::string vb = ExtractXmlAttr_(tag, "viewBox");
+    float minX = 0.0f, minY = 0.0f, vbW = 0.0f, vbH = 0.0f;
+    if (vb.empty() ||
+        std::sscanf(vb.c_str(), "%f %f %f %f", &minX, &minY, &vbW, &vbH) != 4 ||
+        vbW <= 0.0f || vbH <= 0.0f) {
+        return false;
+    }
+    w = vbW;
+    h = vbH;
+    return true;
+}
+
+std::string ReplaceCssLightDark_(std::string svg) {
+    size_t pos = 0;
+    while ((pos = svg.find("light-dark(", pos)) != std::string::npos) {
+        size_t open = pos + strlen("light-dark");
+        size_t close = FindMatchingParen_(svg, open);
+        if (close == std::string::npos) break;
+        size_t comma = FindTopLevelComma_(svg, open + 1, close);
+        if (comma == std::string::npos) {
+            pos = close + 1;
+            continue;
+        }
+        std::string light = TrimAscii_(std::string_view(svg).substr(open + 1,
+                                                                     comma - open - 1));
+        svg.replace(pos, close + 1 - pos, light);
+        pos += light.size();
+    }
+    return svg;
+}
+
+std::string ExpandSvgSwitchImageFallbacksForD2D_(const std::string& svg) {
+    std::string out;
+    out.reserve(svg.size());
+    size_t pos = 0;
+    while (true) {
+        size_t sw = svg.find("<switch", pos);
+        if (sw == std::string::npos) {
+            out.append(svg, pos, std::string::npos);
+            break;
+        }
+        out.append(svg, pos, sw - pos);
+        size_t openEnd = svg.find('>', sw);
+        size_t close = openEnd == std::string::npos
+            ? std::string::npos
+            : svg.find("</switch>", openEnd + 1);
+        if (openEnd == std::string::npos || close == std::string::npos) {
+            out.append(svg, sw, std::string::npos);
+            break;
+        }
+        size_t img = svg.find("<image", openEnd + 1);
+        if (img != std::string::npos && img < close) {
+            size_t imgEnd = svg.find('>', img);
+            if (imgEnd != std::string::npos && imgEnd < close) {
+                out.append(svg, img, imgEnd + 1 - img);
+            }
+        } else {
+            out.append(svg, sw, close + 9 - sw);
+        }
+        pos = close + 9;
+    }
+    return out;
+}
+
+bool HasSvgFilter_(const std::string& svg) {
+    std::string lower = LowerAscii_(svg);
+    return lower.find("<filter") != std::string::npos ||
+           lower.find("<fedropshadow") != std::string::npos ||
+           lower.find("<fegaussianblur") != std::string::npos ||
+           lower.find(" filter=") != std::string::npos ||
+           lower.find("\tfilter=") != std::string::npos ||
+           lower.find("\nfilter=") != std::string::npos ||
+           lower.find("\rfilter=") != std::string::npos;
+}
+
+bool HasSvgGaussianBlurFilter_(const std::string& svg) {
+    return LowerAscii_(svg).find("<fegaussianblur") != std::string::npos;
+}
+
+bool NeedsLunaSvgMainRenderer_(const std::string& svg);
+
+float ParseSvgFloat_(const std::string& value, float fallback = 0.0f) {
+    if (value.empty()) return fallback;
+    char* end = nullptr;
+    float v = std::strtof(value.c_str(), &end);
+    return end == value.c_str() ? fallback : v;
+}
+
+std::vector<float> ParseSvgFloatList_(const std::string& value) {
+    std::vector<float> out;
+    const char* p = value.c_str();
+    while (*p) {
+        while (*p && (std::isspace(static_cast<unsigned char>(*p)) || *p == ',')) {
+            ++p;
+        }
+        if (!*p) break;
+        char* end = nullptr;
+        float v = std::strtof(p, &end);
+        if (end == p) {
+            ++p;
+            continue;
+        }
+        out.push_back(v);
+        p = end;
+    }
+    return out;
+}
+
+std::string SvgHexColorFromUnitRgb_(float r, float g, float b) {
+    auto channel = [](float v) -> int {
+        v = std::clamp(v, 0.0f, 1.0f);
+        return static_cast<int>(std::round(v * 255.0f));
+    };
+    char buf[8] = {};
+    std::snprintf(buf, sizeof(buf), "#%02X%02X%02X",
+                  channel(r), channel(g), channel(b));
+    return std::string(buf);
+}
+
+std::string ParseSvgColor_(const std::string& value) {
+    if (value.size() == 7 && value[0] == '#') return value;
+    if (value.size() == 4 && value[0] == '#') {
+        std::string out = "#000000";
+        out[1] = out[2] = value[1];
+        out[3] = out[4] = value[2];
+        out[5] = out[6] = value[3];
+        return out;
+    }
+    return "#000000";
+}
+
+void EraseXmlAttr_(std::string& attrs, std::string_view name) {
+    size_t pos = 0;
+    while ((pos = attrs.find(name, pos)) != std::string::npos) {
+        const bool leftOk = pos == 0 ||
+            std::isspace(static_cast<unsigned char>(attrs[pos - 1]));
+        size_t p = pos + name.size();
+        while (p < attrs.size() &&
+               std::isspace(static_cast<unsigned char>(attrs[p]))) {
+            ++p;
+        }
+        if (!leftOk || p >= attrs.size() || attrs[p] != '=') {
+            pos += name.size();
+            continue;
+        }
+
+        ++p;
+        while (p < attrs.size() &&
+               std::isspace(static_cast<unsigned char>(attrs[p]))) {
+            ++p;
+        }
+        if (p < attrs.size() && (attrs[p] == '"' || attrs[p] == '\'')) {
+            const char quote = attrs[p++];
+            size_t q = attrs.find(quote, p);
+            p = (q == std::string::npos) ? attrs.size() : q + 1;
+        } else {
+            while (p < attrs.size() &&
+                   !std::isspace(static_cast<unsigned char>(attrs[p]))) {
+                ++p;
+            }
+        }
+        size_t start = pos;
+        while (start > 0 &&
+               std::isspace(static_cast<unsigned char>(attrs[start - 1]))) {
+            --start;
+        }
+        attrs.erase(start, p - start);
+        pos = start;
+    }
+}
+
+bool TagHasAttr_(const std::string& tag, const char* name) {
+    return !ExtractXmlAttr_(tag, name).empty();
+}
+
+bool TagNameIs_(const std::string& name, const char* a, const char* b = nullptr,
+                const char* c = nullptr, const char* d = nullptr) {
+    return name == a || (b && name == b) || (c && name == c) || (d && name == d);
+}
+
+struct SvgTagInfo_ {
+    std::string name;
+    bool closing = false;
+    bool selfClosing = false;
+    bool special = false;
+};
+
+SvgTagInfo_ ParseSvgTag_(const std::string& svg, size_t lt, size_t gt) {
+    SvgTagInfo_ info;
+    if (lt + 1 >= svg.size() || lt >= gt) {
+        info.special = true;
+        return info;
+    }
+
+    size_t p = lt + 1;
+    if (svg[p] == '/' && p + 1 < gt) {
+        info.closing = true;
+        ++p;
+    } else if (svg[p] == '?' || svg[p] == '!') {
+        info.special = true;
+        return info;
+    }
+
+    while (p < gt && std::isspace(static_cast<unsigned char>(svg[p]))) ++p;
+    size_t nameStart = p;
+    while (p < gt && IsXmlNameChar_(svg[p])) ++p;
+    if (p == nameStart) {
+        info.special = true;
+        return info;
+    }
+    info.name = LowerAscii_(svg.substr(nameStart, p - nameStart));
+
+    size_t tail = gt;
+    while (tail > lt && std::isspace(static_cast<unsigned char>(svg[tail - 1]))) --tail;
+    info.selfClosing = tail > lt && svg[tail - 1] == '/';
+    return info;
+}
+
+bool IsD2DUnsupportedSvgElement_(const std::string& tagName) {
+    return tagName == "filter" || tagName == "foreignobject";
+}
+
+size_t FindSvgElementEnd_(const std::string& svg, size_t openLt, size_t openGt,
+                          const std::string& tagName) {
+    size_t pos = openGt + 1;
+    int depth = 1;
+    while (pos < svg.size()) {
+        size_t lt = svg.find('<', pos);
+        if (lt == std::string::npos) break;
+        size_t gt = svg.find('>', lt);
+        if (gt == std::string::npos) break;
+
+        SvgTagInfo_ info = ParseSvgTag_(svg, lt, gt);
+        if (!info.special && info.name == tagName) {
+            if (info.closing) {
+                --depth;
+                if (depth == 0) return gt + 1;
+            } else if (!info.selfClosing) {
+                ++depth;
+            }
+        }
+        pos = gt + 1;
+    }
+    return openGt + 1;
+}
+
+std::string SvgLocalName_(const std::string& tagName) {
+    size_t colon = tagName.rfind(':');
+    return colon == std::string::npos ? tagName : tagName.substr(colon + 1);
+}
+
+bool IsD2DLayerResourceElement_(const std::string& tagName) {
+    const std::string local = SvgLocalName_(tagName);
+    return local == "defs" ||
+           local == "style" ||
+           local == "lineargradient" ||
+           local == "radialgradient" ||
+           local == "pattern" ||
+           local == "clippath" ||
+           local == "mask" ||
+           local == "marker" ||
+           local == "symbol";
+}
+
+void CollectSvgUrlRefs_(const std::string& text, std::vector<std::string>& out) {
+    size_t pos = 0;
+    while (pos + 3 <= text.size()) {
+        if (std::tolower(static_cast<unsigned char>(text[pos])) != 'u' ||
+            std::tolower(static_cast<unsigned char>(text[pos + 1])) != 'r' ||
+            std::tolower(static_cast<unsigned char>(text[pos + 2])) != 'l') {
+            ++pos;
+            continue;
+        }
+
+        const size_t afterName = pos + 3;
+        if (pos > 0 && IsXmlNameChar_(text[pos - 1])) {
+            pos = afterName;
+            continue;
+        }
+        if (afterName < text.size() && IsXmlNameChar_(text[afterName])) {
+            pos = afterName;
+            continue;
+        }
+
+        size_t open = afterName;
+        while (open < text.size() && std::isspace(static_cast<unsigned char>(text[open]))) ++open;
+        if (open >= text.size() || text[open] != '(') {
+            pos = afterName;
+            continue;
+        }
+        size_t p = open + 1;
+        while (p < text.size() && std::isspace(static_cast<unsigned char>(text[p]))) ++p;
+        if (p < text.size() && (text[p] == '"' || text[p] == '\'')) ++p;
+        if (p >= text.size() || text[p] != '#') {
+            pos = open + 1;
+            continue;
+        }
+
+        size_t idStart = p + 1;
+        size_t idEnd = idStart;
+        while (idEnd < text.size() && IsXmlNameChar_(text[idEnd])) ++idEnd;
+        if (idEnd > idStart) {
+            out.push_back(text.substr(idStart, idEnd - idStart));
+        }
+        pos = idEnd;
+    }
+}
+
+std::string ExtractSvgHrefRefId_(const std::string& tag) {
+    std::string href = ExtractXmlAttr_(tag, "href");
+    if (href.empty()) href = ExtractXmlAttr_(tag, "xlink:href");
+    href = TrimAscii_(href);
+    if (href.size() > 1 && href[0] == '#') return href.substr(1);
+    return {};
+}
+
+bool SvgPatternContainsImageRef_(const std::string& patternXml,
+                                 const std::unordered_set<std::string>& imageIds) {
+    size_t pos = 0;
+    while (pos < patternXml.size()) {
+        size_t lt = patternXml.find('<', pos);
+        if (lt == std::string::npos) break;
+        size_t gt = patternXml.find('>', lt);
+        if (gt == std::string::npos) break;
+
+        SvgTagInfo_ info = ParseSvgTag_(patternXml, lt, gt);
+        if (!info.special && !info.closing) {
+            std::string local = SvgLocalName_(info.name);
+            if (local == "image") return true;
+
+            std::string tag = patternXml.substr(lt, gt - lt + 1);
+            std::string refId = ExtractSvgHrefRefId_(tag);
+            if (!refId.empty() && imageIds.find(refId) != imageIds.end()) {
+                return true;
+            }
+        }
+        pos = gt + 1;
+    }
+    return false;
+}
+
+bool HasUsedImageBackedSvgPattern_(const std::string& svg) {
+    std::unordered_set<std::string> imageIds;
+    size_t pos = 0;
+    while (pos < svg.size()) {
+        size_t lt = svg.find('<', pos);
+        if (lt == std::string::npos) break;
+        size_t gt = svg.find('>', lt);
+        if (gt == std::string::npos) break;
+
+        SvgTagInfo_ info = ParseSvgTag_(svg, lt, gt);
+        if (!info.special && !info.closing && SvgLocalName_(info.name) == "image") {
+            std::string id = ExtractXmlAttr_(svg.substr(lt, gt - lt + 1), "id");
+            if (!id.empty()) imageIds.insert(std::move(id));
+        }
+        pos = gt + 1;
+    }
+
+    std::unordered_set<std::string> imageBackedPatternIds;
+    pos = 0;
+    while (pos < svg.size()) {
+        size_t lt = svg.find('<', pos);
+        if (lt == std::string::npos) break;
+        size_t gt = svg.find('>', lt);
+        if (gt == std::string::npos) break;
+
+        SvgTagInfo_ info = ParseSvgTag_(svg, lt, gt);
+        if (!info.special && !info.closing && SvgLocalName_(info.name) == "pattern") {
+            std::string tag = svg.substr(lt, gt - lt + 1);
+            std::string id = ExtractXmlAttr_(tag, "id");
+            size_t end = info.selfClosing ? gt + 1 : FindSvgElementEnd_(svg, lt, gt, info.name);
+            if (!id.empty() && end > lt) {
+                std::string patternXml = svg.substr(lt, end - lt);
+                if (SvgPatternContainsImageRef_(patternXml, imageIds)) {
+                    imageBackedPatternIds.insert(std::move(id));
+                }
+            }
+            pos = end;
+            continue;
+        }
+        pos = gt + 1;
+    }
+
+    if (imageBackedPatternIds.empty()) return false;
+
+    std::vector<std::string> refs;
+    pos = 0;
+    while (pos < svg.size()) {
+        size_t lt = svg.find('<', pos);
+        if (lt == std::string::npos) break;
+        size_t gt = svg.find('>', lt);
+        if (gt == std::string::npos) break;
+
+        SvgTagInfo_ info = ParseSvgTag_(svg, lt, gt);
+        if (!info.special && !info.closing && SvgLocalName_(info.name) != "pattern") {
+            refs.clear();
+            CollectSvgUrlRefs_(svg.substr(lt, gt - lt + 1), refs);
+            for (const std::string& ref : refs) {
+                if (imageBackedPatternIds.find(ref) != imageBackedPatternIds.end()) {
+                    return true;
+                }
+            }
+        }
+        pos = gt + 1;
+    }
+    return false;
+}
+
+struct SvgD2DMaskConversion_ {
+    std::string xml;
+    bool hasUnconvertedMaskRefs = false;
+};
+
+bool SvgStyleDeclIsAlphaMask_(std::string style) {
+    style = LowerAscii_(std::move(style));
+    style.erase(std::remove_if(style.begin(), style.end(),
+                               [](unsigned char c) { return std::isspace(c); }),
+                style.end());
+    return style.find("mask-type:alpha") != std::string::npos;
+}
+
+bool IsAlphaSvgMaskTag_(const std::string& tag) {
+    std::string maskType = LowerAscii_(TrimAscii_(ExtractXmlAttr_(tag, "mask-type")));
+    if (maskType == "alpha") return true;
+    return SvgStyleDeclIsAlphaMask_(ExtractXmlAttr_(tag, "style"));
+}
+
+bool IsD2DClipConvertibleMaskShape_(const std::string& localName) {
+    return localName == "path" ||
+           localName == "rect" ||
+           localName == "circle" ||
+           localName == "ellipse" ||
+           localName == "polygon" ||
+           localName == "polyline";
+}
+
+bool SvgTagHasComplexMaskPaint_(const std::string& tag) {
+    if (!ExtractXmlAttr_(tag, "style").empty()) return true;
+    if (!ExtractXmlAttr_(tag, "filter").empty()) return true;
+    if (!ExtractXmlAttr_(tag, "mask").empty()) return true;
+    if (!ExtractXmlAttr_(tag, "clip-path").empty()) return true;
+    if (!ExtractXmlAttr_(tag, "opacity").empty() &&
+        ParseSvgFloat_(ExtractXmlAttr_(tag, "opacity"), 1.0f) < 0.999f) {
+        return true;
+    }
+    if (!ExtractXmlAttr_(tag, "fill-opacity").empty() &&
+        ParseSvgFloat_(ExtractXmlAttr_(tag, "fill-opacity"), 1.0f) < 0.999f) {
+        return true;
+    }
+    std::string fill = LowerAscii_(TrimAscii_(ExtractXmlAttr_(tag, "fill")));
+    if (fill == "none" || fill.find("url(") != std::string::npos) {
+        return true;
+    }
+    std::string stroke = LowerAscii_(TrimAscii_(ExtractXmlAttr_(tag, "stroke")));
+    if (!stroke.empty() && stroke != "none") return true;
+    return false;
+}
+
+bool SvgTextOnlyWhitespace_(std::string_view text) {
+    for (char c : text) {
+        if (!std::isspace(static_cast<unsigned char>(c))) return false;
+    }
+    return true;
+}
+
+bool ExtractSingleSimpleMaskShape_(const std::string& content,
+                                   std::string& shapeXml) {
+    bool found = false;
+    size_t pos = 0;
+    while (pos < content.size()) {
+        size_t lt = content.find('<', pos);
+        if (lt == std::string::npos) {
+            return SvgTextOnlyWhitespace_(std::string_view(content).substr(pos)) && found;
+        }
+        if (!SvgTextOnlyWhitespace_(std::string_view(content).substr(pos, lt - pos))) {
+            return false;
+        }
+        size_t gt = content.find('>', lt);
+        if (gt == std::string::npos) return false;
+
+        SvgTagInfo_ info = ParseSvgTag_(content, lt, gt);
+        if (info.special) {
+            pos = gt + 1;
+            continue;
+        }
+        if (info.closing || found) return false;
+
+        std::string local = SvgLocalName_(info.name);
+        if (!IsD2DClipConvertibleMaskShape_(local)) return false;
+
+        const size_t end = info.selfClosing
+            ? gt + 1
+            : FindSvgElementEnd_(content, lt, gt, info.name);
+        if (end <= lt || end > content.size()) return false;
+
+        std::string shape = content.substr(lt, end - lt);
+        std::string shapeTag = content.substr(lt, gt - lt + 1);
+        if (SvgTagHasComplexMaskPaint_(shapeTag)) return false;
+        if (!info.selfClosing) {
+            const size_t closeLt = content.rfind("</", end - 1);
+            if (closeLt == std::string::npos || closeLt <= gt) {
+                return false;
+            }
+            if (!SvgTextOnlyWhitespace_(std::string_view(content).substr(
+                    gt + 1, closeLt - gt - 1))) {
+                return false;
+            }
+        }
+
+        shapeXml = std::move(shape);
+        found = true;
+        pos = end;
+    }
+    return found;
+}
+
+bool BuildD2DClipPathFromSimpleMask_(const std::string& maskXml,
+                                     std::string& id,
+                                     std::string& clipPathXml) {
+    size_t lt = maskXml.find('<');
+    size_t gt = lt == std::string::npos ? std::string::npos : maskXml.find('>', lt);
+    if (lt == std::string::npos || gt == std::string::npos) return false;
+
+    std::string maskTag = maskXml.substr(lt, gt - lt + 1);
+    SvgTagInfo_ info = ParseSvgTag_(maskXml, lt, gt);
+    if (info.special || info.closing || info.selfClosing ||
+        SvgLocalName_(info.name) != "mask") {
+        return false;
+    }
+    if (!IsAlphaSvgMaskTag_(maskTag)) return false;
+
+    id = ExtractXmlAttr_(maskTag, "id");
+    if (id.empty()) return false;
+
+    size_t closeLt = maskXml.rfind("</");
+    if (closeLt == std::string::npos || closeLt <= gt) return false;
+
+    std::string shapeXml;
+    if (!ExtractSingleSimpleMaskShape_(maskXml.substr(gt + 1, closeLt - gt - 1),
+                                       shapeXml)) {
+        return false;
+    }
+
+    clipPathXml = "<clipPath id=\"" + id +
+                  "\" clipPathUnits=\"userSpaceOnUse\">" +
+                  shapeXml + "</clipPath>";
+    return true;
+}
+
+std::string ExtractSvgUrlRefId_(const std::string& value) {
+    std::vector<std::string> refs;
+    CollectSvgUrlRefs_(value, refs);
+    return refs.empty() ? std::string{} : refs.front();
+}
+
+void InsertXmlAttr_(std::string& tag, const std::string& attr) {
+    size_t insert = tag.rfind('>');
+    if (insert == std::string::npos) return;
+    size_t slash = insert;
+    while (slash > 0 && std::isspace(static_cast<unsigned char>(tag[slash - 1]))) {
+        --slash;
+    }
+    if (slash > 0 && tag[slash - 1] == '/') insert = slash - 1;
+    tag.insert(insert, " " + attr);
+}
+
+bool HasSvgMaskAttribute_(const std::string& svg) {
+    size_t pos = 0;
+    while (pos < svg.size()) {
+        size_t lt = svg.find('<', pos);
+        if (lt == std::string::npos) break;
+        size_t gt = svg.find('>', lt);
+        if (gt == std::string::npos) break;
+
+        SvgTagInfo_ info = ParseSvgTag_(svg, lt, gt);
+        if (!info.special && !info.closing) {
+            std::string tag = svg.substr(lt, gt - lt + 1);
+            if (!ExtractXmlAttr_(tag, "mask").empty()) return true;
+        }
+        pos = gt + 1;
+    }
+    return false;
+}
+
+SvgD2DMaskConversion_ ConvertSimpleSvgMasksToClipPathsForD2D_(
+    const std::string& svg) {
+    std::unordered_map<std::string, std::string> clipByMaskId;
+    struct Replacement {
+        size_t start = 0;
+        size_t end = 0;
+        std::string text;
+    };
+    std::vector<Replacement> replacements;
+
+    size_t pos = 0;
+    while (pos < svg.size()) {
+        size_t lt = svg.find('<', pos);
+        if (lt == std::string::npos) break;
+        size_t gt = svg.find('>', lt);
+        if (gt == std::string::npos) break;
+
+        SvgTagInfo_ info = ParseSvgTag_(svg, lt, gt);
+        if (!info.special && !info.closing && SvgLocalName_(info.name) == "mask") {
+            const size_t end = info.selfClosing ? gt + 1
+                : FindSvgElementEnd_(svg, lt, gt, info.name);
+            std::string id;
+            std::string clipPathXml;
+            if (end > lt &&
+                BuildD2DClipPathFromSimpleMask_(svg.substr(lt, end - lt),
+                                                id, clipPathXml) &&
+                clipByMaskId.find(id) == clipByMaskId.end()) {
+                clipByMaskId.emplace(id, clipPathXml);
+                replacements.push_back(Replacement{lt, end, std::move(clipPathXml)});
+            }
+            pos = end;
+            continue;
+        }
+        pos = gt + 1;
+    }
+
+    if (clipByMaskId.empty()) {
+        return SvgD2DMaskConversion_{svg, HasSvgMaskAttribute_(svg)};
+    }
+
+    std::string converted;
+    converted.reserve(svg.size());
+    pos = 0;
+    size_t replIndex = 0;
+    while (pos < svg.size()) {
+        if (replIndex < replacements.size() && pos == replacements[replIndex].start) {
+            converted += replacements[replIndex].text;
+            pos = replacements[replIndex].end;
+            ++replIndex;
+            continue;
+        }
+
+        size_t lt = svg.find('<', pos);
+        if (lt == std::string::npos) {
+            converted.append(svg, pos, std::string::npos);
+            break;
+        }
+        converted.append(svg, pos, lt - pos);
+        if (replIndex < replacements.size() && lt == replacements[replIndex].start) {
+            converted += replacements[replIndex].text;
+            pos = replacements[replIndex].end;
+            ++replIndex;
+            continue;
+        }
+        size_t gt = svg.find('>', lt);
+        if (gt == std::string::npos) {
+            converted.append(svg, lt, std::string::npos);
+            break;
+        }
+
+        std::string tag = svg.substr(lt, gt - lt + 1);
+        SvgTagInfo_ info = ParseSvgTag_(svg, lt, gt);
+        if (!info.special && !info.closing && SvgLocalName_(info.name) != "mask") {
+            std::string maskId = ExtractSvgUrlRefId_(ExtractXmlAttr_(tag, "mask"));
+            if (!maskId.empty() &&
+                clipByMaskId.find(maskId) != clipByMaskId.end() &&
+                ExtractXmlAttr_(tag, "clip-path").empty()) {
+                EraseXmlAttr_(tag, "mask");
+                InsertXmlAttr_(tag, "clip-path=\"url(#" + maskId + ")\"");
+            }
+        }
+        converted += tag;
+        pos = gt + 1;
+    }
+
+    return SvgD2DMaskConversion_{std::move(converted),
+                                 HasSvgMaskAttribute_(converted)};
+}
+
+bool NeedsLunaSvgMainRenderer_(const std::string& svg) {
+    /* D2D SvgDocument 是主交互视图的优先路径: 轴线、曲线、文字轮廓保持矢量
+     * 直绘。之前遇到 data:image/png 就整图切 LunaSVG 栅格, 会把本来可矢量画
+     * 的 Matplotlib 坐标轴/标签一起栅格化, 横轴小字和刻度出现毛刺。
+     * 但 D2D 对位图 pattern 填充支持不完整, 会把这类 SVG 的背景图案丢掉。
+     * 因此只在元素实际 url(#patternId) 引用了 image-backed pattern 时回退。
+     *
+     * feGaussianBlur / SourceAlpha 链式阴影需要按 SVG 文档顺序对单个元素做
+     * 离屏合成; D2D overlay 层只能画在整张基础 SVG 之前或之后, 会被背景
+     * 盖住或盖住后续内容。LunaSVG 的元素级 filter hook 更适合这类文件。 */
+    return HasUsedImageBackedSvgPattern_(svg) || HasSvgGaussianBlurFilter_(svg);
+}
+
+std::string BuildD2DDropShadowSvg_(const std::string& svg,
+                                   float& dx, float& dy, float& stdDeviation) {
+    size_t rootLt = svg.find("<svg");
+    size_t rootGt = rootLt == std::string::npos ? std::string::npos : svg.find('>', rootLt);
+    if (rootLt == std::string::npos || rootGt == std::string::npos) return {};
+
+    std::string lower = LowerAscii_(svg);
+    size_t feLt = lower.find("<fedropshadow");
+    size_t feGt = feLt == std::string::npos ? std::string::npos : svg.find('>', feLt);
+    if (feLt == std::string::npos || feGt == std::string::npos) return {};
+
+    std::string feTag = svg.substr(feLt, feGt - feLt + 1);
+    dx = ParseSvgFloat_(ExtractXmlAttr_(feTag, "dx"));
+    dy = ParseSvgFloat_(ExtractXmlAttr_(feTag, "dy"));
+    stdDeviation = ParseSvgFloat_(ExtractXmlAttr_(feTag, "stdDeviation"));
+    std::string color = ParseSvgColor_(ExtractXmlAttr_(feTag, "flood-color"));
+    float opacity = std::clamp(ParseSvgFloat_(ExtractXmlAttr_(feTag, "flood-opacity"), 1.0f),
+                               0.0f, 1.0f);
+    if (stdDeviation <= 0.0f) stdDeviation = 0.01f;
+
+    std::string out = svg.substr(rootLt, rootGt - rootLt + 1);
+    size_t pos = rootGt + 1;
+    while (true) {
+        size_t lt = svg.find('<', pos);
+        if (lt == std::string::npos) break;
+        size_t gt = svg.find('>', lt);
+        if (gt == std::string::npos) break;
+        if (lt + 1 >= svg.size() || svg[lt + 1] == '/' || svg[lt + 1] == '?' ||
+            svg[lt + 1] == '!') {
+            pos = gt + 1;
+            continue;
+        }
+
+        std::string tag = svg.substr(lt, gt - lt + 1);
+        if (ExtractXmlAttr_(tag, "filter").empty()) {
+            pos = gt + 1;
+            continue;
+        }
+
+        size_t nameStart = lt + 1;
+        size_t nameEnd = nameStart;
+        while (nameEnd < gt && IsXmlNameChar_(svg[nameEnd])) ++nameEnd;
+        std::string tagName = svg.substr(nameStart, nameEnd - nameStart);
+        std::string attrs = svg.substr(nameEnd, gt - nameEnd);
+        if (!attrs.empty() && attrs.back() == '>') attrs.pop_back();
+        if (!attrs.empty() && attrs.back() == '/') attrs.pop_back();
+
+        const bool hadStroke = TagHasAttr_(tag, "stroke") ||
+                               TagNameIs_(tagName, "line", "polyline");
+        const bool hadFill = TagHasAttr_(tag, "fill") ||
+                             TagNameIs_(tagName, "circle", "ellipse", "rect", "polygon");
+        EraseXmlAttr_(attrs, "filter");
+        EraseXmlAttr_(attrs, "style");
+        EraseXmlAttr_(attrs, "fill");
+        EraseXmlAttr_(attrs, "stroke");
+        EraseXmlAttr_(attrs, "fill-opacity");
+        EraseXmlAttr_(attrs, "stroke-opacity");
+
+        out += "<";
+        out += tagName;
+        out += attrs;
+        if (hadFill) {
+            out += " fill=\"";
+            out += color;
+            out += "\" fill-opacity=\"";
+            out += std::to_string(opacity);
+            out += "\"";
+        } else {
+            out += " fill=\"none\"";
+        }
+        if (hadStroke) {
+            out += " stroke=\"";
+            out += color;
+            out += "\" stroke-opacity=\"";
+            out += std::to_string(opacity);
+            out += "\"";
+        }
+        out += "/>";
+        pos = gt + 1;
+    }
+    out += "</svg>";
+    return out;
+}
+
+std::string BuildD2DFilteredElementsSvg_(const std::string& svg) {
+    size_t rootLt = svg.find("<svg");
+    size_t rootGt = rootLt == std::string::npos ? std::string::npos : svg.find('>', rootLt);
+    if (rootLt == std::string::npos || rootGt == std::string::npos) return {};
+
+    std::string out = svg.substr(rootLt, rootGt - rootLt + 1);
+    bool any = false;
+    size_t pos = rootGt + 1;
+    while (true) {
+        size_t lt = svg.find('<', pos);
+        if (lt == std::string::npos) break;
+        size_t gt = svg.find('>', lt);
+        if (gt == std::string::npos) break;
+        if (lt + 1 >= svg.size() || svg[lt + 1] == '/' || svg[lt + 1] == '?' ||
+            svg[lt + 1] == '!') {
+            pos = gt + 1;
+            continue;
+        }
+
+        std::string tag = svg.substr(lt, gt - lt + 1);
+        if (ExtractXmlAttr_(tag, "filter").empty()) {
+            pos = gt + 1;
+            continue;
+        }
+
+        size_t nameStart = lt + 1;
+        size_t nameEnd = nameStart;
+        while (nameEnd < gt && IsXmlNameChar_(svg[nameEnd])) ++nameEnd;
+        std::string tagName = svg.substr(nameStart, nameEnd - nameStart);
+        std::string attrs = svg.substr(nameEnd, gt - nameEnd);
+        if (!attrs.empty() && attrs.back() == '>') attrs.pop_back();
+        if (!attrs.empty() && attrs.back() == '/') attrs.pop_back();
+        EraseXmlAttr_(attrs, "filter");
+
+        out += "<";
+        out += tagName;
+        out += attrs;
+        out += "/>";
+        any = true;
+        pos = gt + 1;
+    }
+    if (!any) return {};
+    out += "</svg>";
+    return out;
+}
+
+struct D2DDropShadowLayerXml_ {
+    std::string shadowXml;
+    std::string coverXml;
+    float dx = 0.0f;
+    float dy = 0.0f;
+    float stdDeviation = 0.0f;
+};
+
+enum class D2DFilterPaintMode_ {
+    SourcePaintBlur,
+    RecolorSourceAlpha
+};
+
+struct D2DFilterSpec_ {
+    std::string id;
+    D2DFilterPaintMode_ paintMode = D2DFilterPaintMode_::RecolorSourceAlpha;
+    std::string color = "#000000";
+    float opacity = 1.0f;
+    float dx = 0.0f;
+    float dy = 0.0f;
+    float stdDeviation = 0.0f;
+};
+
+std::string BuildD2DBaseWithoutFilteredElementsSvg_(const std::string& svg) {
+    std::string out;
+    out.reserve(svg.size());
+    size_t pos = 0;
+    while (true) {
+        size_t lt = svg.find('<', pos);
+        if (lt == std::string::npos) {
+            out.append(svg, pos, std::string::npos);
+            break;
+        }
+        size_t gt = svg.find('>', lt);
+        if (gt == std::string::npos) {
+            out.append(svg, pos, std::string::npos);
+            break;
+        }
+        std::string tag = svg.substr(lt, gt - lt + 1);
+        SvgTagInfo_ info = ParseSvgTag_(svg, lt, gt);
+        if (!info.special && !info.closing &&
+            IsD2DUnsupportedSvgElement_(info.name)) {
+            out.append(svg, pos, lt - pos);
+            pos = info.selfClosing
+                ? gt + 1
+                : FindSvgElementEnd_(svg, lt, gt, info.name);
+            continue;
+        }
+        if (!info.special && !info.closing &&
+            !ExtractXmlAttr_(tag, "filter").empty()) {
+            std::string cleaned = tag;
+            EraseXmlAttr_(cleaned, "filter");
+            out.append(svg, pos, lt - pos);
+            out += cleaned;
+            pos = gt + 1;
+            continue;
+        }
+        out.append(svg, pos, gt + 1 - pos);
+        pos = gt + 1;
+    }
+    return out;
+}
+
+std::string BuildD2DLayerResourceContext_(const std::string& svg, size_t rootGt) {
+    std::string out;
+    int depth = 0;
+    size_t pos = rootGt + 1;
+    while (pos < svg.size()) {
+        size_t lt = svg.find('<', pos);
+        if (lt == std::string::npos) break;
+        size_t gt = svg.find('>', lt);
+        if (gt == std::string::npos) break;
+
+        SvgTagInfo_ info = ParseSvgTag_(svg, lt, gt);
+        if (info.special) {
+            pos = gt + 1;
+            continue;
+        }
+        if (info.closing) {
+            if (depth == 0 && info.name == "svg") break;
+            if (depth > 0) --depth;
+            pos = gt + 1;
+            continue;
+        }
+
+        if (depth == 0 && IsD2DLayerResourceElement_(info.name)) {
+            size_t end = info.selfClosing ? gt + 1
+                                          : FindSvgElementEnd_(svg, lt, gt, info.name);
+            if (end <= lt) end = gt + 1;
+            out += BuildD2DBaseWithoutFilteredElementsSvg_(svg.substr(lt, end - lt));
+            pos = end;
+            continue;
+        }
+
+        if (!info.selfClosing) ++depth;
+        pos = gt + 1;
+    }
+    return out;
+}
+
+std::string BuildSvgThumbnailXml_(const std::string& svg) {
+    std::string out;
+    out.reserve(svg.size());
+    size_t pos = 0;
+    while (true) {
+        size_t lt = svg.find('<', pos);
+        if (lt == std::string::npos) {
+            out.append(svg, pos, std::string::npos);
+            break;
+        }
+        size_t gt = svg.find('>', lt);
+        if (gt == std::string::npos) {
+            out.append(svg, pos, std::string::npos);
+            break;
+        }
+
+        std::string tag = svg.substr(lt, gt - lt + 1);
+        SvgTagInfo_ info = ParseSvgTag_(svg, lt, gt);
+        if (!info.special && !info.closing &&
+            !ExtractXmlAttr_(tag, "filter").empty()) {
+            EraseXmlAttr_(tag, "filter");
+        }
+        out.append(svg, pos, lt - pos);
+        out += tag;
+        pos = gt + 1;
+    }
+    return out;
+}
+
+bool FindSvgStartTag_(const std::string& xml, const std::string& localName,
+                      size_t start, size_t* outLt, size_t* outGt,
+                      std::string* outTag) {
+    size_t pos = start;
+    while (pos < xml.size()) {
+        size_t lt = xml.find('<', pos);
+        if (lt == std::string::npos) break;
+        size_t gt = xml.find('>', lt);
+        if (gt == std::string::npos) break;
+        SvgTagInfo_ info = ParseSvgTag_(xml, lt, gt);
+        if (!info.special && !info.closing &&
+            SvgLocalName_(info.name) == localName) {
+            if (outLt) *outLt = lt;
+            if (outGt) *outGt = gt;
+            if (outTag) *outTag = xml.substr(lt, gt - lt + 1);
+            return true;
+        }
+        pos = gt + 1;
+    }
+    return false;
+}
+
+std::string ExtractFirstSvgUrlRefId_(const std::string& value) {
+    std::vector<std::string> refs;
+    CollectSvgUrlRefs_(value, refs);
+    return refs.empty() ? std::string{} : refs.front();
+}
+
+bool ParseSvgColorMatrixShadow_(const std::string& tag,
+                                std::string& color,
+                                float& opacity) {
+    std::vector<float> values = ParseSvgFloatList_(ExtractXmlAttr_(tag, "values"));
+    if (values.size() < 20) return false;
+    color = SvgHexColorFromUnitRgb_(values[4], values[9], values[14]);
+    const float alphaMul = values[18];
+    const float alphaAdd = values[19];
+    opacity = std::clamp(std::fabs(alphaMul) > 0.0001f ? alphaMul : alphaAdd,
+                         0.0f, 1.0f);
+    return true;
+}
+
+D2DFilterSpec_ ParseD2DFilterSpec_(const std::string& filterXml) {
+    D2DFilterSpec_ spec;
+
+    std::string dropTag;
+    if (FindSvgStartTag_(filterXml, "fedropshadow", 0, nullptr, nullptr, &dropTag)) {
+        spec.paintMode = D2DFilterPaintMode_::RecolorSourceAlpha;
+        spec.dx = ParseSvgFloat_(ExtractXmlAttr_(dropTag, "dx"));
+        spec.dy = ParseSvgFloat_(ExtractXmlAttr_(dropTag, "dy"));
+        spec.stdDeviation = ParseSvgFloat_(ExtractXmlAttr_(dropTag, "stdDeviation"));
+        spec.color = ParseSvgColor_(ExtractXmlAttr_(dropTag, "flood-color"));
+        spec.opacity = std::clamp(ParseSvgFloat_(ExtractXmlAttr_(dropTag, "flood-opacity"),
+                                                1.0f),
+                                  0.0f, 1.0f);
+        if (spec.stdDeviation <= 0.0f) spec.stdDeviation = 0.01f;
+        return spec;
+    }
+
+    std::string blurTag;
+    if (!FindSvgStartTag_(filterXml, "fegaussianblur", 0, nullptr, nullptr, &blurTag)) {
+        return {};
+    }
+
+    spec.stdDeviation = ParseSvgFloat_(ExtractXmlAttr_(blurTag, "stdDeviation"));
+    if (spec.stdDeviation <= 0.0f) spec.stdDeviation = 0.01f;
+
+    std::string offsetTag;
+    if (FindSvgStartTag_(filterXml, "feoffset", 0, nullptr, nullptr, &offsetTag)) {
+        spec.dx = ParseSvgFloat_(ExtractXmlAttr_(offsetTag, "dx"));
+        spec.dy = ParseSvgFloat_(ExtractXmlAttr_(offsetTag, "dy"));
+    }
+
+    std::string lower = LowerAscii_(filterXml);
+    const bool shadowChain = lower.find("sourcealpha") != std::string::npos ||
+                             lower.find("dropshadow") != std::string::npos;
+    if (!shadowChain) {
+        spec.paintMode = D2DFilterPaintMode_::SourcePaintBlur;
+        return spec;
+    }
+
+    spec.paintMode = D2DFilterPaintMode_::RecolorSourceAlpha;
+    size_t scan = 0;
+    std::string matrixTag;
+    while (FindSvgStartTag_(filterXml, "fecolormatrix", scan, &scan, nullptr,
+                            &matrixTag)) {
+        ParseSvgColorMatrixShadow_(matrixTag, spec.color, spec.opacity);
+        ++scan;
+    }
+    return spec;
+}
+
+std::vector<D2DFilterSpec_> CollectD2DFilterSpecs_(const std::string& svg) {
+    std::vector<D2DFilterSpec_> out;
+    size_t pos = 0;
+    while (pos < svg.size()) {
+        size_t lt = svg.find('<', pos);
+        if (lt == std::string::npos) break;
+        size_t gt = svg.find('>', lt);
+        if (gt == std::string::npos) break;
+        SvgTagInfo_ info = ParseSvgTag_(svg, lt, gt);
+        if (!info.special && !info.closing && SvgLocalName_(info.name) == "filter") {
+            std::string tag = svg.substr(lt, gt - lt + 1);
+            std::string id = ExtractXmlAttr_(tag, "id");
+            size_t end = info.selfClosing ? gt + 1
+                                          : FindSvgElementEnd_(svg, lt, gt, info.name);
+            if (!id.empty() && end > lt) {
+                D2DFilterSpec_ spec = ParseD2DFilterSpec_(svg.substr(lt, end - lt));
+                if (spec.stdDeviation > 0.0f) {
+                    spec.id = std::move(id);
+                    out.push_back(std::move(spec));
+                }
+            }
+            pos = end;
+            continue;
+        }
+        pos = gt + 1;
+    }
+    return out;
+}
+
+const D2DFilterSpec_* FindD2DFilterSpec_(const std::vector<D2DFilterSpec_>& specs,
+                                         const std::string& id) {
+    for (const auto& spec : specs) {
+        if (spec.id == id) return &spec;
+    }
+    return nullptr;
+}
+
+std::vector<D2DDropShadowLayerXml_> BuildD2DDropShadowLayerXmls_(const std::string& svg) {
+    std::vector<D2DDropShadowLayerXml_> layers;
+    size_t rootLt = svg.find("<svg");
+    size_t rootGt = rootLt == std::string::npos ? std::string::npos : svg.find('>', rootLt);
+    if (rootLt == std::string::npos || rootGt == std::string::npos) return layers;
+
+    std::vector<D2DFilterSpec_> filterSpecs = CollectD2DFilterSpecs_(svg);
+    if (filterSpecs.empty()) return layers;
+
+    std::string rootOpen = svg.substr(rootLt, rootGt - rootLt + 1);
+    std::string layerResourceContext = BuildD2DLayerResourceContext_(svg, rootGt);
+
+    size_t pos = rootGt + 1;
+    while (true) {
+        size_t lt = svg.find('<', pos);
+        if (lt == std::string::npos) break;
+        size_t gt = svg.find('>', lt);
+        if (gt == std::string::npos) break;
+        if (lt + 1 >= svg.size() || svg[lt + 1] == '/' || svg[lt + 1] == '?' ||
+            svg[lt + 1] == '!') {
+            pos = gt + 1;
+            continue;
+        }
+
+        std::string tag = svg.substr(lt, gt - lt + 1);
+        std::string filterId = ExtractFirstSvgUrlRefId_(ExtractXmlAttr_(tag, "filter"));
+        const D2DFilterSpec_* filterSpec = FindD2DFilterSpec_(filterSpecs, filterId);
+        if (!filterSpec) {
+            pos = gt + 1;
+            continue;
+        }
+
+        size_t nameStart = lt + 1;
+        size_t nameEnd = nameStart;
+        while (nameEnd < gt && IsXmlNameChar_(svg[nameEnd])) ++nameEnd;
+        std::string tagName = svg.substr(nameStart, nameEnd - nameStart);
+        std::string attrs = svg.substr(nameEnd, gt - nameEnd);
+        if (!attrs.empty() && attrs.back() == '>') attrs.pop_back();
+        if (!attrs.empty() && attrs.back() == '/') attrs.pop_back();
+
+        const bool hadStroke = TagHasAttr_(tag, "stroke") ||
+                               TagNameIs_(tagName, "line", "polyline");
+        const bool hadFill = TagHasAttr_(tag, "fill") ||
+                             TagNameIs_(tagName, "circle", "ellipse", "rect", "polygon");
+
+        std::string coverAttrs = attrs;
+        EraseXmlAttr_(coverAttrs, "filter");
+        std::string shadowAttrs = coverAttrs;
+
+        const bool recolorShadow =
+            filterSpec->paintMode == D2DFilterPaintMode_::RecolorSourceAlpha;
+        if (recolorShadow) {
+            EraseXmlAttr_(shadowAttrs, "style");
+            EraseXmlAttr_(shadowAttrs, "fill");
+            EraseXmlAttr_(shadowAttrs, "stroke");
+            EraseXmlAttr_(shadowAttrs, "fill-opacity");
+            EraseXmlAttr_(shadowAttrs, "stroke-opacity");
+        }
+
+        std::string cover = rootOpen + layerResourceContext + "<" + tagName +
+                            coverAttrs + "/></svg>";
+        std::string shadow = rootOpen + layerResourceContext + "<" + tagName +
+                             shadowAttrs;
+        if (recolorShadow) {
+            if (hadFill) {
+                shadow += " fill=\"" + filterSpec->color + "\" fill-opacity=\"" +
+                          std::to_string(filterSpec->opacity) + "\"";
+            } else {
+                shadow += " fill=\"none\"";
+            }
+            if (hadStroke) {
+                shadow += " stroke=\"" + filterSpec->color + "\" stroke-opacity=\"" +
+                          std::to_string(filterSpec->opacity) + "\"";
+            }
+        }
+        shadow += "/></svg>";
+
+        layers.push_back(D2DDropShadowLayerXml_{std::move(shadow), std::move(cover),
+                                                filterSpec->dx, filterSpec->dy,
+                                                filterSpec->stdDeviation});
+        pos = gt + 1;
+    }
+    return layers;
+}
+
+} // namespace
+
+namespace test {
+
+std::pair<std::string, std::string> BuildFirstD2DDropShadowLayerXmlForTest(
+    const std::string& svg) {
+    auto layers = BuildD2DDropShadowLayerXmls_(svg);
+    if (layers.empty()) return {};
+    return {layers.front().shadowXml, layers.front().coverXml};
+}
+
+std::pair<std::string, bool> ConvertSimpleSvgMasksToClipPathsForD2DForTest(
+    const std::string& svg) {
+    auto converted = ConvertSimpleSvgMasksToClipPathsForD2D_(svg);
+    return {std::move(converted.xml), converted.hasUnconvertedMaskRefs};
+}
+
+}  // namespace test
+
+namespace {
+
+std::vector<unsigned char> DecodeBase64_(std::string_view input) {
+    unsigned char table[256];
+    std::fill(table, table + 256, 255);
+    for (int i = 0; i < 26; ++i) {
+        table[static_cast<unsigned char>('A' + i)] = static_cast<unsigned char>(i);
+        table[static_cast<unsigned char>('a' + i)] = static_cast<unsigned char>(26 + i);
+    }
+    for (int i = 0; i < 10; ++i)
+        table[static_cast<unsigned char>('0' + i)] = static_cast<unsigned char>(52 + i);
+    table[static_cast<unsigned char>('+')] = 62;
+    table[static_cast<unsigned char>('/')] = 63;
+
+    std::vector<unsigned char> out;
+    out.reserve(input.size() * 3 / 4);
+    int value = 0;
+    int bits = -8;
+    for (unsigned char ch : input) {
+        if (ch == '=') break;
+        if (std::isspace(ch)) continue;
+        unsigned char d = table[ch];
+        if (d == 255) continue;
+        value = (value << 6) | d;
+        bits += 6;
+        if (bits >= 0) {
+            out.push_back(static_cast<unsigned char>((value >> bits) & 0xFF));
+            bits -= 8;
+        }
+    }
+    return out;
+}
+
+bool IsXmlNameChar_(char ch) {
+    unsigned char c = static_cast<unsigned char>(ch);
+    return std::isalnum(c) || ch == '_' || ch == '-' || ch == ':' || ch == '.';
+}
+
+bool IsSvgPlacementAttr_(const std::string& attrs, size_t start, size_t len) {
+    return (len == 1 && attrs[start] == 'x') ||
+           (len == 1 && attrs[start] == 'y') ||
+           (len == 5 && attrs.compare(start, len, "width") == 0) ||
+           (len == 6 && attrs.compare(start, len, "height") == 0);
+}
+
+std::string RemoveSvgPlacementAttrs_(const std::string& attrs) {
+    std::string out;
+    out.reserve(attrs.size());
+    size_t i = 0;
+    while (i < attrs.size()) {
+        const size_t itemStart = i;
+        while (i < attrs.size() &&
+               std::isspace(static_cast<unsigned char>(attrs[i]))) {
+            ++i;
+        }
+        if (i >= attrs.size()) {
+            out.append(attrs, itemStart, attrs.size() - itemStart);
+            break;
+        }
+
+        const size_t nameStart = i;
+        while (i < attrs.size() && IsXmlNameChar_(attrs[i])) ++i;
+        if (nameStart == i) {
+            out.push_back(attrs[i++]);
+            continue;
+        }
+
+        const size_t nameEnd = i;
+        size_t j = i;
+        while (j < attrs.size() &&
+               std::isspace(static_cast<unsigned char>(attrs[j]))) {
+            ++j;
+        }
+        if (j >= attrs.size() || attrs[j] != '=') {
+            out.append(attrs, itemStart, nameEnd - itemStart);
+            continue;
+        }
+
+        ++j;
+        while (j < attrs.size() &&
+               std::isspace(static_cast<unsigned char>(attrs[j]))) {
+            ++j;
+        }
+        if (j < attrs.size() && (attrs[j] == '"' || attrs[j] == '\'')) {
+            const char quote = attrs[j++];
+            size_t q = attrs.find(quote, j);
+            j = (q == std::string::npos) ? attrs.size() : q + 1;
+        } else {
+            while (j < attrs.size() &&
+                   !std::isspace(static_cast<unsigned char>(attrs[j]))) {
+                ++j;
+            }
+        }
+
+        if (!IsSvgPlacementAttr_(attrs, nameStart, nameEnd - nameStart)) {
+            out.append(attrs, itemStart, j - itemStart);
+        }
+        i = j;
+    }
+    return out;
+}
+
+std::string ExpandEmbeddedSvgImagesForD2D_(const std::string& svg) {
+    std::string out;
+    out.reserve(svg.size());
+    size_t pos = 0;
+    while (true) {
+        size_t lt = svg.find("<image", pos);
+        if (lt == std::string::npos) {
+            out.append(svg, pos, std::string::npos);
+            break;
+        }
+        out.append(svg, pos, lt - pos);
+        size_t gt = svg.find('>', lt);
+        if (gt == std::string::npos) {
+            out.append(svg, lt, std::string::npos);
+            break;
+        }
+        std::string tag = svg.substr(lt, gt - lt + 1);
+        bool selfClose = (gt > lt && svg[gt - 1] == '/');
+        size_t elemEnd = gt + 1;
+        if (!selfClose) {
+            size_t close = svg.find("</image>", gt + 1);
+            if (close != std::string::npos)
+                elemEnd = close + 8;
+        }
+
+        std::string href = ExtractXmlAttr_(tag, "href");
+        if (href.empty()) href = ExtractXmlAttr_(tag, "xlink:href");
+        std::string lowerHref = LowerAscii_(href.substr(0, std::min<size_t>(href.size(), 64)));
+        const size_t comma = href.find(',');
+        if (comma != std::string::npos &&
+            lowerHref.find("data:image/svg+xml") == 0 &&
+            lowerHref.find(";base64") != std::string::npos) {
+            auto bytes = DecodeBase64_(std::string_view(href).substr(comma + 1));
+            std::string child(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+            size_t cLt = child.find("<svg");
+            size_t cGt = cLt == std::string::npos ? std::string::npos : child.find('>', cLt);
+            size_t cClose = child.rfind("</svg>");
+            if (cLt != std::string::npos && cGt != std::string::npos && cClose != std::string::npos) {
+                std::string x = ExtractXmlAttr_(tag, "x");
+                std::string y = ExtractXmlAttr_(tag, "y");
+                std::string w = ExtractXmlAttr_(tag, "width");
+                std::string h = ExtractXmlAttr_(tag, "height");
+                std::string transform = ExtractXmlAttr_(tag, "transform");
+                std::string attrs = RemoveSvgPlacementAttrs_(
+                    child.substr(cLt + 4, cGt - (cLt + 4)));
+                std::string body = child.substr(cGt + 1, cClose - (cGt + 1));
+                if (!transform.empty()) {
+                    out += "<g transform=\"";
+                    out += transform;
+                    out += "\">";
+                }
+                out += "<svg";
+                out += attrs;
+                if (!x.empty()) out += " x=\"" + x + "\"";
+                if (!y.empty()) out += " y=\"" + y + "\"";
+                if (!w.empty()) out += " width=\"" + w + "\"";
+                if (!h.empty()) out += " height=\"" + h + "\"";
+                out += ">";
+                out += body;
+                out += "</svg>";
+                if (!transform.empty()) out += "</g>";
+            } else {
+                out.append(svg, lt, elemEnd - lt);
+            }
+        } else {
+            out.append(svg, lt, elemEnd - lt);
+        }
+        pos = elemEnd;
+    }
+    return out;
+}
+
+Microsoft::WRL::ComPtr<IStream> CreateStreamFromString_(const std::string& s) {
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, s.size());
+    if (!h) return nullptr;
+    void* p = GlobalLock(h);
+    if (!p) {
+        GlobalFree(h);
+        return nullptr;
+    }
+    memcpy(p, s.data(), s.size());
+    GlobalUnlock(h);
+    Microsoft::WRL::ComPtr<IStream> stream;
+    if (FAILED(CreateStreamOnHGlobal(h, TRUE, stream.GetAddressOf()))) {
+        GlobalFree(h);
+        return nullptr;
+    }
+    return stream;
+}
+
+}  // namespace
+
+GhImgViewWidget::~GhImgViewWidget() {
+    for (const auto& kv : tiles_) {
+        GlobalResourceStore().Remove(kv.second.resourceKey);
+    }
+    if (previewResourceKey_.IsValid()) {
+        GlobalResourceStore().Remove(previewResourceKey_);
+    }
+    ClearSvgRaster_();
+}
 
 // ===== 数据形状 =====
 
 void GhImgViewWidget::Begin(const Info& info, Renderer& r) {
+    const uint64_t oldGeneration = imageGeneration_;
+    ++imageGeneration_;
+    if (oldGeneration != 0) {
+        if (info.keepPreview) {
+            for (const auto& kv : tiles_) {
+                GlobalResourceStore().SetPinnedVisible(kv.second.resourceKey, false);
+            }
+        }
+        if (info.keepPreview) GlobalResourceStore().MarkGenerationEvictable(oldGeneration);
+        else                  GlobalResourceStore().PurgeGeneration(oldGeneration);
+    }
+
     tiles_.clear();
     /* L168: keepPreview 时不清 preview 兜底层 — preview 在 OnDraw 永远先画兜底,
      * tile 逐级盖上, 清晰度物理单调, 消除切金字塔时的闪烁。 */
     if (!info.keepPreview) {
-        preview_.Reset();
+        previewResourceKey_ = {};
         previewW_ = previewH_ = 0;
     }
     /* 切瓦块 source 前清 SVG 状态. svgSlot_ 置空 = 放弃任何在飞后台渲染 (其线程
      * 写到的是旧 slot, 自然丢弃)。 */
     svgDoc_.reset();
-    svgRaster_.Reset();
-    svgRasterW_ = svgRasterH_ = 0;
+    svgD2DDoc_.Reset();
+    svgD2DXml_.clear();
+    svgThumbXml_.clear();
+    svgRasterMain_ = false;
+    svgD2DShadowLayers_.clear();
+    ClearSvgRaster_();
     svgW_ = svgH_ = 0;
     svgSlot_.reset();
 
@@ -147,16 +1752,28 @@ void GhImgViewWidget::Begin(const Info& info, Renderer& r) {
 
 void GhImgViewWidget::SetPreview(const void* bgra, uint32_t pw, uint32_t ph,
                                   uint32_t stride, Renderer& r) {
+    (void)r;
     if (!bgra || pw == 0 || ph == 0) return;
     if (stride == 0) stride = pw * 4;
-    /* gh_img_view 的输入约定: caller 喂 straight (non-premultiplied) BGRA —
-       绝大多数 PNG/JPEG 解码器 (ghde / WIC GUID_WICPixelFormat32bppBGRA /
-       libpng / stb_image) 默认输出 straight. lib 内部 premul 转成 D2D
-       PREMULTIPLIED bitmap 期望的格式 — 抗锯齿边缘 (alpha 中间值) 大倍率
-       放大时不会出 chroma fringe. */
-    auto bmp = r.CreateBitmapFromPixelsStraight(bgra, (int)pw, (int)ph, (int)stride);
-    if (!bmp) return;
-    preview_  = std::move(bmp);
+    if (previewResourceKey_.IsValid() &&
+        previewResourceKey_.image_generation != imageGeneration_) {
+        GlobalResourceStore().PurgeGeneration(previewResourceKey_.image_generation);
+        previewResourceKey_ = {};
+    }
+    if (previewResourceKey_.IsValid()) {
+        /* Do not UpdateImage in place: render-thread/GPU caches are keyed by
+         * ResourceKey, so reusing the key can leave animated previews visually
+         * stuck on the previous bitmap. Remove the old preview first, then add
+         * a fresh key; ResourceStore still retains only one preview frame. */
+        GlobalResourceStore().Remove(previewResourceKey_);
+        previewResourceKey_ = {};
+    }
+
+    ResourceKey key = GlobalResourceStore().AddImage(
+        ResourceKind::Preview, imageGeneration_, (int)pw, (int)ph, (int)stride,
+        PixelFormat::BgraStraight, bgra, true);
+    if (!key.IsValid()) return;
+    previewResourceKey_ = key;
     previewW_ = pw;
     previewH_ = ph;
     InvalidateAllWindows();
@@ -165,26 +1782,64 @@ void GhImgViewWidget::SetPreview(const void* bgra, uint32_t pw, uint32_t ph,
 void GhImgViewWidget::SetTile(uint32_t level, uint32_t tx, uint32_t ty,
                                const void* bgra, uint32_t tw, uint32_t th,
                                uint32_t stride, Renderer& r) {
+    (void)r;
     if (!bgra || tw == 0 || th == 0) return;
     if (level >= info_.levels) return;
     if (stride == 0) stride = tw * 4;
 
-    /* 同 SetPreview — caller 喂 straight BGRA, lib 内部 premul. */
-    auto bmp = r.CreateBitmapFromPixelsStraight(bgra, (int)tw, (int)th, (int)stride);
-    if (!bmp) return;
+    ResourceKey resourceKey = GlobalResourceStore().AddImage(
+        ResourceKind::Tile, imageGeneration_, (int)tw, (int)th, (int)stride,
+        PixelFormat::BgraStraight, bgra, true);
+    if (!resourceKey.IsValid()) return;
 
     // L48: 不再做 LRU evict — viewport trim 在 NotifyViewport 内做, 跟 viewport
     // 边界严格绑定. SetTile 只负责装新 tile, 不主动 evict.
     Tile t;
-    t.bmp = std::move(bmp);
+    t.resourceKey = resourceKey;
     t.w   = tw;
     t.h   = th;
-    tiles_[TileKey{level, tx, ty}] = std::move(t);
+    TileKey key{level, tx, ty};
+    auto old = tiles_.find(key);
+    if (old != tiles_.end()) GlobalResourceStore().Remove(old->second.resourceKey);
+    tiles_[key] = std::move(t);
     if (!tileBatch_) InvalidateAllWindows();   // L115: batch 内不刷, EndTileBatch 一次刷
 }
 
 void GhImgViewWidget::EndTileBatch() {
     tileBatch_ = false;
+    InvalidateAllWindows();
+}
+
+void GhImgViewWidget::EndViewUpdate() {
+    if (viewUpdateDepth_ <= 0) return;
+    --viewUpdateDepth_;
+    if (viewUpdateDepth_ != 0) return;
+
+    const bool notify = pendingViewportNotify_;
+    const bool invalidate = pendingInvalidate_;
+    {
+        TraceEvent("gh_img_view", "end_view_update",
+                   {TraceBool("notify", notify),
+                    TraceBool("invalidate", invalidate),
+                    TraceF64("zoom", zoom_),
+                    TraceF64("pan_x", panX_),
+                    TraceF64("pan_y", panY_)});
+    }
+    pendingViewportNotify_ = false;
+    pendingInvalidate_ = false;
+    if (notify) NotifyViewport();
+    if (invalidate) InvalidateAllWindows();
+}
+
+void GhImgViewWidget::RequestViewportCommit() {
+    if (viewUpdateDepth_ > 0) {
+        pendingViewportNotify_ = true;
+        pendingInvalidate_ = true;
+        TraceEvent("gh_img_view", "request_viewport_deferred");
+        return;
+    }
+    TraceEvent("gh_img_view", "request_viewport_immediate");
+    NotifyViewport();
     InvalidateAllWindows();
 }
 
@@ -210,6 +1865,7 @@ void GhImgViewWidget::TrimToViewport_(uint32_t active_level,
         if (onTileEvicted) {
             onTileEvicted(k.level, k.tx, k.ty);
         }
+        GlobalResourceStore().Remove(it->second.resourceKey);
         it = tiles_.erase(it);
     }
 }
@@ -217,6 +1873,7 @@ void GhImgViewWidget::TrimToViewport_(uint32_t active_level,
 void GhImgViewWidget::ClearLevel(uint32_t level) {
     for (auto it = tiles_.begin(); it != tiles_.end(); ) {
         if (it->first.level == level) {
+            GlobalResourceStore().Remove(it->second.resourceKey);
             it = tiles_.erase(it);
         } else {
             ++it;
@@ -226,12 +1883,22 @@ void GhImgViewWidget::ClearLevel(uint32_t level) {
 }
 
 void GhImgViewWidget::Clear() {
+    if (imageGeneration_ != 0) GlobalResourceStore().PurgeGeneration(imageGeneration_);
+    if (previewResourceKey_.IsValid() &&
+        previewResourceKey_.image_generation != imageGeneration_) {
+        GlobalResourceStore().PurgeGeneration(previewResourceKey_.image_generation);
+    }
+    ++imageGeneration_;
     tiles_.clear();
-    preview_.Reset();
+    previewResourceKey_ = {};
     previewW_ = previewH_ = 0;
     svgDoc_.reset();
-    svgRaster_.Reset();
-    svgRasterW_ = svgRasterH_ = 0;
+    svgD2DDoc_.Reset();
+    svgD2DXml_.clear();
+    svgThumbXml_.clear();
+    svgRasterMain_ = false;
+    svgD2DShadowLayers_.clear();
+    ClearSvgRaster_();
     svgW_ = svgH_ = 0;
     svgSlot_.reset();
     info_ = Info{};
@@ -243,39 +1910,209 @@ void GhImgViewWidget::Clear() {
 
 // ---- SVG 矢量源 (Build 70+ L20) ----
 
+/* L195: LunaSVG 无内置字体、也不解析 SVG 内嵌 @font-face → 不注册任何字体则
+ * <text> 全部渲染不出 (getFontFace 落空 → null face → 无字形)。给它注册一个
+ * 系统 CJK fallback 字体, 注册成 empty family "" (LunaSVG 的通配回退: 任何没注册
+ * 的 font-family 都落到它)。lazy 一次 — FontFaceCache 是进程级全局静态。 */
+static void EnsureLunaSvgFallbackFont_() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    wchar_t winDir[MAX_PATH] = {};
+    UINT n = GetWindowsDirectoryW(winDir, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return;
+    std::wstring fonts = std::wstring(winDir) + L"\\Fonts\\";
+    /* 找第一个存在的 CJK 字体 (中英全覆盖): 微软雅黑(Win7+) → 等线(Win10+) → 黑体 → 宋体。 */
+    const wchar_t* cands[] = { L"msyh.ttc", L"Deng.ttf", L"simhei.ttf", L"simsun.ttc" };
+    std::wstring wpath;
+    for (const wchar_t* fn : cands) {
+        std::wstring p = fonts + fn;
+        if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) { wpath = p; break; }
+    }
+    if (wpath.empty()) return;
+    /* 读一次到 leaked buffer (进程级 fallback 字体, 永不释放), 多 family 共享同一份数据。 */
+    std::ifstream ff(wpath.c_str(), std::ios::binary);
+    if (!ff) return;
+    auto* buf = new std::string((std::istreambuf_iterator<char>(ff)),
+                                 std::istreambuf_iterator<char>());
+    if (buf->empty()) return;
+    /* 覆盖 lunasvg 的 generic fallback 目标 (lunasvg graphics.cpp generic_fallbacks:
+     * sans-serif→Arial / serif→Times New Roman / monospace→Courier New) + empty family。
+     * 这些默认是纯拉丁字体, SVG 文字的 font-family 列表 fallback 到它们时, 中文字形落空
+     * 渲染成豆腐 (lunasvg 选定单一字体、无逐字形回退)。用 CJK 字体覆盖它们 (FontFaceCache
+     * 把新条目插链表头, 即盖过 load_sys 加载的系统同名字体) → 中英文都正常渲染。
+     * bold/italic 4 档全注册, 覆盖任意 weight 的文字。 */
+    const char* fams[] = { "Arial", "Times New Roman", "Courier New", "" };
+    for (const char* fam : fams)
+        for (int bi = 0; bi < 4; ++bi)
+            lunasvg_add_font_face_from_data(fam, (bi & 1) != 0, (bi & 2) != 0,
+                                            buf->data(), buf->size(), nullptr, nullptr);
+}
+
 bool GhImgViewWidget::SetSvgFromFile(const std::wstring& path, Renderer& r) {
-    (void)r;   /* LunaSVG 纯 CPU 栅格化, 加载阶段不需要 D2D 渲染器 */
+    const bool hasImmediateD2D = r.RT5() != nullptr;
 
-    /* L173 / core-ui Phase 4: 改用 LunaSVG。它原生解析 <style> CSS 选择器 / 渐变 /
-     * clip / mask / <text> / filter, 不再需要 svg_style_inliner 预处理或
-     * <text>→<path> 转换 (那些是 D2D ID2D1SvgDocument 不支持时的补丁)。
-     * loadFromFile 走 UTF-8 路径, 这里把宽字符路径转 UTF-8。 */
-    /* 用宽字符路径读文件再 loadFromData — Windows 的 fopen/loadFromFile 把窄路径
-     * 按系统 ANSI 码页解释, 传 UTF-8 路径会打不开带中文的文件。MSVC 的 ifstream
-     * 支持 wchar_t* 路径, 绕开码页问题 (跟 ghde gh_svg_decoder 同思路)。 */
-    std::ifstream f(path.c_str(), std::ios::binary);
-    if (!f) return false;
-    std::string xml((std::istreambuf_iterator<char>(f)),
-                    std::istreambuf_iterator<char>());
-    if (xml.empty()) return false;
+    /* D2D SvgDocument remains the preferred interactive view, but build 223+
+     * can release the UI thread render target after render-thread present takes
+     * over. Loading must therefore validate/store XML without requiring a UI
+     * RT; the render thread will recreate the SvgDocument while replaying the
+     * DisplayList. */
+    Microsoft::WRL::ComPtr<ID2D1SvgDocument> d2dDoc;
+    std::string xml;
+    std::string d2dXml;
+    std::string thumbXml;
+    bool needsRasterMain = false;
+    auto tryPrepareSvg = [&](std::string candidateXml) -> bool {
+        if (candidateXml.empty()) return false;
+        EnsureLunaSvgFallbackFont_();
+        candidateXml = ReplaceCssLightDark_(std::move(candidateXml));
+        candidateXml = ExpandSvgSwitchImageFallbacksForD2D_(candidateXml);
+        candidateXml = ExpandEmbeddedSvgImagesForD2D_(candidateXml);
+        candidateXml = r.SvgInlineTextAsPaths(candidateXml);
+        auto maskConversion = ConvertSimpleSvgMasksToClipPathsForD2D_(candidateXml);
+        std::string candidateD2DSource = std::move(maskConversion.xml);
+        std::string candidateD2DXml = HasSvgFilter_(candidateXml)
+            ? BuildD2DBaseWithoutFilteredElementsSvg_(candidateD2DSource)
+            : candidateD2DSource;
+        std::string candidateThumbXml = HasSvgFilter_(candidateXml)
+            ? BuildSvgThumbnailXml_(candidateXml)
+            : std::string{};
+        Microsoft::WRL::ComPtr<ID2D1SvgDocument> candidateDoc;
+        if (!r.CreateSvgDocumentFromXml(candidateD2DXml, 1024.0f, 1024.0f,
+                                        hasImmediateD2D ? &candidateDoc : nullptr)) {
+            return false;
+        }
+        xml = std::move(candidateXml);
+        d2dXml = std::move(candidateD2DXml);
+        thumbXml = std::move(candidateThumbXml);
+        d2dDoc = std::move(candidateDoc);
+        needsRasterMain = NeedsLunaSvgMainRenderer_(xml) ||
+                          maskConversion.hasUnconvertedMaskRefs;
+        return true;
+    };
 
-    auto doc = lunasvg::Document::loadFromData(xml);
-    if (!doc) return false;
+    auto inlined = LoadSvgWithInlinedStyles(path);
+    bool created = tryPrepareSvg(std::move(inlined));
+    if (!created) {
+        std::ifstream f(path.c_str(), std::ios::binary);
+        if (f) {
+            std::string raw((std::istreambuf_iterator<char>(f)),
+                            std::istreambuf_iterator<char>());
+            created = tryPrepareSvg(std::move(raw));
+        }
+    }
+    if (!created) return false;
 
-    /* natural size = LunaSVG intrinsic (viewBox 优先, 否则 width/height 属性)。 */
-    uint32_t natW = static_cast<uint32_t>(doc->width()  + 0.5f);
-    uint32_t natH = static_cast<uint32_t>(doc->height() + 0.5f);
+    uint32_t natW = 1024, natH = 1024;
+    const std::string rootTag = ExtractSvgRootTag_(xml);
+    float viewBoxW = 0.0f, viewBoxH = 0.0f;
+    const bool haveViewBox = ParseSvgViewBoxSize_(rootTag, viewBoxW, viewBoxH);
+    const float cssW = ParseSvgCssPxLength_(ExtractXmlAttr_(rootTag, "width"));
+    const float cssH = ParseSvgCssPxLength_(ExtractXmlAttr_(rootTag, "height"));
+    if (cssW > 0.0f && cssH > 0.0f) {
+        natW = static_cast<uint32_t>(cssW + 0.5f);
+        natH = static_cast<uint32_t>(cssH + 0.5f);
+    } else if (cssW > 0.0f && haveViewBox) {
+        natW = static_cast<uint32_t>(cssW + 0.5f);
+        natH = static_cast<uint32_t>(cssW * viewBoxH / viewBoxW + 0.5f);
+    } else if (cssH > 0.0f && haveViewBox) {
+        natW = static_cast<uint32_t>(cssH * viewBoxW / viewBoxH + 0.5f);
+        natH = static_cast<uint32_t>(cssH + 0.5f);
+    } else if (haveViewBox) {
+        natW = static_cast<uint32_t>(viewBoxW + 0.5f);
+        natH = static_cast<uint32_t>(viewBoxH + 0.5f);
+    }
+    Microsoft::WRL::ComPtr<ID2D1SvgElement> root;
+    if (d2dDoc) d2dDoc->GetRoot(root.GetAddressOf());
+    if (root && !haveViewBox && cssW <= 0.0f && cssH <= 0.0f) {
+        D2D1_SVG_VIEWBOX vb{};
+        if (SUCCEEDED(root->GetAttributeValue(L"viewBox",
+                                              D2D1_SVG_ATTRIBUTE_POD_TYPE_VIEWBOX,
+                                              &vb, sizeof(vb))) &&
+            vb.width > 0.0f && vb.height > 0.0f) {
+            natW = static_cast<uint32_t>(vb.width + 0.5f);
+            natH = static_cast<uint32_t>(vb.height + 0.5f);
+        } else {
+            D2D1_SVG_LENGTH lw{}, lh{};
+            if (SUCCEEDED(root->GetAttributeValue(L"width",
+                                                  D2D1_SVG_ATTRIBUTE_POD_TYPE_LENGTH,
+                                                  &lw, sizeof(lw))) &&
+                lw.value > 0.0f) {
+                natW = static_cast<uint32_t>(lw.value + 0.5f);
+            }
+            if (SUCCEEDED(root->GetAttributeValue(L"height",
+                                                  D2D1_SVG_ATTRIBUTE_POD_TYPE_LENGTH,
+                                                  &lh, sizeof(lh))) &&
+                lh.value > 0.0f) {
+                natH = static_cast<uint32_t>(lh.value + 0.5f);
+            }
+        }
+
+    }
     if (natW == 0) natW = 1024;
     if (natH == 0) natH = 1024;
+    if (root) {
+        const D2D1_SVG_LENGTH ow{static_cast<float>(natW), D2D1_SVG_LENGTH_UNITS_NUMBER};
+        const D2D1_SVG_LENGTH oh{static_cast<float>(natH), D2D1_SVG_LENGTH_UNITS_NUMBER};
+        root->SetAttributeValue(L"width", ow);
+        root->SetAttributeValue(L"height", oh);
+    }
+
+    std::vector<SvgD2DDropShadowLayer> shadowLayers;
+    if (HasSvgFilter_(xml)) {
+        auto* ctx5 = hasImmediateD2D ? r.RT5() : nullptr;
+        for (auto& layerXml : BuildD2DDropShadowLayerXmls_(xml)) {
+            SvgD2DDropShadowLayer layer;
+            layer.dx = layerXml.dx;
+            layer.dy = layerXml.dy;
+            layer.stdDeviation = layerXml.stdDeviation;
+
+            if (ctx5) {
+                Microsoft::WRL::ComPtr<IStream> shadowStream =
+                    CreateStreamFromString_(layerXml.shadowXml);
+                Microsoft::WRL::ComPtr<IStream> coverStream =
+                    CreateStreamFromString_(layerXml.coverXml);
+                if (shadowStream) {
+                    ctx5->CreateSvgDocument(shadowStream.Get(),
+                                            D2D1::SizeF((float)natW, (float)natH),
+                                            layer.shadowDoc.GetAddressOf());
+                }
+                if (coverStream) {
+                    ctx5->CreateSvgDocument(coverStream.Get(),
+                                            D2D1::SizeF((float)natW, (float)natH),
+                                            layer.coverDoc.GetAddressOf());
+                }
+            }
+
+            layer.shadowXml = std::move(layerXml.shadowXml);
+            layer.coverXml = std::move(layerXml.coverXml);
+            shadowLayers.push_back(std::move(layer));
+        }
+    }
+
+    auto doc = lunasvg::Document::loadFromData(xml);
 
     /* 进入 SVG 模式 — 清瓦块 state, 把 natural size 写进 info_ 让 Fit / zoom
      * 几何全部复用瓦块路径的代码. levels = 1 (SVG 不分级). */
     tiles_.clear();
-    preview_.Reset();
+    if (previewResourceKey_.IsValid()) {
+        GlobalResourceStore().Remove(previewResourceKey_);
+        previewResourceKey_ = {};
+    }
     previewW_ = previewH_ = 0;
-    svgRaster_.Reset();              /* 新文件 — 作废旧栅格缓存 */
-    svgRasterW_ = svgRasterH_ = 0;
+    ClearSvgRaster_();               /* 新文件 — 作废旧栅格缓存 */
     svgSlot_ = std::make_shared<SvgRenderSlot>();   /* 新文件 → 新结果槽 */
+    svgRasterMain_ = needsRasterMain;
+    svgThumbXml_ = std::move(thumbXml);
+    if (svgRasterMain_) {
+        svgD2DDoc_.Reset();
+        svgD2DXml_.clear();
+        svgD2DShadowLayers_.clear();
+    } else {
+        svgD2DDoc_ = std::move(d2dDoc);
+        svgD2DXml_ = d2dXml.empty() ? xml : d2dXml;
+        svgD2DShadowLayers_ = std::move(shadowLayers);
+    }
     svgDoc_  = std::move(doc);       /* unique_ptr → shared_ptr */
     svgW_    = natW;
     svgH_    = natH;
@@ -303,8 +2140,6 @@ int GhImgViewWidget::RenderSvgToBgra(uint32_t target_w, uint32_t target_h,
                                        Renderer& r) {
     if (!svgDoc_ || svgW_ == 0 || svgH_ == 0) return -1;
     if (!out_bgra || target_w == 0 || target_h == 0) return -2;
-    (void)r;   /* LunaSVG 纯 CPU 栅格化, 不需要 D2D 渲染器 */
-
     /* fit 保 aspect, 长边贴到 target 边 */
     double src_aspect = (double)svgW_ / (double)svgH_;
     double dst_aspect = (double)target_w / (double)target_h;
@@ -319,131 +2154,156 @@ int GhImgViewWidget::RenderSvgToBgra(uint32_t target_w, uint32_t target_h,
     if (out_w_v == 0) out_w_v = 1;
     if (out_h_v == 0) out_h_v = 1;
 
-    /* LunaSVG 栅格化 (CPU)。premultiplied ARGB32 (BGRA 字节序) = caller 期望的
-     * BGRA premul, 逐行拷出 (stride 可能 > w*4)。 */
-    lunasvg::Bitmap bmp = svgDoc_->renderToBitmap((int)out_w_v, (int)out_h_v,
-                                                  0x00000000u);
-    if (bmp.isNull() || !bmp.data()) return -5;
-    const uint8_t* src    = bmp.data();
-    const int      stride = bmp.stride();
-    const uint32_t bw     = (uint32_t)bmp.width();
-    const uint32_t bh     = (uint32_t)bmp.height();
-    const uint32_t cw     = (bw < out_w_v) ? bw : out_w_v;
-    const uint32_t ch     = (bh < out_h_v) ? bh : out_h_v;
-    memset(out_bgra, 0, (size_t)out_w_v * out_h_v * 4);
-    for (uint32_t y = 0; y < ch; ++y) {
-        memcpy(out_bgra + (size_t)y * out_w_v * 4,
-               src + (size_t)y * stride,
-               (size_t)cw * 4);
+    auto copyBitmap = [&](lunasvg::Bitmap& bmp) -> bool {
+        if (bmp.isNull() || !bmp.data()) return false;
+        const uint8_t* src = bmp.data();
+        const int stride = bmp.stride();
+        const uint32_t bw = static_cast<uint32_t>(bmp.width());
+        const uint32_t bh = static_cast<uint32_t>(bmp.height());
+        const uint32_t cw = (bw < out_w_v) ? bw : out_w_v;
+        const uint32_t ch = (bh < out_h_v) ? bh : out_h_v;
+        if (cw == 0 || ch == 0 || stride <= 0) return false;
+        memset(out_bgra, 0, static_cast<size_t>(out_w_v) * out_h_v * 4u);
+        for (uint32_t y = 0; y < ch; ++y) {
+            memcpy(out_bgra + static_cast<size_t>(y) * out_w_v * 4u,
+                   src + static_cast<size_t>(y) * stride,
+                   static_cast<size_t>(cw) * 4u);
+        }
+        return true;
+    };
+
+    if (!svgRasterMain_ && !svgD2DXml_.empty()) {
+        std::vector<SvgDocumentRef::DropShadowLayer> shadowRefs;
+        shadowRefs.reserve(svgD2DShadowLayers_.size());
+        for (const auto& layer : svgD2DShadowLayers_) {
+            if (layer.shadowXml.empty() || layer.coverXml.empty()) continue;
+            SvgDocumentRef::DropShadowLayer ref;
+            ref.shadow_xml = layer.shadowXml;
+            ref.cover_xml = layer.coverXml;
+            ref.dx = layer.dx;
+            ref.dy = layer.dy;
+            ref.std_deviation = layer.stdDeviation;
+            shadowRefs.push_back(std::move(ref));
+        }
+        if (r.RenderSvgDocumentToBgra(svgD2DXml_, static_cast<float>(svgW_),
+                                      static_cast<float>(svgH_), shadowRefs,
+                                      out_w_v, out_h_v, out_bgra)) {
+            if (out_w) *out_w = out_w_v;
+            if (out_h) *out_h = out_h_v;
+            return 0;
+        }
     }
+
+    if (!svgThumbXml_.empty()) {
+        std::unique_ptr<lunasvg::Document> stripped =
+            lunasvg::Document::loadFromData(svgThumbXml_);
+        if (stripped) {
+            lunasvg::Bitmap bmp = stripped->renderToBitmap(
+                static_cast<int>(out_w_v), static_cast<int>(out_h_v),
+                0x00000000u);
+            if (copyBitmap(bmp)) {
+                if (out_w) *out_w = out_w_v;
+                if (out_h) *out_h = out_h_v;
+                return 0;
+            }
+        }
+    }
+
+    lunasvg::Bitmap bmp = svgDoc_->renderToBitmap(
+        static_cast<int>(out_w_v), static_cast<int>(out_h_v), 0x00000000u);
+    if (!copyBitmap(bmp)) return -5;
 
     if (out_w) *out_w = out_w_v;
     if (out_h) *out_h = out_h_v;
     return 0;
 }
 
-// L173 / core-ui Phase 4: SVG 按当前显示分辨率重栅到 svgRaster_。
-// 关键: 缓存分辨率必须贴近显示分辨率 — 放大过界 (cache < 显示, 会上采糊) 或缩小
-// 过多 (cache > 显示×kReuseMax, 大倍数 downscale 直接缩会锯齿, D2D 无 mipmap 预
-// 滤波) 都要重栅。重栅渲到 显示×kSuper (轻度超采样抗锯齿 + 给邻近缩放档复用余量)。
-void GhImgViewWidget::EnsureSvgRaster(const D2D1_RECT_F& dest, Renderer& r) {
+// L196: SVG 主视图按可见源矩形重栅到 svgRaster_。整图单 bitmap 有固定 cap,
+// 高倍放大文字时必然上采样发糊; 视口重栅让输出尺寸只跟当前窗口/zoom 档有关。
+void GhImgViewWidget::EnsureSvgRaster(float srcL, float srcT, float srcR, float srcB,
+                                      uint32_t renW, uint32_t renH, Renderer& r) {
     if (!svgDoc_ || svgW_ == 0 || svgH_ == 0) return;
-    const float drawW = dest.right - dest.left;
-    const float drawH = dest.bottom - dest.top;
-    if (drawW <= 0.f || drawH <= 0.f) return;
+    SvgRenderSlot::Request req{srcL, srcT, srcR, srcB, renW, renH};
+    std::vector<uint8_t> buf;
+    uint32_t bw = 0, bh = 0;
+    if (!SvgRenderRequestToBgra(svgDoc_, req, buf, bw, bh)) return;
 
-    /* 当前显示尺寸 (设备像素), 封顶兜内存 (保 aspect)。 */
-    const uint32_t kCap = 4096;
-    uint32_t needW = (uint32_t)std::ceil(drawW);
-    uint32_t needH = (uint32_t)std::ceil(drawH);
-    if (needW > kCap || needH > kCap) {
-        const float s = (float)kCap / (float)(needW > needH ? needW : needH);
-        needW = (uint32_t)(needW * s);
-        needH = (uint32_t)(needH * s);
-    }
-    if (needW == 0) needW = 1;
-    if (needH == 0) needH = 1;
-
-    /* 复用窗口: 缓存 ∈ [显示, 显示×1.6]。下限保证不上采 (不糊), 上限把 downscale
-     * 倍数限制在 1.6× 内 (D2D 高质三次插值在此范围内无锯齿; 再大直接缩就走样)。
-     * 落窗内 → 复用; 否则 (放大过界 / 缩小过多) → 重栅到当前显示档。 */
-    if (svgRaster_
-        && svgRasterW_ >= needW && svgRasterW_ <= needW + needW * 6 / 10
-        && svgRasterH_ >= needH && svgRasterH_ <= needH + needH * 6 / 10) {
+    ResourceKey resourceKey = GlobalResourceStore().AddImage(
+        ResourceKind::SvgRaster, imageGeneration_, static_cast<int>(bw),
+        static_cast<int>(bh), static_cast<int>(bw * 4),
+        PixelFormat::BgraPremul, buf.data(), true);
+    auto res = GlobalResourceStore().Acquire(resourceKey);
+    if (!res || !res->bytes) {
+        if (resourceKey.IsValid()) GlobalResourceStore().Remove(resourceKey);
         return;
     }
 
-    /* 渲到 显示×1.3 (轻超采样: 渲得比显示大、缩回去 = supersample AA, 圆角更平滑;
-     * 同时给邻近缩放档留复用余量, 减少重栅频率)。封顶 kCap。 */
-    uint64_t renW = (uint64_t)needW * 13 / 10;
-    uint64_t renH = (uint64_t)needH * 13 / 10;
-    if (renW > kCap || renH > kCap) {
-        const double s = (double)kCap / (double)(renW > renH ? renW : renH);
-        renW = (uint64_t)(renW * s);
-        renH = (uint64_t)(renH * s);
-    }
-    if (renW == 0) renW = 1;
-    if (renH == 0) renH = 1;
-
-    lunasvg::Bitmap bmp = svgDoc_->renderToBitmap((int)renW, (int)renH,
-                                                  0x00000000u);
-    if (bmp.isNull() || !bmp.data()) return;
-    const uint32_t bw = (uint32_t)bmp.width();
-    const uint32_t bh = (uint32_t)bmp.height();
-    if (bw == 0 || bh == 0) return;
-
-    /* LunaSVG premultiplied ARGB32 (BGRA 字节序) = D2D premultiplied BGRA 位图,
-     * 直接拿数据建 D2D 位图 (CreateBitmap 拷贝数据, bmp 之后可析构)。 */
-    auto* rt = r.RT();
-    if (!rt) return;
-    const D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
-        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
-        96.0f, 96.0f);
     Microsoft::WRL::ComPtr<ID2D1Bitmap> bitmap;
-    if (FAILED(rt->CreateBitmap(D2D1::SizeU(bw, bh), bmp.data(),
-                                (UINT32)bmp.stride(), &props, &bitmap))) {
-        return;
+    auto* rt = r.RT();
+    if (rt) {
+        float dpiX = 96.0f, dpiY = 96.0f;
+        rt->GetDpi(&dpiX, &dpiY);
+        const D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+            dpiX, dpiY);
+        rt->CreateBitmap(D2D1::SizeU(bw, bh), res->bytes->data(),
+                         static_cast<UINT32>(res->stride), &props, &bitmap);
     }
+    ClearSvgRaster_();
     svgRaster_  = std::move(bitmap);
+    svgRasterResourceKey_ = resourceKey;
     svgRasterW_ = bw;
     svgRasterH_ = bh;
+    svgRasterSrcL_ = srcL;
+    svgRasterSrcT_ = srcT;
+    svgRasterSrcR_ = srcR;
+    svgRasterSrcB_ = srcB;
 }
 
 // 起 (或更新) 一个后台栅格化请求。非阻塞: 后台线程渲 LunaSVG → BGRA 存进 slot
 // → InvalidateRect 唤醒 UI 线程 (下次 OnDraw 由 ConsumeSvgRasterResult_ 换上)。
 // 线程只碰 slot + 自己持有的 doc/hwnd (shared_ptr 保活), 不碰 this → 析构/换图安全。
 // 渲染期间又改缩放 (want 变) → 渲完再渲最新档 (合并到最后一次), inFlight 保证单线程。
-void GhImgViewWidget::RequestSvgRasterAsync_(uint32_t renW, uint32_t renH,
+void GhImgViewWidget::RequestSvgRasterAsync_(float srcL, float srcT,
+                                             float srcR, float srcB,
+                                             uint32_t renW, uint32_t renH,
                                              unsigned long uiThreadId) {
     auto slot = svgSlot_;
     auto doc  = svgDoc_;
-    if (!slot || !doc || renW == 0 || renH == 0) return;
-    slot->wantW.store(renW);
-    slot->wantH.store(renH);
+    SvgRenderSlot::Request req{srcL, srcT, srcR, srcB, renW, renH};
+    if (!slot || !doc || !SvgReqValid(req)) return;
+    {
+        std::lock_guard<std::mutex> lk(slot->mu);
+        slot->wantReq = req;
+    }
     bool expected = false;
     if (!slot->inFlight.compare_exchange_strong(expected, true))
         return;   /* 已有后台线程在渲, 它渲完会看 want 再渲最新 */
 
     std::thread([slot, doc, uiThreadId]() {
         for (;;) {
-            const uint32_t w = slot->wantW.load();
-            const uint32_t h = slot->wantH.load();
-            lunasvg::Bitmap bmp = doc->renderToBitmap((int)w, (int)h, 0x00000000u);
-            if (!bmp.isNull() && bmp.data()) {
-                const uint32_t bw = static_cast<uint32_t>(bmp.width());
-                const uint32_t bh = static_cast<uint32_t>(bmp.height());
-                const int stride  = bmp.stride();
-                const uint8_t* src = bmp.data();
-                std::vector<uint8_t> buf(static_cast<size_t>(bw) * bh * 4);
-                for (uint32_t y = 0; y < bh; ++y)
-                    memcpy(buf.data() + static_cast<size_t>(y) * bw * 4,
-                           src + static_cast<size_t>(y) * stride,
-                           static_cast<size_t>(bw) * 4);
-                {
-                    std::lock_guard<std::mutex> lk(slot->mu);
+            SvgRenderSlot::Request req;
+            {
+                std::lock_guard<std::mutex> lk(slot->mu);
+                req = slot->wantReq;
+            }
+            std::vector<uint8_t> buf;
+            uint32_t bw = 0, bh = 0;
+            const bool rendered = SvgRenderRequestToBgra(doc, req, buf, bw, bh);
+            bool publish = false;
+            bool done = false;
+            {
+                std::lock_guard<std::mutex> lk(slot->mu);
+                done = SvgReqSame(slot->wantReq, req);
+                if (rendered && done) {
                     slot->bgra.swap(buf);
+                    slot->readyReq = req;
                     slot->w = bw; slot->h = bh; slot->ready = true;
+                    publish = true;
                 }
+                if (done) slot->inFlight.store(false);
+            }
+            if (publish) {
                 /* 跨线程唤醒 UI 重绘 (InvalidateRect 线程安全; 同
                  * InvalidateAllWindows 的按线程枚举窗口模式)。 */
                 EnumThreadWindows(uiThreadId, [](HWND hwnd, LPARAM) -> BOOL {
@@ -455,47 +2315,77 @@ void GhImgViewWidget::RequestSvgRasterAsync_(uint32_t renW, uint32_t renH,
                 }, 0);
             }
             /* 期间又改了缩放 → 渲最新; 否则收工。 */
-            if (slot->wantW.load() == w && slot->wantH.load() == h) {
-                slot->inFlight.store(false);
+            if (done) {
                 break;
             }
         }
     }).detach();
 }
 
-// UI 线程: 后台结果就绪则把 BGRA 建成 D2D 位图换上 svgRaster_ (D2D 单线程, 必须
-// 在 UI 线程建)。
+// UI 线程: 后台结果就绪则写入 CPU SvgRaster resource, 并在有 RT 时建 D2D 缓存。
 void GhImgViewWidget::ConsumeSvgRasterResult_(Renderer& r) {
     if (!svgSlot_) return;
     std::vector<uint8_t> buf;
     uint32_t bw = 0, bh = 0;
+    SvgRenderSlot::Request req;
     {
         std::lock_guard<std::mutex> lk(svgSlot_->mu);
         if (!svgSlot_->ready) return;
         buf.swap(svgSlot_->bgra);
+        req = svgSlot_->readyReq;
         bw = svgSlot_->w; bh = svgSlot_->h;
         svgSlot_->ready = false;
     }
-    if (bw == 0 || bh == 0 || buf.size() < static_cast<size_t>(bw) * bh * 4) return;
-    auto* rt = r.RT();
-    if (!rt) return;
-    const D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
-        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
-        96.0f, 96.0f);
-    Microsoft::WRL::ComPtr<ID2D1Bitmap> bitmap;
-    if (FAILED(rt->CreateBitmap(D2D1::SizeU(bw, bh), buf.data(), bw * 4, &props, &bitmap)))
+    if (!SvgReqValid(req) || bw == 0 || bh == 0 ||
+        buf.size() < static_cast<size_t>(bw) * bh * 4) return;
+
+    ResourceKey resourceKey = GlobalResourceStore().AddImage(
+        ResourceKind::SvgRaster, imageGeneration_, static_cast<int>(bw),
+        static_cast<int>(bh), static_cast<int>(bw * 4),
+        PixelFormat::BgraPremul, buf.data(), true);
+    auto res = GlobalResourceStore().Acquire(resourceKey);
+    if (!res || !res->bytes) {
+        if (resourceKey.IsValid()) GlobalResourceStore().Remove(resourceKey);
         return;
+    }
+
+    Microsoft::WRL::ComPtr<ID2D1Bitmap> bitmap;
+    auto* rt = r.RT();
+    if (rt) {
+        float dpiX = 96.0f, dpiY = 96.0f;
+        rt->GetDpi(&dpiX, &dpiY);
+        const D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+            dpiX, dpiY);
+        rt->CreateBitmap(D2D1::SizeU(bw, bh), res->bytes->data(),
+                         static_cast<UINT32>(res->stride), &props, &bitmap);
+    }
+    ClearSvgRaster_();
     svgRaster_  = std::move(bitmap);
+    svgRasterResourceKey_ = resourceKey;
     svgRasterW_ = bw;
     svgRasterH_ = bh;
+    svgRasterSrcL_ = req.srcL;
+    svgRasterSrcT_ = req.srcT;
+    svgRasterSrcR_ = req.srcR;
+    svgRasterSrcB_ = req.srcB;
+}
+
+void GhImgViewWidget::ClearSvgRaster_() {
+    if (svgRasterResourceKey_.IsValid()) {
+        GlobalResourceStore().Remove(svgRasterResourceKey_);
+        svgRasterResourceKey_ = {};
+    }
+    svgRaster_.Reset();
+    svgRasterW_ = svgRasterH_ = 0;
+    svgRasterSrcL_ = svgRasterSrcT_ = svgRasterSrcR_ = svgRasterSrcB_ = 0.0f;
 }
 
 void GhImgViewWidget::SetActiveLevel(uint32_t level) {
     if (level >= info_.levels) return;
     SwitchLevel(level);
     autoLevel_ = false;
-    NotifyViewport();
-    InvalidateAllWindows();
+    RequestViewportCommit();
 }
 
 // ===== 视口 =====
@@ -503,11 +2393,17 @@ void GhImgViewWidget::SetActiveLevel(uint32_t level) {
 void GhImgViewWidget::SetZoom(float z) {
     z = std::clamp(z, minZoom_, maxZoom_);
     if (zoom_ == z) return;
+    {
+        TraceEvent("gh_img_view", "set_zoom",
+                   {TraceF64("old", zoom_),
+                    TraceF64("new", z),
+                    TraceI64("depth", viewUpdateDepth_)});
+    }
     zoom_ = z;
     if (autoLevel_) SwitchLevel(PickAutoLevel());
     ConstrainPan();
-    NotifyViewport();
-    InvalidateAllWindows();
+    InvalidateSvgRenderSlot_(svgSlot_);
+    RequestViewportCommit();
 }
 
 /* L47 follow-up: 之前 SetPan 是 .h inline 单纯赋值 panX_/Y_, 没 fire
@@ -522,11 +2418,19 @@ void GhImgViewWidget::SetZoom(float z) {
  * (例如 minimap drag 时连续 set_pan), 避免无效 callback. */
 void GhImgViewWidget::SetPan(float x, float y) {
     if (panX_ == x && panY_ == y) return;
+    {
+        TraceEvent("gh_img_view", "set_pan",
+                   {TraceF64("old_x", panX_),
+                    TraceF64("old_y", panY_),
+                    TraceF64("new_x", x),
+                    TraceF64("new_y", y),
+                    TraceI64("depth", viewUpdateDepth_)});
+    }
     panX_ = x;
     panY_ = y;
     ConstrainPan();
-    NotifyViewport();
-    InvalidateAllWindows();
+    InvalidateSvgRenderSlot_(svgSlot_);
+    RequestViewportCommit();
 }
 
 void GhImgViewWidget::SetZoomAround(float z, float anchorX, float anchorY) {
@@ -563,8 +2467,8 @@ void GhImgViewWidget::SetZoomAround(float z, float anchorX, float anchorY) {
     panY_ = anchorY - cy - ry;
 
     ConstrainPan();
-    NotifyViewport();
-    InvalidateAllWindows();
+    InvalidateSvgRenderSlot_(svgSlot_);
+    RequestViewportCommit();
 }
 
 void GhImgViewWidget::Fit() {
@@ -580,8 +2484,8 @@ void GhImgViewWidget::Fit() {
     zoom_ = std::clamp(zoom_, minZoom_, maxZoom_);
     panX_ = 0; panY_ = 0;
     if (autoLevel_) SwitchLevel(PickAutoLevel());
-    NotifyViewport();
-    InvalidateAllWindows();
+    InvalidateSvgRenderSlot_(svgSlot_);
+    RequestViewportCommit();
 }
 
 void GhImgViewWidget::SetRotation(int angle) {
@@ -590,21 +2494,31 @@ void GhImgViewWidget::SetRotation(int angle) {
     rotation_ = n;
     // pan / zoom 都保留 (用户预期: 旋转不丢视图状态). pan 在屏幕空间, 跟
     // rotation 解耦, 不需要旋转 pan 向量 — 详见类注释.
-    NotifyViewport();
-    InvalidateAllWindows();
+    InvalidateSvgRenderSlot_(svgSlot_);
+    RequestViewportCommit();
 }
 
 void GhImgViewWidget::Reset() {
     zoom_ = 1.0f;
     panX_ = 0; panY_ = 0;
     if (autoLevel_) SwitchLevel(PickAutoLevel());
-    NotifyViewport();
-    InvalidateAllWindows();
+    InvalidateSvgRenderSlot_(svgSlot_);
+    RequestViewportCommit();
 }
 
 // ===== Widget 虚函数 =====
 
 void GhImgViewWidget::OnDraw(Renderer& r) {
+    {
+        TraceEvent("gh_img_view", "on_draw",
+                   {TraceF64("l", rect.left),
+                    TraceF64("t", rect.top),
+                    TraceF64("r", rect.right),
+                    TraceF64("b", rect.bottom),
+                    TraceF64("zoom", zoom_),
+                    TraceF64("pan_x", panX_),
+                    TraceF64("pan_y", panY_)});
+    }
     // 画布底色 (旋转不影响, 永远填满 widget rect)
     r.FillRect(rect, bgColor);
 
@@ -618,7 +2532,12 @@ void GhImgViewWidget::OnDraw(Renderer& r) {
         rect.top    != lastNotifiedRect_.top    ||
         rect.right  != lastNotifiedRect_.right  ||
         rect.bottom != lastNotifiedRect_.bottom) {
-        NotifyViewport();   // 内部 set lastNotifiedRect_ = rect 防重 fire
+        if (viewUpdateDepth_ > 0) {
+            pendingViewportNotify_ = true;
+            TraceEvent("gh_img_view", "draw_viewport_deferred");
+        } else {
+            NotifyViewport();   // 内部 set lastNotifiedRect_ = rect 防重 fire
+        }
     }
 
     // 视觉 AABB (rotation 应用后的可见框) 做早期剔除. logical dest 给 tile
@@ -633,72 +2552,243 @@ void GhImgViewWidget::OnDraw(Renderer& r) {
 
     r.PushClip(rect);
 
-    /* L173 / core-ui Phase 4: SVG 模式 — LunaSVG 按当前显示分辨率栅格化到
-     * svgRaster_ 缓存位图, 走和普通图一样的 DrawBitmap 路径 (统一)。放大过界
-     * 才重栅 (任意缩放档清晰), 平移用缓存零成本。rotation 跟瓦块路径同款: 绕
-     * dest 中心的 transform + logical dest 内 DrawBitmap。 */
+    /* SVG 模式: 主视图优先 D2D SvgDocument 直绘, 避免线框图在默认缩放下
+     * 先栅格化再采样导致发虚。D2D 不可用或创建失败时再走下方 LunaSVG
+     * 视口栅格缓存路径。 */
+    if (svgD2DDoc_ || !svgD2DXml_.empty()) {
+        float dcx = (dest.left + dest.right ) * 0.5f;
+        float dcy = (dest.top  + dest.bottom) * 0.5f;
+        D2D1_MATRIX_3X2_F xf =
+            D2D1::Matrix3x2F::Scale(zoom_, zoom_) *
+            D2D1::Matrix3x2F::Translation(dest.left, dest.top);
+        if (rotation_ != 0) {
+            xf = xf * D2D1::Matrix3x2F::Rotation((float)rotation_,
+                                                 D2D1::Point2F(dcx, dcy));
+        }
+        bool recordedSvgDocument = false;
+        if (!svgD2DXml_.empty() && r.IsRecordingDisplayList()) {
+            std::vector<SvgDocumentRef::DropShadowLayer> shadowRefs;
+            shadowRefs.reserve(svgD2DShadowLayers_.size());
+            for (const auto& layer : svgD2DShadowLayers_) {
+                if (layer.shadowXml.empty() || layer.coverXml.empty()) continue;
+                SvgDocumentRef::DropShadowLayer ref;
+                ref.shadow_xml = layer.shadowXml;
+                ref.cover_xml = layer.coverXml;
+                ref.dx = layer.dx;
+                ref.dy = layer.dy;
+                ref.std_deviation = layer.stdDeviation;
+                shadowRefs.push_back(std::move(ref));
+            }
+            r.RecordSvgDocument(svgD2DXml_, (float)svgW_, (float)svgH_, xf,
+                                std::move(shadowRefs));
+            recordedSvgDocument = true;
+        }
+
+        if (auto* ctx5 = r.RT5()) {
+            if (!svgD2DDoc_ && !svgD2DXml_.empty()) {
+                r.CreateSvgDocumentFromXml(svgD2DXml_, (float)svgW_, (float)svgH_,
+                                           &svgD2DDoc_);
+            }
+            if (!svgD2DDoc_) {
+                if (recordedSvgDocument) {
+                    r.PopClip();
+                    return;
+                }
+            } else {
+                D2D1_MATRIX_3X2_F oldXf;
+                ctx5->GetTransform(&oldXf);
+                D2D1_MATRIX_3X2_F svgXf = xf * oldXf;
+                xf = svgXf;
+                ctx5->SetTransform(xf);
+                svgD2DDoc_->SetViewportSize(D2D1::SizeF((float)svgW_, (float)svgH_));
+                ctx5->DrawSvgDocument(svgD2DDoc_.Get());
+
+                for (auto& layer : svgD2DShadowLayers_) {
+                    if (!layer.shadowDoc && !layer.shadowXml.empty()) {
+                        r.CreateSvgDocumentFromXml(layer.shadowXml, (float)svgW_, (float)svgH_,
+                                                   &layer.shadowDoc);
+                    }
+                    if (!layer.coverDoc && !layer.coverXml.empty()) {
+                        r.CreateSvgDocumentFromXml(layer.coverXml, (float)svgW_, (float)svgH_,
+                                                   &layer.coverDoc);
+                    }
+                    if (!layer.shadowDoc || !layer.coverDoc) continue;
+                    Microsoft::WRL::ComPtr<ID2D1CommandList> shadowList;
+                    if (SUCCEEDED(ctx5->CreateCommandList(shadowList.GetAddressOf()))) {
+                        Microsoft::WRL::ComPtr<ID2D1Image> oldTarget;
+                        ctx5->GetTarget(&oldTarget);
+                        ctx5->SetTarget(shadowList.Get());
+                        ctx5->SetTransform(D2D1::Matrix3x2F::Identity());
+                        ctx5->Clear(D2D1::ColorF(0, 0, 0, 0));
+                        layer.shadowDoc->SetViewportSize(D2D1::SizeF((float)svgW_,
+                                                                     (float)svgH_));
+                        ctx5->DrawSvgDocument(layer.shadowDoc.Get());
+                        ctx5->SetTarget(oldTarget.Get());
+                        if (SUCCEEDED(shadowList->Close())) {
+                            Microsoft::WRL::ComPtr<ID2D1Effect> blur;
+                            if (SUCCEEDED(ctx5->CreateEffect(CLSID_D2D1GaussianBlur,
+                                                            blur.GetAddressOf()))) {
+                                blur->SetInput(0, shadowList.Get());
+                                blur->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
+                                               layer.stdDeviation);
+                                blur->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE,
+                                               D2D1_BORDER_MODE_SOFT);
+                                D2D1_MATRIX_3X2_F shadowXf =
+                                    D2D1::Matrix3x2F::Translation(layer.dx, layer.dy) *
+                                    svgXf;
+                                ctx5->SetTransform(shadowXf);
+                                ctx5->DrawImage(blur.Get(), D2D1::Point2F(0, 0),
+                                                D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+                                ctx5->SetTransform(svgXf);
+                                layer.coverDoc->SetViewportSize(
+                                    D2D1::SizeF((float)svgW_, (float)svgH_));
+                                ctx5->DrawSvgDocument(layer.coverDoc.Get());
+                            }
+                        }
+                    }
+                }
+                ctx5->SetTransform(oldXf);
+                r.PopClip();
+                return;
+            }
+        }
+        if (recordedSvgDocument) {
+            r.PopClip();
+            return;
+        }
+    }
+
     if (svgDoc_) {
         /* 后台栅格化: UI 线程只画缓存位图, 永不阻塞输入。
          *  1) 先消费后台已渲好的结果 (若有) → 换上 svgRaster_。
-         *  2) 算当前显示需要的分辨率 + 复用窗口 [显示, 显示×1.6]。落窗内 → 直接画。
-         *  3) 出窗: 没缓存 (首帧) 同步渲一张 (load 一次性); 否则丢后台渲 (非阻塞),
-         *     渲好前继续画旧缓存 (略软), 渲完 InvalidateRect → 下帧换上。 */
+         *  2) 反算当前 widget 覆盖的 SVG 源坐标, 加 overscan, 只渲视口块。
+         *  3) 已有缓存覆盖当前可见区且像素密度匹配 → 直接画; 否则后台渲最新块。
+         *     没缓存时同步渲首块, 避免 SVG 首帧空白。 */
         ConsumeSvgRasterResult_(r);
 
-        const float drawW = dest.right - dest.left;
-        const float drawH = dest.bottom - dest.top;
-        if (drawW > 0.f && drawH > 0.f) {
-            const uint32_t kCap = 4096;
-            uint32_t needW = (uint32_t)std::ceil(drawW);
-            uint32_t needH = (uint32_t)std::ceil(drawH);
-            if (needW > kCap || needH > kCap) {
-                const float s = (float)kCap / (float)(needW > needH ? needW : needH);
-                needW = (uint32_t)(needW * s);
-                needH = (uint32_t)(needH * s);
+        float ix[4], iy[4];
+        ScreenToImage(rect.left,  rect.top,    ix[0], iy[0]);
+        ScreenToImage(rect.right, rect.top,    ix[1], iy[1]);
+        ScreenToImage(rect.right, rect.bottom, ix[2], iy[2]);
+        ScreenToImage(rect.left,  rect.bottom, ix[3], iy[3]);
+
+        float visL = std::min(std::min(ix[0], ix[1]), std::min(ix[2], ix[3]));
+        float visR = std::max(std::max(ix[0], ix[1]), std::max(ix[2], ix[3]));
+        float visT = std::min(std::min(iy[0], iy[1]), std::min(iy[2], iy[3]));
+        float visB = std::max(std::max(iy[0], iy[1]), std::max(iy[2], iy[3]));
+        visL = std::clamp(visL, 0.0f, static_cast<float>(svgW_));
+        visR = std::clamp(visR, 0.0f, static_cast<float>(svgW_));
+        visT = std::clamp(visT, 0.0f, static_cast<float>(svgH_));
+        visB = std::clamp(visB, 0.0f, static_cast<float>(svgH_));
+
+        if (visR > visL && visB > visT) {
+            const float z = (zoom_ > 1e-6f) ? zoom_ : 1e-6f;
+            const float padX = std::max((visR - visL) * 0.35f, 8.0f / z);
+            const float padY = std::max((visB - visT) * 0.35f, 8.0f / z);
+            float reqL = std::clamp(visL - padX, 0.0f, static_cast<float>(svgW_));
+            float reqR = std::clamp(visR + padX, 0.0f, static_cast<float>(svgW_));
+            float reqT = std::clamp(visT - padY, 0.0f, static_cast<float>(svgH_));
+            float reqB = std::clamp(visB + padY, 0.0f, static_cast<float>(svgH_));
+            if (reqR <= reqL) reqR = std::min(static_cast<float>(svgW_), reqL + 1.0f);
+            if (reqB <= reqT) reqB = std::min(static_cast<float>(svgH_), reqT + 1.0f);
+
+            float rasterScale = z * std::max(dpi_scale_, 1.0f);
+            if (svgRasterMain_) {
+                /* 含滤镜 SVG 会走 LunaSVG 栅格主路径。小图标如果只按原始
+                 * 200/300px 或 512px 栅格化, 圆形边缘会比 D2D 矢量路径更容易显
+                 * 锯齿; 给滤镜主路径一个更高的超采样底线, 再由 D2D 高质量下采样。 */
+                constexpr float kFilteredSmallSvgRasterLongEdge = 1024.0f;
+                const uint32_t svgLongEdge = std::max(svgW_, svgH_);
+                if (svgLongEdge > 0 &&
+                    svgLongEdge < static_cast<uint32_t>(kFilteredSmallSvgRasterLongEdge)) {
+                    rasterScale = std::max(
+                        rasterScale,
+                        kFilteredSmallSvgRasterLongEdge / static_cast<float>(svgLongEdge));
+                }
+                /* 内嵌位图 SVG 的真实细节上限来自包内 PNG/JPG。极端 zoom 时继续把
+                 * LunaSVG matrix scale 拉高只会触发 plutovg 的大比例栅格风险; 超过
+                 * 16 px/SVG-unit 后交给 D2D 位图采样放大。纯矢量主路径仍走 D2D。 */
+                rasterScale = std::min(rasterScale, 16.0f);
+            } else {
+                const uint32_t svgLongEdge = std::max(svgW_, svgH_);
+                constexpr float kSmallSvgRasterLongEdge = 512.0f;
+                if (svgLongEdge > 0 &&
+                    svgLongEdge < static_cast<uint32_t>(kSmallSvgRasterLongEdge)) {
+                    rasterScale = std::max(
+                        rasterScale,
+                        kSmallSvgRasterLongEdge / static_cast<float>(svgLongEdge));
+                }
             }
-            if (needW == 0) needW = 1;
-            if (needH == 0) needH = 1;
-            const bool inWindow = svgRaster_
-                && svgRasterW_ >= needW && svgRasterW_ <= needW + needW * 6 / 10
-                && svgRasterH_ >= needH && svgRasterH_ <= needH + needH * 6 / 10;
-            if (!inWindow) {
-                if (!svgRaster_) {
-                    EnsureSvgRaster(dest, r);   /* 首帧同步 (load 一次性, 非缩放热路径) */
+
+            uint32_t renW = static_cast<uint32_t>(std::ceil((reqR - reqL) * rasterScale));
+            uint32_t renH = static_cast<uint32_t>(std::ceil((reqB - reqT) * rasterScale));
+            const uint32_t kViewportCap = 8192;
+            if (renW > kViewportCap || renH > kViewportCap) {
+                const double s = static_cast<double>(kViewportCap) /
+                    static_cast<double>(renW > renH ? renW : renH);
+                renW = static_cast<uint32_t>(std::max(1.0, std::floor(renW * s)));
+                renH = static_cast<uint32_t>(std::max(1.0, std::floor(renH * s)));
+            }
+            if (renW == 0) renW = 1;
+            if (renH == 0) renH = 1;
+
+            const float targetScaleX = renW / (reqR - reqL);
+            const float targetScaleY = renH / (reqB - reqT);
+            const bool hasRaster = svgRaster_ || svgRasterResourceKey_.IsValid();
+            const bool coversVisible = hasRaster &&
+                svgRasterSrcL_ <= visL + 0.5f &&
+                svgRasterSrcT_ <= visT + 0.5f &&
+                svgRasterSrcR_ >= visR - 0.5f &&
+                svgRasterSrcB_ >= visB - 0.5f;
+            bool scaleOk = false;
+            if (coversVisible) {
+                const float cw = svgRasterSrcR_ - svgRasterSrcL_;
+                const float ch = svgRasterSrcB_ - svgRasterSrcT_;
+                if (cw > 0.0f && ch > 0.0f) {
+                    const float cachedScaleX = svgRasterW_ / cw;
+                    const float cachedScaleY = svgRasterH_ / ch;
+                    scaleOk = cachedScaleX >= targetScaleX * 0.92f &&
+                              cachedScaleX <= targetScaleX * 1.35f &&
+                              cachedScaleY >= targetScaleY * 0.92f &&
+                              cachedScaleY <= targetScaleY * 1.35f;
+                }
+            }
+            if (!coversVisible || !scaleOk) {
+                if (!hasRaster) {
+                    EnsureSvgRaster(reqL, reqT, reqR, reqB, renW, renH, r);
                 } else {
-                    uint64_t renW = (uint64_t)needW * 13 / 10;
-                    uint64_t renH = (uint64_t)needH * 13 / 10;
-                    if (renW > kCap || renH > kCap) {
-                        const double s = (double)kCap / (double)(renW > renH ? renW : renH);
-                        renW = (uint64_t)(renW * s);
-                        renH = (uint64_t)(renH * s);
-                    }
-                    if (renW == 0) renW = 1;
-                    if (renH == 0) renH = 1;
-                    RequestSvgRasterAsync_((uint32_t)renW, (uint32_t)renH,
+                    RequestSvgRasterAsync_(reqL, reqT, reqR, reqB, renW, renH,
                                            GetCurrentThreadId());
                 }
             }
         }
-        if (svgRaster_) {
-            D2D1_MATRIX_3X2_F oldXf;
+        if (svgRaster_ || svgRasterResourceKey_.IsValid()) {
             bool rotated = (rotation_ != 0);
             if (rotated) {
-                auto* rt = r.RT();
-                rt->GetTransform(&oldXf);
                 float dcx = (dest.left + dest.right ) * 0.5f;
                 float dcy = (dest.top  + dest.bottom) * 0.5f;
-                auto xf = D2D1::Matrix3x2F::Rotation((float)rotation_,
-                                                     D2D1::Point2F(dcx, dcy)) * oldXf;
-                rt->SetTransform(xf);
+                r.PushTransform(D2D1::Matrix3x2F::Rotation(
+                    (float)rotation_, D2D1::Point2F(dcx, dcy)));
             }
-            auto ps = svgRaster_->GetPixelSize();
-            float pscale = ps.width > 0
-                ? (dest.right - dest.left) / (float)ps.width : 1.0f;
-            auto interp = (!antialias_ && pscale >= 1.0f)
+            const float dpr = dpi_scale_ > 1e-3f ? dpi_scale_ : 1.0f;
+            auto snapDev = [&](float v) { return std::round(v * dpr) / dpr; };
+            D2D1_RECT_F rasterDest{
+                snapDev(dest.left + svgRasterSrcL_ * zoom_),
+                snapDev(dest.top  + svgRasterSrcT_ * zoom_),
+                snapDev(dest.left + svgRasterSrcR_ * zoom_),
+                snapDev(dest.top  + svgRasterSrcB_ * zoom_),
+            };
+            const float pixelW = svgRasterW_ > 0 ? static_cast<float>(svgRasterW_) : 1.0f;
+            float pscale = pixelW > 0
+                ? (rasterDest.right - rasterDest.left) * dpr / pixelW
+                : 1.0f;
+            auto interp = (pscale > 0.98f && pscale < 1.02f)
+                ? D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+                : (!antialias_ && pscale >= 1.0f)
                 ? D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR
                 : PickInterp(pscale);
-            r.DrawBitmapHQ(svgRaster_.Get(), dest, 1.0f, interp);
-            if (rotated) r.RT()->SetTransform(oldXf);
+            r.DrawImageResource(svgRasterResourceKey_, rasterDest, SamplingForInterp(interp));
+            if (rotated) r.PopTransform();
         }
         r.PopClip();
         return;
@@ -707,46 +2797,44 @@ void GhImgViewWidget::OnDraw(Renderer& r) {
     // rotation != 0: 套一层绕 dest 中心的旋转 transform. 内部 DrawBitmap 仍
     // 用 logical dest, D2D 会把 bitmap 围着中心旋转, 视觉 AABB 自然变成
     // effW×effH×zoom. rotation == 0 时跳过 GetTransform/SetTransform 开销.
-    D2D1_MATRIX_3X2_F oldXf;
     bool rotated = (rotation_ != 0);
     if (rotated) {
-        auto* rt = r.RT();
-        rt->GetTransform(&oldXf);
         float dcx = (dest.left + dest.right ) * 0.5f;
         float dcy = (dest.top  + dest.bottom) * 0.5f;
         auto xf = D2D1::Matrix3x2F::Rotation((float)rotation_,
-                                              D2D1::Point2F(dcx, dcy)) * oldXf;
-        rt->SetTransform(xf);
+                                              D2D1::Point2F(dcx, dcy));
+        r.PushTransform(xf);
     }
 
     // 1) preview 兜底（最粗，永远先画）
     // Interpolation 走 PickInterp: 大幅下采 (zoom < 0.5) 退 HQ_LINEAR 避免
     // CUBIC negative-lobe 在高对比边缘振铃出色边. 适度缩放 / 上采保持
     // HQ_CUBIC 的锐度优势.
-    if (preview_) {
-        auto ps = preview_->GetPixelSize();
-        float pscale = ps.width > 0
-            ? (dest.right - dest.left) / static_cast<float>(ps.width)
+    if (previewResourceKey_.IsValid()) {
+        float pscale = previewW_ > 0
+            ? (dest.right - dest.left) / static_cast<float>(previewW_)
             : 1.0f;
         // antialias_=false 且上采 (pscale >= 1) → NEAREST 像素清晰; 否则平滑.
         auto pinterp = (!antialias_ && pscale >= 1.0f)
             ? D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR
             : PickInterp(pscale);
-        r.DrawBitmapHQ(preview_.Get(), dest, 1.0f, pinterp);
+        r.DrawImageResource(previewResourceKey_, dest, SamplingForInterp(pinterp));
     }
 
     // 2) 多级金字塔：从最粗到最细，每级把已加载的可见瓦块画上去。
     //    后画的覆盖先画的 → active level（最细）压在最上面，旧级在下兜底。
     //    切级瞬间新级瓦块还没全到时，已有的旧级仍盖在 preview 之上 —— 无缝过渡。
     if (info_.levels > 0) {
-        for (int lvl = (int)info_.levels - 1; lvl >= 0; --lvl) {
+        // 只画 活动层 + 比它更低清的层 (lvl >= active) —— 低清层在活动层瓦块未到达时
+        // 画在其【下方】兜底 gap。不画比活动层【更高清】的残留层 (lvl < active, 如放大
+        // 后保留的 L0): 它们在当前缩放下要大幅缩小, 画在最上层会 ring/锯齿/糊
+        // (放大→缩小后文字发硬、部分区域看着"坏了"就是这个高清残留层盖在上面)。
+        for (int lvl = (int)info_.levels - 1; lvl >= (int)activeLevel_; --lvl) {
             DrawLevel(r, (uint32_t)lvl, dest);
         }
     }
 
-    if (rotated) {
-        r.RT()->SetTransform(oldXf);
-    }
+    if (rotated) r.PopTransform();
 
     r.PopClip();
 }
@@ -760,8 +2848,11 @@ void GhImgViewWidget::DrawLevel(Renderer& r, uint32_t level, const D2D1_RECT_F& 
     uint32_t txMax = (lw + ts - 1) / ts;
     uint32_t tyMax = (lh + ts - 1) / ts;
 
-    float scale = LevelToScreenScale(level) * zoom_;
-    if (scale <= 1e-6f) return;
+    // L194: 分轴 scale。极端宽高比图 (超长/超宽) 在 coarse level 宽比≠高比,
+    // 用单一 (宽) scale 缩 Y 会让该级溢出 dest 底边 → X 用 scaleX, Y 用 scaleY。
+    float scaleX = LevelToScreenScale (level) * zoom_;
+    float scaleY = LevelToScreenScaleY(level) * zoom_;
+    if (scaleX <= 1e-6f || scaleY <= 1e-6f) return;
 
     // 可见瓦块范围 — rotation-aware: widget rect 4 角通过反旋转回 logical
     // 空间, 取 AABB, 再换算到 level 像素. rotation=0 时退化为旧路径
@@ -775,8 +2866,8 @@ void GhImgViewWidget::DrawLevel(Renderer& r, uint32_t level, const D2D1_RECT_F& 
         float dy = sy - dcy;
         float rdx, rdy;
         RotateCCW(rotation_, dx, dy, rdx, rdy);
-        lx = (dcx + rdx - destLeft) / scale;
-        ly = (dcy + rdy - destTop ) / scale;
+        lx = (dcx + rdx - destLeft) / scaleX;
+        ly = (dcy + rdy - destTop ) / scaleY;
     };
     float lx[4], ly[4];
     cornerToLevel(rect.left,  rect.top,    lx[0], ly[0]);
@@ -797,95 +2888,24 @@ void GhImgViewWidget::DrawLevel(Renderer& r, uint32_t level, const D2D1_RECT_F& 
     // 出色边. 适度缩放 / 上采保持 HQ_CUBIC. scale 局部变量已是 screen-per-
     // source-px, 见上面 LevelToScreenScale * zoom_.
     // antialias_=false 且上采 (scale >= 1) → NEAREST 像素清晰; 否则平滑.
-    auto interp = (!antialias_ && scale >= 1.0f)
+    auto interp = (!antialias_ && scaleX >= 1.0f)
         ? D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR
-        : PickInterp(scale);
+        : PickInterp(scaleX);   // X/Y scale 差 <5%, interp 判定用 scaleX 即可
+    const ImageSampling sampling = SamplingForInterp(interp);
     // snap 屏幕坐标到整数【设备像素】(dest rect 是 DIP, ctx 按 dpi_scale_ 缩到设备).
     const float dpr = dpi_scale_ > 1e-3f ? dpi_scale_ : 1.0f;
     auto snapDev = [dpr](float v) { return std::round(v * dpr) / dpr; };
 
-    // L105: 把本级可见瓦块先 1:1 精确拼到一张【连续】离屏位图(无内部瓦块边界),
-    // 再整体 device-snap + 缩放一次上屏。非整数缩放下逐块直绘会出两类半透明缝:
-    //   ① 分数设备像素部分覆盖(相邻块共享边界总覆盖<100%, 透背景);
-    //   ② 每块独立插值在瓦块边缘钳位 → 插值梯度不连续。
-    // 拼成连续位图后, 缩放时 CUBIC/LINEAR 跨越原瓦块边界连续采样 → 两类缝全消。
-    ID2D1DeviceContext5* ctx5 = r.RT5();
-    const uint32_t bx0 = (uint32_t)tx0 * ts;
-    const uint32_t by0 = (uint32_t)ty0 * ts;
-    const uint32_t bw  = std::min(lw - bx0, (uint32_t)(tx1 - tx0) * ts);
-    const uint32_t bh  = std::min(lh - by0, (uint32_t)(ty1 - ty0) * ts);
-    constexpr uint32_t kMaxComposite = 4096;   // bbox 超此则退逐块直绘(安全阀)
-    bool composited = false;
-
-    if (ctx5 && bw > 0 && bh > 0 && bw <= kMaxComposite && bh <= kMaxComposite) {
-        if (!composite_ || compositeW_ < bw || compositeH_ < bh) {
-            uint32_t nw = std::max(bw, compositeW_);
-            uint32_t nh = std::max(bh, compositeH_);
-            D2D1_BITMAP_PROPERTIES1 bp = {};
-            bp.pixelFormat = D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
-                                                D2D1_ALPHA_MODE_PREMULTIPLIED);
-            bp.dpiX = 96.0f; bp.dpiY = 96.0f;
-            bp.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
-            Microsoft::WRL::ComPtr<ID2D1Bitmap1> nb;
-            if (SUCCEEDED(ctx5->CreateBitmap(D2D1::SizeU(nw, nh), nullptr, 0, &bp, &nb))) {
-                composite_ = nb; compositeW_ = nw; compositeH_ = nh;
-            } else {
-                composite_.Reset(); compositeW_ = compositeH_ = 0;
-            }
-        }
-        if (composite_) {
-            // 切离屏 target, identity transform + 96 DPI → 1:1 精确拼瓦块.
-            Microsoft::WRL::ComPtr<ID2D1Image> oldTarget;
-            ctx5->GetTarget(&oldTarget);
-            D2D1_MATRIX_3X2_F oldXf2; ctx5->GetTransform(&oldXf2);
-            float odx = 96.0f, ody = 96.0f; ctx5->GetDpi(&odx, &ody);
-
-            ctx5->SetTarget(composite_.Get());
-            ctx5->SetDpi(96.0f, 96.0f);
-            ctx5->SetTransform(D2D1::Matrix3x2F::Identity());
-            ctx5->PushAxisAlignedClip(D2D1::RectF(0.0f, 0.0f, (float)bw, (float)bh),
-                                       D2D1_ANTIALIAS_MODE_ALIASED);
-            ctx5->Clear(D2D1::ColorF(0, 0, 0, 0));   // 缺的瓦块留透明 → 缩放后透出 preview
-            for (int ty = ty0; ty < ty1; ++ty) {
-                for (int tx = tx0; tx < tx1; ++tx) {
-                    auto it = tiles_.find(TileKey{level, (uint32_t)tx, (uint32_t)ty});
-                    if (it == tiles_.end()) continue;
-                    float lx = (float)(tx * (int)ts - (int)bx0);
-                    float ly = (float)(ty * (int)ts - (int)by0);
-                    D2D1_RECT_F dr = {lx, ly, lx + (float)it->second.w, ly + (float)it->second.h};
-                    ctx5->DrawBitmap(it->second.bmp.Get(), dr, 1.0f,
-                                      D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, nullptr);
-                }
-            }
-            ctx5->PopAxisAlignedClip();
-            ctx5->SetTarget(oldTarget.Get());
-            ctx5->SetDpi(odx, ody);
-            ctx5->SetTransform(oldXf2);
-
-            // 整体上屏: 源 rect=[0,0,bw,bh], dest device-snap 外边界 + CUBIC/LINEAR 缩放.
-            float X0 = snapDev(destLeft + (float)bx0        * scale);
-            float Y0 = snapDev(destTop  + (float)by0        * scale);
-            float X1 = snapDev(destLeft + (float)(bx0 + bw) * scale);
-            float Y1 = snapDev(destTop  + (float)(by0 + bh) * scale);
-            D2D1_RECT_F dst = {X0, Y0, X1, Y1};
-            D2D1_RECT_F src = {0.0f, 0.0f, (float)bw, (float)bh};
-            ctx5->DrawBitmap(composite_.Get(), dst, 1.0f, interp, &src);
-            composited = true;
-        }
-    }
-
-    if (!composited) {   // fallback: 逐块直绘(snapDev 消部分覆盖缝)
-        for (int ty = ty0; ty < ty1; ++ty) {
-            for (int tx = tx0; tx < tx1; ++tx) {
-                auto it = tiles_.find(TileKey{level, (uint32_t)tx, (uint32_t)ty});
-                if (it == tiles_.end()) continue;
-                float x0 = snapDev(destLeft + (float)(tx * (int)ts)                     * scale);
-                float y0 = snapDev(destTop  + (float)(ty * (int)ts)                     * scale);
-                float x1 = snapDev(destLeft + (float)(tx * (int)ts + (int)it->second.w) * scale);
-                float y1 = snapDev(destTop  + (float)(ty * (int)ts + (int)it->second.h) * scale);
-                D2D1_RECT_F tileDest = {x0, y0, x1, y1};
-                r.DrawBitmapHQ(it->second.bmp.Get(), tileDest, 1.0f, interp);
-            }
+    for (int ty = ty0; ty < ty1; ++ty) {
+        for (int tx = tx0; tx < tx1; ++tx) {
+            auto it = tiles_.find(TileKey{level, (uint32_t)tx, (uint32_t)ty});
+            if (it == tiles_.end()) continue;
+            float x0 = snapDev(destLeft + (float)(tx * (int)ts)                     * scaleX);
+            float y0 = snapDev(destTop  + (float)(ty * (int)ts)                     * scaleY);
+            float x1 = snapDev(destLeft + (float)(tx * (int)ts + (int)it->second.w) * scaleX);
+            float y1 = snapDev(destTop  + (float)(ty * (int)ts + (int)it->second.h) * scaleY);
+            D2D1_RECT_F tileDest = {x0, y0, x1, y1};
+            r.DrawImageResource(it->second.resourceKey, tileDest, sampling);
         }
     }
 
@@ -929,9 +2949,10 @@ bool GhImgViewWidget::OnMouseMove(const MouseEvent& e) {
      * 跟浏览器 / Photoshop drag 大图体验一致, 不卡 UI. tile cache 在 drag
      * 期间也不被打扰 (无新 SetTile, 无 evict), 旧 viewport 内 tile 保留.
      *
-     * 仍 InvalidateAllWindows 让 D2D 重绘新 pan 后的 viewport (用现有 tile +
-     * preview). */
-    InvalidateAllWindows();
+     * 重绘由 UiWindowImpl 的 pressed-widget mousemove 分支负责。这里不能再
+     * InvalidateAllWindows: 打开信息/设置等 owned 窗口后, 每次 pan 都把其它
+     * 顶层窗也标脏, 主窗口 WM_PAINT 更容易被高频 WM_MOUSEMOVE 饿到松手后
+     * 才执行。 */
     return true;
 }
 
@@ -975,11 +2996,21 @@ uint32_t GhImgViewWidget::LevelHeight(uint32_t level) const {
 }
 
 float GhImgViewWidget::LevelToScreenScale(uint32_t level) const {
-    // 顶级宽 / level 宽 —— level 像素到顶级像素的放大倍数
+    // 顶级宽 / level 宽 —— level 像素到顶级像素的放大倍数 (X 轴)
     if (info_.fullWidth == 0) return 1.0f;
     uint32_t lw = LevelWidth(level);
     if (lw == 0) return 1.0f;
     return (float)info_.fullWidth / (float)lw;
+}
+
+float GhImgViewWidget::LevelToScreenScaleY(uint32_t level) const {
+    // L194: 顶级高 / level 高 —— Y 轴独立比例。LevelW/LevelH 各自 floor 折半,
+    // 极端宽高比 (如 1080x29679) 在 coarse level 宽比≠高比 (lvl5: 32.7 vs 32.0),
+    // 用宽比缩 Y 会让该级比图像真高多出几百~上千 px, 从底边溢出 → 必须分轴。
+    if (info_.fullHeight == 0) return 1.0f;
+    uint32_t lh = LevelHeight(level);
+    if (lh == 0) return 1.0f;
+    return (float)info_.fullHeight / (float)lh;
 }
 
 D2D1_RECT_F GhImgViewWidget::ComputeDestRect() const {
@@ -1090,6 +3121,16 @@ void GhImgViewWidget::ConstrainPan() {
 void GhImgViewWidget::NotifyViewport() {
     if (!onViewportChanged) return;
     if (info_.fullWidth == 0 || info_.fullHeight == 0) return;
+    {
+        TraceEvent("gh_img_view", "notify_viewport",
+                   {TraceF64("zoom", zoom_),
+                    TraceF64("pan_x", panX_),
+                    TraceF64("pan_y", panY_),
+                    TraceF64("l", rect.left),
+                    TraceF64("t", rect.top),
+                    TraceF64("r", rect.right),
+                    TraceF64("b", rect.bottom)});
+    }
 
     Viewport vp{};
     vp.activeLevel = activeLevel_;
@@ -1104,8 +3145,9 @@ void GhImgViewWidget::NotifyViewport() {
     uint32_t tyMax = (lh + ts - 1) / ts;
 
     D2D1_RECT_F dest = ComputeDestRect();
-    float scale = LevelToScreenScale(activeLevel_) * zoom_;
-    if (scale <= 1e-6f) {
+    float scaleX = LevelToScreenScale (activeLevel_) * zoom_;   // L194: 分轴, 同 DrawLevel
+    float scaleY = LevelToScreenScaleY(activeLevel_) * zoom_;
+    if (scaleX <= 1e-6f || scaleY <= 1e-6f) {
         vp.visibleTx0 = vp.visibleTy0 = 0;
         vp.visibleTx1 = txMax;
         vp.visibleTy1 = tyMax;
@@ -1117,8 +3159,8 @@ void GhImgViewWidget::NotifyViewport() {
             float dx = sx - dcx, dy = sy - dcy;
             float rdx, rdy;
             RotateCCW(rotation_, dx, dy, rdx, rdy);
-            lx = (dcx + rdx - dest.left) / scale;
-            ly = (dcy + rdy - dest.top ) / scale;
+            lx = (dcx + rdx - dest.left) / scaleX;
+            ly = (dcy + rdy - dest.top ) / scaleY;
         };
         float lx[4], ly[4];
         corner(rect.left,  rect.top,    lx[0], ly[0]);
@@ -1152,13 +3194,7 @@ void GhImgViewWidget::NotifyViewport() {
 }
 
 void GhImgViewWidget::InvalidateAllWindows() {
-    EnumThreadWindows(GetCurrentThreadId(), [](HWND hwnd, LPARAM) -> BOOL {
-        wchar_t cls[64];
-        GetClassNameW(hwnd, cls, 64);
-        if (wcscmp(cls, L"UiCore_Window") == 0)
-            InvalidateRect(hwnd, nullptr, FALSE);
-        return TRUE;
-    }, 0);
+    GetContext().InvalidateAllWindows();
 }
 
 } // namespace ui

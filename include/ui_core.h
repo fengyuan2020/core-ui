@@ -70,6 +70,15 @@ typedef struct UiColor {
     float r, g, b, a;
 } UiColor;
 
+typedef enum UiIconColorRole {
+    UI_ICON_COLOR_BUTTON_TEXT = 0,
+    UI_ICON_COLOR_TITLEBAR_TEXT = 1,
+    UI_ICON_COLOR_CONTENT_TEXT = 2,
+    UI_ICON_COLOR_ACCENT = 3,
+    UI_ICON_COLOR_DANGER = 4,
+    UI_ICON_COLOR_DIVIDER = 5
+} UiIconColorRole;
+
 typedef struct UiRect {
     float left, top, right, bottom;
 } UiRect;
@@ -148,17 +157,62 @@ UI_API int  ui_run(void);              /* message loop, returns exit code */
 UI_API void ui_quit(int exit_code);    /* posts WM_QUIT */
 
 /* ------------------------------------------------------------------ */
+/* Trace sink                                                          */
+/* ------------------------------------------------------------------ */
+typedef enum UiTraceFieldType {
+    UI_TRACE_FIELD_I64  = 1,
+    UI_TRACE_FIELD_U64  = 2,
+    UI_TRACE_FIELD_F64  = 3,
+    UI_TRACE_FIELD_BOOL = 4,
+    UI_TRACE_FIELD_STR  = 5
+} UiTraceFieldType;
+
+typedef struct UiTraceField {
+    const char* key;
+    int         type;       /* UiTraceFieldType */
+    int64_t     i64;
+    uint64_t    u64;
+    double      f64;
+    int         boolean;
+    const char* str;        /* UTF-8, borrowed; valid only during callback */
+} UiTraceField;
+
+typedef struct UiTraceEvent {
+    const char* source;     /* core_window / gh_img_view / ... */
+    const char* category;   /* window / render / input / ... */
+    const char* name;       /* event name */
+    uint32_t    field_count;
+    const UiTraceField* fields;
+} UiTraceEvent;
+
+typedef void (*UiTraceSink)(const UiTraceEvent* event, void* userdata);
+
+/* Registers a process-wide trace sink. core-ui never owns output policy:
+ * callers decide enablement, filtering, persistence, and analysis. */
+UI_API void ui_trace_set_sink(UiTraceSink sink, void* userdata);
+
+/* ------------------------------------------------------------------ */
 /* Window management                                                  */
 /* ------------------------------------------------------------------ */
 UI_API UiWindow ui_window_create(const UiWindowConfig* config);
 UI_API void     ui_window_destroy(UiWindow win);
 UI_API void     ui_window_show(UiWindow win);
 UI_API void     ui_window_show_immediate(UiWindow win);  /* 跳过开场动画 */
+UI_API void     ui_window_show_immediate_no_activate(UiWindow win);  /* 显示但不抢键盘焦点 */
 UI_API void     ui_window_prepare_rt(UiWindow win);     /* 预创建渲染目标（不显示窗口） */
 UI_API void     ui_window_hide(UiWindow win);
 UI_API void     ui_window_set_root(UiWindow win, UiWidget root);
 UI_API void     ui_window_set_title(UiWindow win, const wchar_t* title);
+UI_API void     ui_window_set_resizable(UiWindow win, int resizable);
 UI_API void     ui_window_invalidate(UiWindow win);
+/* Batch visual mutations on one window. While active, resize/paint invalidations
+ * are coalesced and only the final state is painted when the outermost batch
+ * ends. Calls may be nested.
+ *
+ * CanvasVisualTransaction is for image/canvas workflows that update widget
+ * visual state and HWND geometry as one unit. */
+UI_API void     ui_window_begin_canvas_visual_transaction(UiWindow win);
+UI_API void     ui_window_end_canvas_visual_transaction(UiWindow win);
 /* 强制重新布局（set_visible 等改变影响布局的属性后调用） */
 UI_API void     ui_window_relayout(UiWindow win);
 UI_API void*    ui_window_hwnd(UiWindow win);   /* returns HWND */
@@ -173,6 +227,10 @@ UI_API float    ui_window_dpi_scale(UiWindow win);
 /* Window callbacks                                                   */
 /* ------------------------------------------------------------------ */
 typedef void (*UiWindowCloseCallback)(UiWindow win, void* userdata);
+/* WM_CLOSE/标题栏关闭按钮/Alt+F4 的关闭请求回调。
+ * 返回 0 = 宿主已处理，取消默认 DestroyWindow；非 0 = 继续默认关闭。
+ * 与 ui_window_on_close 不同：on_close 是关闭前通知，不能阻止关闭。 */
+typedef int  (*UiWindowCloseRequestCallback)(UiWindow win, void* userdata);
 typedef void (*UiWindowResizeCallback)(UiWindow win, int w, int h, void* userdata);
 typedef void (*UiWindowDropCallback)(UiWindow win, const wchar_t* path, void* userdata);
 typedef void (*UiWindowKeyCallback)(UiWindow win, int vk_code, void* userdata);
@@ -192,6 +250,14 @@ UI_API void     ui_menu_destroy(UiMenu menu);
 UI_API void     ui_menu_add_separator(UiMenu menu);
 UI_API void     ui_menu_set_enabled(UiMenu menu, int id, int enabled);
 UI_API void     ui_menu_set_bg_color(UiMenu menu, UiColor color);
+/* Enable or disable the frosted-glass popup material. When disabled, menus use
+ * an opaque theme card and do not capture the backdrop. */
+UI_API void     ui_menu_set_frosted_material(UiMenu menu, int enabled);
+/* Control the frosted material blur radius in DIP. The material must be enabled
+ * separately with ui_menu_set_frosted_material. radius < 0 restores the default
+ * auto blur, radius == 0 disables backdrop capture while keeping material tint,
+ * radius > 0 uses that explicit blur radius. */
+UI_API void     ui_menu_set_backdrop_blur(UiMenu menu, float radius);
 /* Build 69+ (L19): 单菜单圆角半径覆盖. <0 = 用 lib 默认 (10.0). 影响 shadow
  * + card bg. hover item highlight (6px) 不动 — 它是 item 级视觉, 不属于
  * 容器圆角范畴. submenu 单独设, 不继承父菜单. */
@@ -301,10 +367,19 @@ UI_API const char* ui_menu_item_attr(UiMenuItem item, const char* name);
 typedef void (*UiRightClickCallback)(UiWindow win, float x, float y, void* userdata);
 UI_API void ui_window_on_right_click(UiWindow win, UiRightClickCallback cb, void* userdata);
 
+/* L219: 标题栏背景"拖动"(按下后超过系统拖动阈值)回调。仅当
+ * ui_window_set_titlebar_drag_intercept(win, 1) 开启拦截时触发 —— 此时标题栏背景
+ * 拖动不走系统移动(拖窗), 而 fire 此回调(纯点击不触发)。典型用途: 全屏态拖标题栏退出
+ * 全屏。intercept=0(默认)时标题栏拖动走正常拖窗。 */
+typedef void (*UiTitleBarDragCallback)(UiWindow win, void* userdata);
+UI_API void ui_window_on_titlebar_drag(UiWindow win, UiTitleBarDragCallback cb, void* userdata);
+UI_API void ui_window_set_titlebar_drag_intercept(UiWindow win, int on);
+
 /* ------------------------------------------------------------------ */
 /* Window callbacks                                                   */
 /* ------------------------------------------------------------------ */
 UI_API void ui_window_on_close(UiWindow win, UiWindowCloseCallback cb, void* userdata);
+UI_API void ui_window_on_close_request(UiWindow win, UiWindowCloseRequestCallback cb, void* userdata);
 UI_API void ui_window_on_resize(UiWindow win, UiWindowResizeCallback cb, void* userdata);
 UI_API void ui_window_on_drop(UiWindow win, UiWindowDropCallback cb, void* userdata);
 UI_API void ui_window_on_key(UiWindow win, UiWindowKeyCallback cb, void* userdata);
@@ -528,6 +603,8 @@ UI_API void     ui_gh_img_view_clear(UiWidget w);
  * begin/end 必须成对; end 触发一次 invalidate. */
 UI_API void     ui_gh_img_view_begin_tile_batch(UiWidget w);
 UI_API void     ui_gh_img_view_end_tile_batch(UiWidget w);
+UI_API void     ui_gh_img_view_begin_view_update(UiWidget w);
+UI_API void     ui_gh_img_view_end_view_update(UiWidget w);
 
 /* Build 70+ (L20): SVG 矢量源. 喂一个 .svg 文件, widget 进入 SVG 模式 —
  * 跳过瓦块逻辑, OnDraw 直接 DrawSvgDocument (ID2D1DeviceContext5 原生光栅化).
@@ -625,6 +702,7 @@ UI_API UiWidget ui_icon_button(const char* svg, int ghost);
 UI_API void     ui_icon_button_set_svg(UiWidget w, const char* svg);
 UI_API void     ui_icon_button_set_ghost(UiWidget w, int ghost);
 UI_API void     ui_icon_button_set_icon_color(UiWidget w, UiColor color);
+UI_API void     ui_icon_button_set_icon_color_role(UiWidget w, UiIconColorRole role);
 UI_API void     ui_icon_button_set_icon_padding(UiWidget w, float padding);
 /* ghost 模式 hover/press bg 视觉开关. 1 (默认) = 标准按钮反馈,
  * 0 = 永远只画 icon (titlebar 装饰按钮 / 状态指示器场景). 仅对 ghost

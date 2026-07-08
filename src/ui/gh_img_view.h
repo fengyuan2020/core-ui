@@ -15,6 +15,7 @@
 
 #include "widget.h"
 #include "renderer.h"
+#include "render_handles.h"
 
 #include <d2d1.h>
 #include <d2d1_3.h>      /* ID2D1SvgDocument — Build 70+ (L20) SVG 原生路径 */
@@ -71,7 +72,7 @@ public:
     // 喂一个 SVG 文件作为渲染源. 进入 "SVG 模式" — 跳过瓦块逻辑, OnDraw 用
     // ID2D1DeviceContext5::DrawSvgDocument + 当前 viewport (zoom/pan/rotation)
     // transform 直接矢量光栅化. info_.fullWidth/Height 由 SVG natural size
-    // (优先 viewBox, fallback width/height 属性) 喂入, 所以 Fit/Reset/zoom
+    // (优先 width/height 的 CSS px 尺寸, fallback viewBox) 喂入, 所以 Fit/Reset/zoom
     // 等几何全部复用原有路径.
     //
     // 调用方在加载 .svg 文件时调本函数, 替代 Begin + SetTile 系列. 之前
@@ -85,15 +86,14 @@ public:
     bool SetSvgFromFile(const std::wstring& path, Renderer& r);
 
     // SVG 模式判断 — 当前 source 是 SVG 还是瓦块 pyramid.
-    bool IsSvgMode() const { return svgDoc_ != nullptr; }
+    bool IsSvgMode() const { return svgD2DDoc_ != nullptr || svgDoc_ != nullptr; }
 
     // 把当前加载的 SVG 矢量源光栅化到 caller 缓冲, 用于鸟瞰图缩略图等场景.
     // fit 到 target_w×target_h 保 aspect (短边贴边, 长边等比缩), 实际像素尺寸
     // 写回 out_w/out_h, BGRA8 premul 数据写到 out_bgra (大小 = out_w*out_h*4, packed).
     // out_bgra 由 caller 分配, 至少 target_w*target_h*4 字节.
     // 必须先 SetSvgFromFile, 否则返 -1. 其他错误返非 0.
-    // 内部使用 ID2D1DeviceContext5 + off-screen target bitmap + CPU_READ bitmap
-    // CopyFromBitmap, 不影响外层 BeginDraw 状态 (调用方应在 paint cycle 外调).
+    // 优先走 D2D 离屏渲染，保留主视图的 SVG 阴影层；D2D 不可用时回退 LunaSVG。
     int RenderSvgToBgra(uint32_t target_w, uint32_t target_h,
                          uint8_t* out_bgra,
                          uint32_t* out_w, uint32_t* out_h,
@@ -128,6 +128,8 @@ public:
     // 配合切级保留旧级 (TrimToViewport_), 消除放大切级时的逐 tile 波浪刷新。
     void     BeginTileBatch() { tileBatch_ = true; }
     void     EndTileBatch();
+    void     BeginViewUpdate() { ++viewUpdateDepth_; }
+    void     EndViewUpdate();
 
     // ---- 视口 ----
     float Zoom() const               { return zoom_; }
@@ -203,6 +205,9 @@ private:
     // 多级 fallback 用旧级清晰图覆盖新级未到达的 tile (切级清晰→更清晰, 无波浪/无空白)。
     uint32_t prevActiveLevel_ = UINT32_MAX;
     bool     tileBatch_ = false;   // L115: Begin/EndTileBatch 间抑制逐 tile invalidate
+    int      viewUpdateDepth_ = 0;
+    bool     pendingViewportNotify_ = false;
+    bool     pendingInvalidate_ = false;
 
     float zoom_ = 1.0f;
     float panX_ = 0, panY_ = 0;
@@ -242,17 +247,13 @@ private:
         }
     };
     struct Tile {
-        Microsoft::WRL::ComPtr<ID2D1Bitmap> bmp;
+        ResourceKey resourceKey;
         uint32_t w = 0, h = 0;
     };
     std::unordered_map<TileKey, Tile, TileKeyHash> tiles_;
-    Microsoft::WRL::ComPtr<ID2D1Bitmap> preview_;
+    ResourceKey previewResourceKey_;
     uint32_t previewW_ = 0, previewH_ = 0;
-
-    // L105: 缓存的离屏合成位图 (TARGET). DrawLevel 把本级可见瓦块 1:1 拼进它(无内部
-    // 瓦块边界)再整体缩放上屏, 消除非整数缩放下的瓦块接缝。按需重建(只增不减)。
-    Microsoft::WRL::ComPtr<ID2D1Bitmap1> composite_;
-    uint32_t compositeW_ = 0, compositeH_ = 0;
+    uint64_t imageGeneration_ = 0;
 
     // L48: NotifyViewport 内调, 清掉 tiles_ 中不在 viewport 范围内的 tile
     // + 非 active level 的 tile. 每个被清的 tile fire 一次 onTileEvicted,
@@ -262,19 +263,38 @@ private:
                           uint32_t visible_tx0, uint32_t visible_tx1,
                           uint32_t visible_ty0, uint32_t visible_ty1);
 
-    /* L173 / core-ui Phase 4: SVG 矢量源改用 LunaSVG (统一引擎, 与 gh-img-decode
-     * 同款; 支持 filter/feDropShadow/text/mask 等 D2D ID2D1SvgDocument 子集外能力)。
-     * 非空时进入 SVG 模式, OnDraw 用 LunaSVG 按当前显示分辨率栅格化到 svgRaster_
-     * 缓存位图再 DrawBitmap (替原 D2D DrawSvgDocument 矢量直绘)。svgW_/svgH_ =
-     * SVG natural size, 跟 info_.fullWidth/Height 同步。 */
+    /* SVG 矢量源双路径: 主视图优先用 D2D ID2D1SvgDocument 直绘以保持默认缩放
+     * 下的线框/文字清晰; LunaSVG Document 保留给鸟瞰图、截图缩略图和无 D2D
+     * document 时的视口栅格化降级。svgW_/svgH_ = SVG natural size, 跟
+     * info_.fullWidth/Height 同步。 */
     std::shared_ptr<lunasvg::Document> svgDoc_;   /* shared: 后台栅格化线程安全持有 */
+    Microsoft::WRL::ComPtr<ID2D1SvgDocument> svgD2DDoc_;
+    std::string svgD2DXml_;
+    std::string svgThumbXml_;      /* 缩略图专用: 剥图元 filter, 保留本体 */
+    bool svgRasterMain_ = false;   /* 内嵌 PNG/JPG 等位图 SVG: 主视图走 LunaSVG 栅格 */
+    struct SvgD2DDropShadowLayer {
+        std::string shadowXml;
+        std::string coverXml;
+        Microsoft::WRL::ComPtr<ID2D1SvgDocument> shadowDoc;
+        Microsoft::WRL::ComPtr<ID2D1SvgDocument> coverDoc;
+        float dx = 0.0f;
+        float dy = 0.0f;
+        float stdDeviation = 0.0f;
+    };
+    std::vector<SvgD2DDropShadowLayer> svgD2DShadowLayers_;
     uint32_t svgW_ = 0;
     uint32_t svgH_ = 0;
-    /* 栅格化缓存位图 (UI 线程持有/绘制)。svgRasterW_/H_ = 已渲分辨率; 缩放未超过
-     * 复用窗口时直接 downscale 显示 (仍清晰)。 */
+    /* 视口栅格化缓存位图 (UI 线程持有/绘制)。svgRasterSrc* 是这张位图覆盖的
+     * SVG 源坐标矩形; svgRasterW_/H_ 是对应输出分辨率。放大时只重渲当前
+     * viewport + overscan, 不再整图撞固定 4096px 上限 (L196)。 */
     Microsoft::WRL::ComPtr<ID2D1Bitmap> svgRaster_;
+    ResourceKey svgRasterResourceKey_;
     uint32_t svgRasterW_ = 0;
     uint32_t svgRasterH_ = 0;
+    float svgRasterSrcL_ = 0.0f;
+    float svgRasterSrcT_ = 0.0f;
+    float svgRasterSrcR_ = 0.0f;
+    float svgRasterSrcB_ = 0.0f;
 
     /* 后台栅格化 (L173 Phase 4): 缩放重渲丢后台线程, UI 线程只画缓存 → 永不阻塞
      * 输入。后台渲完锁 slot 存 BGRA + InvalidateRect 唤醒, 下次 OnDraw 换上
@@ -282,12 +302,16 @@ private:
      * 悬空)。渲染期间又改缩放 → slot.want 更新, 线程渲完自动再渲最新档 (合并)。 */
     std::shared_ptr<SvgRenderSlot> svgSlot_;
     // 同步渲一张到 svgRaster_ (仅首帧/还没缓存时 — load 时一次性, 不在缩放热路径)。
-    void EnsureSvgRaster(const D2D1_RECT_F& dest, Renderer& r);
+    void EnsureSvgRaster(float srcL, float srcT, float srcR, float srcB,
+                         uint32_t renW, uint32_t renH, Renderer& r);
     // 起/更新一个后台渲染请求 (非阻塞)。uiThreadId = UI 线程 id, 后台渲完用
     // EnumThreadWindows 跨线程 InvalidateRect 唤醒 (同 InvalidateAllWindows 模式)。
-    void RequestSvgRasterAsync_(uint32_t renW, uint32_t renH, unsigned long uiThreadId);
+    void RequestSvgRasterAsync_(float srcL, float srcT, float srcR, float srcB,
+                                uint32_t renW, uint32_t renH,
+                                unsigned long uiThreadId);
     // 后台结果就绪时, 在 UI 线程把 BGRA 建成 D2D 位图换上 svgRaster_。
     void ConsumeSvgRasterResult_(Renderer& r);
+    void ClearSvgRaster_();
 
     // ---- 渲染辅助 ----
     void     DrawLevel(Renderer& r, uint32_t level, const D2D1_RECT_F& dest);
@@ -296,8 +320,12 @@ private:
     // 当前 level 下的图像总尺寸（顶级 = info.fullW/H；每降一级 /2）
     uint32_t LevelWidth(uint32_t level) const;
     uint32_t LevelHeight(uint32_t level) const;
-    // 当前 level 下，1 像素 == 屏幕多少像素（pic→screen 的比例因子）
-    float    LevelToScreenScale(uint32_t level) const;
+    // 当前 level 下，1 像素 == 屏幕多少像素（pic→screen 的比例因子）。
+    // LevelToScreenScale 用【宽度】比 (fullW/LevelW), LevelToScreenScaleY 用【高度】比
+    // (fullH/LevelH)。LevelW/LevelH 各自独立 floor 折半, 极端宽高比 (超长/超宽图)
+    // 在 coarse level 两者比值会偏离 → 必须分轴, 否则该级在非主轴上溢出 dest (L194)。
+    float    LevelToScreenScale (uint32_t level) const;   // X / 宽
+    float    LevelToScreenScaleY(uint32_t level) const;   // Y / 高
     // Logical dest rect: 假设 rotation=0 时, 未旋转 bitmap 在屏幕上的 AABB.
     // 中心 = widget center + pan, 大小 = fullW*zoom × fullH*zoom.
     // OnDraw 在此 dest 内用 logical 坐标 DrawBitmap, D2D rotation transform
@@ -319,6 +347,7 @@ private:
     // 切 level（不动 zoom，等同于换数据来源；外部应清旧 level 瓦块）
     void     SwitchLevel(uint32_t level);
     void     ConstrainPan();
+    void     RequestViewportCommit();
     void     NotifyViewport();
     void     InvalidateAllWindows();
 };

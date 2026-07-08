@@ -12,6 +12,7 @@
 #include "../animation.h"
 #include "../asset.h"
 #include "../css/value.h"
+#include "../debug_trace.h"
 #include "../uix/expr_rewriter.h"
 #include "../uix/value_convert.h"
 #include <algorithm>
@@ -84,6 +85,99 @@ std::string ToUtf8(const std::wstring& s) {
     return r;
 }
 
+bool ParseBackdropBlurText(const std::string& value, float& out) {
+    auto pv = ui::css::ParseValue(value);
+    if (!pv.ok) return false;
+    auto compToPx = [](const ui::css::Component& c, float& px) -> bool {
+        if (c.kind == ui::css::ComponentKind::Number) {
+            px = static_cast<float>(c.number);
+            return true;
+        }
+        if (c.kind == ui::css::ComponentKind::Length) {
+            double v = 0.0;
+            if (ui::css::ResolveLengthPx(c.length, 0, 14, 14, 1920, 1080, v)) {
+                px = static_cast<float>(v);
+                return true;
+            }
+        }
+        if (c.kind == ui::css::ComponentKind::Ident && c.ident == "auto") {
+            px = -1.0f;
+            return true;
+        }
+        if (c.kind == ui::css::ComponentKind::Ident &&
+            (c.ident == "none" || c.ident == "off")) {
+            px = 0.0f;
+            return true;
+        }
+        return false;
+    };
+    for (const auto& c : pv.components) {
+        if (c.kind == ui::css::ComponentKind::Function && c.ident == "blur" &&
+            !c.args.empty()) {
+            return compToPx(c.args[0], out);
+        }
+        if (compToPx(c, out)) return true;
+    }
+    return false;
+}
+
+void ApplyDynamicPositionOverrides(Widget* w) {
+    if (w) w->ApplyDynamicPositionOverrides();
+}
+
+void ParseDynamicAbsSide(const ui::expr::Value& v, float& slot, std::string& rawSlot) {
+    slot = -1.0f;
+    rawSlot.clear();
+    if (v.IsNumber()) {
+        slot = static_cast<float>(v.Number());
+        return;
+    }
+    std::string text = v.ToString();
+    if (text.empty() || text == "auto" || text == "null") return;
+
+    ui::css::Length len;
+    if (ui::css::ParseLength(text, len) && len.unit != ui::css::Unit::Auto &&
+        len.unit != ui::css::Unit::Percent) {
+        double px = 0.0;
+        if (ui::css::ResolveLengthPx(len, 0, 14, 14, 1920, 1080, px)) {
+            slot = static_cast<float>(px);
+            return;
+        }
+    }
+    rawSlot = text;
+}
+
+bool ApplyDynamicAbsSideBinding(Widget* w, const std::string& prop,
+                                const ui::expr::Value& v) {
+    if (!w) return false;
+    float parsed = -1.0f;
+    std::string raw;
+    ParseDynamicAbsSide(v, parsed, raw);
+
+    if (prop == "left") {
+        w->dynamicPosLeftSet = true;
+        w->dynamicPosLeft = parsed;
+        w->dynamicPosLeftRaw = std::move(raw);
+    } else if (prop == "top") {
+        w->dynamicPosTopSet = true;
+        w->dynamicPosTop = parsed;
+        w->dynamicPosTopRaw = std::move(raw);
+    } else if (prop == "right") {
+        w->dynamicPosRightSet = true;
+        w->dynamicPosRight = parsed;
+        w->dynamicPosRightRaw = std::move(raw);
+    } else if (prop == "bottom") {
+        w->dynamicPosBottomSet = true;
+        w->dynamicPosBottom = parsed;
+        w->dynamicPosBottomRaw = std::move(raw);
+    } else {
+        return false;
+    }
+    ApplyDynamicPositionOverrides(w);
+    ui::RequestLayout();
+    return true;
+}
+
 // C trampoline for `$t(key)`. Bound on the data object so user templates
 // see it as `this.$t(...)` after the rewriter pass. Reading `this_val.$locale`
 // through the proxy registers a dep on $locale so the binding re-runs whenever
@@ -105,6 +199,96 @@ JSValue JsTranslateTrampoline(JSContext* ctx, JSValueConst this_val,
     return JS_NewStringLen(ctx, out.data(), out.size());
 }
 
+PageState* PageFromJs(JSContext* ctx) {
+    auto* rt = static_cast<ui::uix::ScriptRuntime*>(JS_GetContextOpaque(ctx));
+    return rt ? static_cast<PageState*>(rt->GetUserData()) : nullptr;
+}
+
+UiWindowImpl* WindowForPage(PageState* page) {
+    if (!page) return nullptr;
+    auto root = page->Root();
+    return root ? ui::GetContext().FindWindowByWidget(root.get()) : nullptr;
+}
+
+void EnsurePageLayout(PageState* page) {
+    if (auto* win = WindowForPage(page)) win->LayoutRoot();
+}
+
+bool IsEffectivelyVisible(const Widget* w) {
+    for (auto* p = w; p; p = p->Parent()) {
+        if (!p->visible) return false;
+    }
+    return true;
+}
+
+void SetObjNumber(JSContext* ctx, JSValueConst obj, const char* name, double v) {
+    JS_SetPropertyStr(ctx, obj, name, JS_NewFloat64(ctx, v));
+}
+
+JSValue JsRectTrampoline(JSContext* ctx, JSValueConst /*this_val*/,
+                         int argc, JSValueConst* argv) {
+    auto* page = PageFromJs(ctx);
+    if (!page || argc < 1) return JS_NULL;
+
+    const char* id = JS_ToCString(ctx, argv[0]);
+    if (!id || !*id) {
+        if (id) JS_FreeCString(ctx, id);
+        return JS_NULL;
+    }
+
+    EnsurePageLayout(page);
+    auto root = page->Root();
+    Widget* w = root ? root->FindById(id) : nullptr;
+    JS_FreeCString(ctx, id);
+    if (!w) return JS_NULL;
+
+    const float left = w->rect.left;
+    const float top = w->rect.top;
+    const float right = w->rect.right;
+    const float bottom = w->rect.bottom;
+    JSValue obj = JS_NewObject(ctx);
+    SetObjNumber(ctx, obj, "left", left);
+    SetObjNumber(ctx, obj, "top", top);
+    SetObjNumber(ctx, obj, "right", right);
+    SetObjNumber(ctx, obj, "bottom", bottom);
+    SetObjNumber(ctx, obj, "width", std::max(0.0f, right - left));
+    SetObjNumber(ctx, obj, "height", std::max(0.0f, bottom - top));
+    SetObjNumber(ctx, obj, "centerX", (left + right) * 0.5f);
+    SetObjNumber(ctx, obj, "centerY", (top + bottom) * 0.5f);
+    JS_SetPropertyStr(ctx, obj, "visible", JS_NewBool(ctx, IsEffectivelyVisible(w)));
+    return obj;
+}
+
+JSValue JsWindowSizeTrampoline(JSContext* ctx, JSValueConst /*this_val*/,
+                               int /*argc*/, JSValueConst* /*argv*/) {
+    auto* page = PageFromJs(ctx);
+    EnsurePageLayout(page);
+
+    JSValue obj = JS_NewObject(ctx);
+    auto root = page ? page->Root() : nullptr;
+    float width = 0.0f;
+    float height = 0.0f;
+    if (root) {
+        width = std::max(0.0f, root->rect.right - root->rect.left);
+        height = std::max(0.0f, root->rect.bottom - root->rect.top);
+    }
+    SetObjNumber(ctx, obj, "width", width);
+    SetObjNumber(ctx, obj, "height", height);
+    SetObjNumber(ctx, obj, "dpiScale",
+                 WindowForPage(page) ? WindowForPage(page)->DpiScale() : 1.0f);
+    return obj;
+}
+
+JSValue JsNextTickTrampoline(JSContext* ctx, JSValueConst this_val,
+                             int argc, JSValueConst* argv) {
+    auto* page = PageFromJs(ctx);
+    EnsurePageLayout(page);
+    if (argc > 0 && JS_IsFunction(ctx, argv[0])) {
+        return JS_Call(ctx, argv[0], this_val, 0, nullptr);
+    }
+    return JS_UNDEFINED;
+}
+
 // Find a transition spec on this widget for the given AnimProperty id.
 const Widget::TransitionSpec* FindTransition(const Widget* w, int propId) {
     for (const auto& t : w->transitions) {
@@ -113,55 +297,86 @@ const Widget::TransitionSpec* FindTransition(const Widget* w, int propId) {
     return nullptr;
 }
 
+UiWindowImpl* OwnerWindow(Widget* w) {
+    return ui::GetContext().FindWindowByWidget(w);
+}
+
 void SetOpacityMaybeAnimated(Widget* w, float target) {
     const auto* t = FindTransition(w, 0);
     if (t && std::abs(w->opacity - target) > 0.001f) {
-        Animations().Animate(w, AnimProperty::Opacity, w->opacity, target,
-                             t->durationMs, static_cast<EasingFunction>(t->easing));
+        if (auto* win = OwnerWindow(w)) {
+            win->AnimateProperty(w, AnimProperty::Opacity, w->opacity, target,
+                                 t->durationMs, static_cast<EasingFunction>(t->easing));
+            return;
+        }
     } else {
         w->opacity = target;
+        return;
     }
+    w->opacity = target;
 }
 
 void SetWidthMaybeAnimated(Widget* w, float target) {
     const auto* t = FindTransition(w, 3);
     if (t && std::abs(w->fixedW - target) > 0.5f && w->fixedW > 0) {
-        Animations().Animate(w, AnimProperty::Width, w->fixedW, target,
-                             t->durationMs, static_cast<EasingFunction>(t->easing));
+        if (auto* win = OwnerWindow(w)) {
+            win->AnimateProperty(w, AnimProperty::Width, w->fixedW, target,
+                                 t->durationMs, static_cast<EasingFunction>(t->easing));
+            return;
+        }
     } else {
         w->fixedW = target;
         ui::RequestLayout();
+        return;
     }
+    w->fixedW = target;
+    ui::RequestLayout();
 }
 
 void SetHeightMaybeAnimated(Widget* w, float target) {
     const auto* t = FindTransition(w, 4);
     if (t && std::abs(w->fixedH - target) > 0.5f && w->fixedH > 0) {
-        Animations().Animate(w, AnimProperty::Height, w->fixedH, target,
-                             t->durationMs, static_cast<EasingFunction>(t->easing));
+        if (auto* win = OwnerWindow(w)) {
+            win->AnimateProperty(w, AnimProperty::Height, w->fixedH, target,
+                                 t->durationMs, static_cast<EasingFunction>(t->easing));
+            return;
+        }
     } else {
         w->fixedH = target;
         ui::RequestLayout();
+        return;
     }
+    w->fixedH = target;
+    ui::RequestLayout();
 }
 
 void SetBgMaybeAnimated(Widget* w, const D2D1_COLOR_F& target) {
     const auto* tA = FindTransition(w, 8);
     if (tA) {
-        auto easing = static_cast<EasingFunction>(tA->easing);
-        Animations().Animate(w, AnimProperty::BgColorR, w->bgColor.r, target.r, tA->durationMs, easing);
-        Animations().Animate(w, AnimProperty::BgColorG, w->bgColor.g, target.g, tA->durationMs, easing);
-        Animations().Animate(w, AnimProperty::BgColorB, w->bgColor.b, target.b, tA->durationMs, easing);
-        Animations().Animate(w, AnimProperty::BgColorA, w->bgColor.a, target.a, tA->durationMs, easing);
+        if (auto* win = OwnerWindow(w)) {
+            auto easing = static_cast<EasingFunction>(tA->easing);
+            win->AnimateProperty(w, AnimProperty::BgColorR, w->bgColor.r, target.r, tA->durationMs, easing);
+            win->AnimateProperty(w, AnimProperty::BgColorG, w->bgColor.g, target.g, tA->durationMs, easing);
+            win->AnimateProperty(w, AnimProperty::BgColorB, w->bgColor.b, target.b, tA->durationMs, easing);
+            win->AnimateProperty(w, AnimProperty::BgColorA, w->bgColor.a, target.a, tA->durationMs, easing);
+            return;
+        }
     } else {
         w->bgColor = target;
+        return;
     }
+    w->bgColor = target;
 }
 
 }  // namespace
 
 PageState::PageState() = default;
 PageState::~PageState() {
+    if (winHandle_) {
+        if (auto* win = ui::GetContext().GetWindow(winHandle_)) {
+            win->onPageResize = nullptr;
+        }
+    }
     DetachQuickJS();
 }
 
@@ -337,6 +552,7 @@ void PageState::DispatchUnmountHooks(Widget* root) {
 }
 
 void PageState::RefreshThemeStyles() {
+    TraceScope themeScope("page_state", "refresh_theme_duration");
     if (!page_.cssVars) return;
     RebuildThemeVars(*page_.cssVars);
     // Walk the live widget tree and re-cascade. recomputeStyle reads
@@ -355,6 +571,19 @@ void PageState::RefreshThemeStyles() {
 
 void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const ui::expr::Value& v) {
     if (!w) return;
+    TraceScope bindingScope("page_state", "apply_binding_duration");
+    if (IsTraceEnabled()) {
+        TraceEvent("page_state", "apply_binding",
+                   {TraceStr("prop", prop.c_str()),
+                    TraceStr("widget_type", w->cssTag.c_str()),
+                    TraceStr("widget_id", w->id.c_str())});
+    }
+    auto traceBindingNoop = [&]() {
+        if (IsTraceEnabled()) {
+            TraceEvent("page_state", "binding_noop", {TraceStr("prop", prop.c_str())});
+        }
+    };
+    bool shouldInvalidate = true;
 
     // Tail-call invalidator: every binding application needs to repaint
     // (LabelWidget::SetText etc. only mutate state without their own
@@ -364,11 +593,13 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
     // that flips a Toggle/CheckBox into animating_=true actually starts
     // ticking even outside a mouse/key event handler.
     struct InvalidateOnExit {
+        bool& shouldInvalidate;
         ~InvalidateOnExit() {
+            if (!shouldInvalidate) return;
             ui::GetContext().InvalidateAllWindows();
             ui::GetContext().UpdateAnimTimers();
         }
-    } _invalidate;
+    } _invalidate{shouldInvalidate};
 
     // SVG shape attribute: "shape[N].<attr>" routes to SvgWidget::SetShapeProperty.
     if (prop.size() > 6 && prop.compare(0, 6, "shape[") == 0) {
@@ -462,6 +693,9 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
     }
     if (prop == "width")      { SetWidthMaybeAnimated(w, static_cast<float>(v.ToNumber())); return; }
     if (prop == "height")     { SetHeightMaybeAnimated(w, static_cast<float>(v.ToNumber())); return; }
+    if (prop == "left" || prop == "top" || prop == "right" || prop == "bottom") {
+        if (ApplyDynamicAbsSideBinding(w, prop, v)) return;
+    }
     if (prop == "min-width" || prop == "minWidth") {
         w->minW = static_cast<float>(v.ToNumber()); ui::RequestLayout(); return;
     }
@@ -505,10 +739,25 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
         // 动画 — 现按 widget.PaintedOnce() 判断, 跟"用户实际看到没"对齐.
         const bool painted = w->PaintedOnce();
         if (auto* rb = dynamic_cast<RadioButtonWidget*>(w)) {
+            if (rb->Selected() == b) {
+                traceBindingNoop();
+                shouldInvalidate = false;
+                return;
+            }
             painted ? rb->SetSelected(b) : rb->SetSelectedImmediate(b);
         } else if (auto* cb = dynamic_cast<CheckBoxWidget*>(w)) {
+            if (cb->Checked() == b) {
+                traceBindingNoop();
+                shouldInvalidate = false;
+                return;
+            }
             painted ? cb->SetChecked(b)  : cb->SetCheckedImmediate(b);
         } else if (auto* tg = dynamic_cast<ToggleWidget*>(w)) {
+            if (tg->On() == b) {
+                traceBindingNoop();
+                shouldInvalidate = false;
+                return;
+            }
             painted ? tg->SetOn(b)       : tg->SetOnImmediate(b);
         }
         return;
@@ -528,12 +777,27 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
             painted ? pb->SetValue(fv) : pb->SetValueImmediate(fv);
         } else if (auto* cb = dynamic_cast<CheckBoxWidget*>(w)) {
             bool b = v.ToBool();
+            if (cb->Checked() == b) {
+                traceBindingNoop();
+                shouldInvalidate = false;
+                return;
+            }
             painted ? cb->SetChecked(b) : cb->SetCheckedImmediate(b);
         } else if (auto* tg = dynamic_cast<ToggleWidget*>(w)) {
             bool b = v.ToBool();
+            if (tg->On() == b) {
+                traceBindingNoop();
+                shouldInvalidate = false;
+                return;
+            }
             painted ? tg->SetOn(b) : tg->SetOnImmediate(b);
         } else if (auto* rb = dynamic_cast<RadioButtonWidget*>(w)) {
             bool b = v.ToBool();
+            if (rb->Selected() == b) {
+                traceBindingNoop();
+                shouldInvalidate = false;
+                return;
+            }
             painted ? rb->SetSelected(b) : rb->SetSelectedImmediate(b);
         } else if (auto* nb = dynamic_cast<NumberBoxWidget*>(w)) {
             nb->SetValue(static_cast<float>(v.ToNumber()));  // NumberBox 无动画字段, 直接 set
@@ -565,7 +829,7 @@ void PageState::WireMenus() {
 void PageState::WireSubtreeMenus(const std::vector<CompiledMenu>& subMenus,
                                   std::vector<std::shared_ptr<ContextMenu>>& outMenus) {
     if (subMenus.empty()) return;
-    /* Build 73 (L17): toWide / renderer / item 构造细节都搬到 PopulateMenuItem
+    /* Build 73 (L17): toWide / item 构造细节都搬到 PopulateMenuItem
      * 里, WireSubtreeMenus 只负责 shells + trigger + hook 注册. */
     auto resolveTrigger = [this](const std::string& sel) -> Widget* {
         if (sel.size() < 2 || sel[0] != '#') return nullptr;
@@ -586,6 +850,9 @@ void PageState::WireSubtreeMenus(const std::vector<CompiledMenu>& subMenus,
     std::function<std::shared_ptr<ContextMenu>(const CompiledMenu&)> buildOne;
     buildOne = [&](const CompiledMenu& cm) -> std::shared_ptr<ContextMenu> {
         auto menu = std::make_shared<ContextMenu>();
+        if (cm.hasBgColor) menu->SetBgColor(cm.bgColor);
+        if (cm.hasFrostedMaterial) menu->SetFrostedMaterial(cm.frostedMaterial);
+        if (cm.hasBackdropBlur) menu->SetBackdropBlur(cm.backdropBlur);
         compiledToMenu_[&cm] = menu.get();
         /* 递归预建所有 submenu shells, 注册它们自己的 hook. submenu 本身的
          * trigger 是 parent menu item, 不走 widget trigger; 但仍走同款 Show
@@ -742,6 +1009,36 @@ std::string PageState::EvalString(
     return r;
 }
 
+bool PageState::EvalMenuBackdropBlur(
+        const std::string& expr,
+        const std::vector<std::pair<std::string, JSValue>>& locals,
+        float& out) {
+    if (expr.empty() || !jsRt_) return false;
+    JSValue v = EvalBoundExpr(expr, locals);
+    if (JS_IsUndefined(v) || JS_IsException(v) || JS_IsNull(v)) {
+        if (JS_IsException(v)) JS_FreeValue(jsRt_->ctx(), v);
+        return false;
+    }
+
+    JSContext* ctx = jsRt_->ctx();
+    bool ok = false;
+    if (JS_IsNumber(v) || JS_IsBool(v)) {
+        double n = 0.0;
+        if (JS_ToFloat64(ctx, &n, v) == 0 && std::isfinite(n)) {
+            out = static_cast<float>(n);
+            ok = true;
+        }
+    } else if (JS_IsString(v)) {
+        const char* c = JS_ToCString(ctx, v);
+        if (c) {
+            ok = ParseBackdropBlurText(c, out);
+            JS_FreeCString(ctx, c);
+        }
+    }
+    JS_FreeValue(ctx, v);
+    return ok;
+}
+
 void PageState::PopulateMenu(
         ContextMenu* menu, const CompiledMenu& cm,
         const std::vector<std::pair<std::string, JSValue>>& locals) {
@@ -752,10 +1049,24 @@ void PageState::PopulateMenu(
      * 空字符串 = 没绑 = 默认 true (show). */
     if (!cm.vIfExpr.empty() && !EvalBool(cm.vIfExpr, locals, true)) return;
 
-    ui::Renderer* renderer = ui::g_activeRenderer;
-    if (winHandle_) {
-        auto* w = ui::GetContext().GetWindow(winHandle_);
-        if (w) renderer = &w->GetRenderer();
+    if (!cm.boundFrostedMaterialExpr.empty()) {
+        menu->SetFrostedMaterial(
+            EvalBool(cm.boundFrostedMaterialExpr, locals,
+                     cm.hasFrostedMaterial ? cm.frostedMaterial : false));
+    }
+
+    if (!cm.boundBgColorExpr.empty()) {
+        ui::css::Color c;
+        if (ui::css::ParseColor(EvalString(cm.boundBgColorExpr, locals), c)) {
+            menu->SetBgColor(D2D1_COLOR_F{c.r, c.g, c.b, c.a});
+        }
+    }
+
+    if (!cm.boundBackdropBlurExpr.empty()) {
+        float blur = cm.hasBackdropBlur ? cm.backdropBlur : -1.0f;
+        if (EvalMenuBackdropBlur(cm.boundBackdropBlurExpr, locals, blur)) {
+            menu->SetBackdropBlur(blur);
+        }
     }
 
     /* Build 77+/80+/81+: 扫所有 items (含 v-if=false 隐藏的) 算 shortcut /
@@ -770,7 +1081,12 @@ void PageState::PopulateMenu(
                 if (mi.separator) continue;
                 float w = mi.shortcut.length() * 6.5f;
                 if (w > maxW) maxW = w;
-                if (mi.submenu) { hasSub = true; scan(*mi.submenu, maxW, hasSub, maxC); }
+                if (mi.submenu) {
+                    hasSub = true;
+                    if (m.shareWidthWithSubmenus) {
+                        scan(*mi.submenu, maxW, hasSub, maxC);
+                    }
+                }
                 /* 真实 measurement, build 83 (正确 CSS spec): build wrapper widget tree,
                  * SizeHint() 走 fixedW (CSS `width: NNN`) 或 children sum (fit-content
                  * fallback). max-width 是严格上界 (cap), min-width 是严格下界. 跟
@@ -823,7 +1139,7 @@ void PageState::PopulateMenu(
                         idxV = JS_NewInt32(ctx, (int32_t)i);
                         extended.emplace_back(mi.vForIndexVar, idxV);
                     }
-                    PopulateMenuItem(menu, mi, extended, renderer);
+                    PopulateMenuItem(menu, mi, extended);
                     if (!JS_IsUndefined(idxV)) JS_FreeValue(ctx, idxV);
                     JS_FreeValue(ctx, elem);
                 }
@@ -832,14 +1148,16 @@ void PageState::PopulateMenu(
                 JS_FreeValue(jsRt_->ctx(), arr);
             }
         } else {
-            PopulateMenuItem(menu, mi, locals, renderer);
+            PopulateMenuItem(menu, mi, locals);
         }
     }
 
     /* Build 85+: 跨菜单树传播 — 算完 parent 的最终 MenuWidth, 回写到所有
      * submenu 当 minPropagatedWidth, 让 submenu 至少跟 parent 同宽. 整族
-     * 菜单视觉一致 (不再 submenu 缩到自身文字宽度). */
-    float parentWidth = menu->MenuWidth();
+     * 菜单视觉一致 (不再 submenu 缩到自身文字宽度).
+     * build 249: share-width=false 让调用方关闭这条传播, 使子菜单按自身
+     * 内容列宽度收缩。 */
+    float parentWidth = cm.shareWidthWithSubmenus ? menu->MenuWidth() : 0.0f;
     std::function<void(const CompiledMenu&)> propagate;
     propagate = [&propagate, this, parentWidth](const CompiledMenu& m) {
         for (const auto& mi : m.items) {
@@ -857,8 +1175,7 @@ void PageState::PopulateMenu(
 
 void PageState::PopulateMenuItem(
         ContextMenu* menu, const CompiledMenuItem& mi,
-        const std::vector<std::pair<std::string, JSValue>>& locals,
-        ui::Renderer* renderer) {
+        const std::vector<std::pair<std::string, JSValue>>& locals) {
     /* item-level v-if / v-show: 求 false → skip, 也不占位 (separator 同款) */
     if (!mi.vIfExpr.empty() && !EvalBool(mi.vIfExpr, locals, true)) return;
 
@@ -877,7 +1194,6 @@ void PageState::PopulateMenuItem(
     std::string scStr = !mi.boundShortcutExpr.empty()
         ? EvalString(mi.boundShortcutExpr, locals) : mi.shortcut;
     std::wstring shortcut = scStr.empty() ? L"" : toWide(scStr);
-    (void)renderer;  // 不再走 svg bitmap 路径, lib widget tree 自管
 
     /* BREAKING (build 75): customContent widget tree — 通过 CompileIterationTemplate
      * 把 mi.contentRoot AST (一个 <div class="menuitem-row"> 包了用户写的 svg /
@@ -1047,6 +1363,40 @@ void PageState::AttachWindow(uint64_t winHandle) {
         }
         if (prev) prev(info);
     };
+
+    win->onPageResize = [self](int width, int height) {
+        if (self) self->DispatchQuickJSResize(width, height);
+    };
+}
+
+void PageState::DispatchQuickJSResize(int width, int height) {
+    if (!jsRt_ || JS_IsUndefined(jsState_) || JS_IsUndefined(jsOptions_)) return;
+    EnsurePageLayout(this);
+
+    JSContext* ctx = jsRt_->ctx();
+    JSValue fn = JS_GetPropertyStr(ctx, jsOptions_, "onResize");
+    if (!JS_IsFunction(ctx, fn)) {
+        JS_FreeValue(ctx, fn);
+        fn = JS_GetPropertyStr(ctx, jsState_, "onResize");
+    }
+    if (!JS_IsFunction(ctx, fn)) {
+        JS_FreeValue(ctx, fn);
+        return;
+    }
+
+    JSValue args[2] = { JS_NewInt32(ctx, width), JS_NewInt32(ctx, height) };
+    JSValue r = JS_Call(ctx, fn, jsState_, 2, args);
+    JS_FreeValue(ctx, args[0]);
+    JS_FreeValue(ctx, args[1]);
+    if (JS_IsException(r)) {
+        JSValue exc = JS_GetException(ctx);
+        const char* msg = JS_ToCString(ctx, exc);
+        errors_.push_back(std::string("onResize threw: ") + (msg ? msg : "(no message)"));
+        if (msg) JS_FreeCString(ctx, msg);
+        JS_FreeValue(ctx, exc);
+    }
+    JS_FreeValue(ctx, r);
+    JS_FreeValue(ctx, fn);
 }
 
 ContextMenu* PageState::FindMenuById(const std::string& id) const {
@@ -1298,6 +1648,12 @@ void PageState::AttachQuickJS(CompiledPage page) {
                                        currentLocale_.size()));
     JS_SetPropertyStr(ctx, dataObj, "$t",
                        JS_NewCFunction(ctx, &JsTranslateTrampoline, "$t", 1));
+    JS_SetPropertyStr(ctx, dataObj, "$rect",
+                       JS_NewCFunction(ctx, &JsRectTrampoline, "$rect", 1));
+    JS_SetPropertyStr(ctx, dataObj, "$windowSize",
+                       JS_NewCFunction(ctx, &JsWindowSizeTrampoline, "$windowSize", 0));
+    JS_SetPropertyStr(ctx, dataObj, "$nextTick",
+                       JS_NewCFunction(ctx, &JsNextTickTrampoline, "$nextTick", 1));
 
     // 3b. MakeReactive — capture dataObj's pointer first; the Proxy keeps a
     // ref so the underlying object stays alive, and the get-trap uses the

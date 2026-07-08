@@ -75,10 +75,6 @@ public:
     static std::unique_ptr<IImageSource>
         CreateFromFile(const std::wstring& path, Renderer& r);
 
-    // 静态位图：外部已有 ID2D1Bitmap（如主动 SetBitmap 场景）
-    static std::unique_ptr<IImageSource>
-        CreateFromBitmap(ComPtr<ID2D1Bitmap> bmp);
-
     // 从内存像素（BGRA）创建静态位图源
     static std::unique_ptr<IImageSource>
         CreateFromPixels(const void* pixels, int w, int h, int stride, Renderer& r);
@@ -93,7 +89,6 @@ public:
         virtual ~ITiledSource() = default;
         virtual void SetTile(int tx, int ty, const void* pixels,
                              int w, int h, int stride) = 0;
-        virtual void SetPreview(ComPtr<ID2D1Bitmap> bmp, int w, int h) = 0;
         virtual void ClearTiles() = 0;
         virtual int  TileSize() const = 0;
     };

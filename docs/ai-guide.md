@@ -263,6 +263,8 @@ void  ui_widget_on_click(UiWidget w, void (*cb)(UiWidget, void*), void* userdata
 UiMenu ui_menu_create(void);
 void   ui_menu_add_item(UiMenu menu, int id, const wchar_t* text);
 void   ui_menu_add_separator(UiMenu menu);
+void   ui_menu_set_bg_color(UiMenu menu, UiColor color);      // alpha controls tint
+void   ui_menu_set_backdrop_blur(UiMenu menu, float radius);  // <0 default, 0 off
 void   ui_menu_show(UiWindow win, UiMenu menu, float x, float y);
 // 通过 ui_window_on_menu 收 id → 分发
 

@@ -16,6 +16,8 @@
 #include <unordered_map>
 #include <cstdint>
 #include "theme.h"
+#include "display_list.h"
+#include "render_handles.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -24,6 +26,7 @@ namespace ui {
 // Parsed SVG icon (cached geometry for efficient rendering)
 struct SvgPathLayer {
     ComPtr<ID2D1PathGeometry> geometry;
+    std::vector<std::string> pathData;
     float opacity = 1.0f;     // per-path opacity from SVG
     float strokeWidth = 0.0f; // >0 means stroke instead of fill
     /* 累积的 SVG transform（来自所有外层 <g transform> + 自身 transform）。
@@ -31,44 +34,9 @@ struct SvgPathLayer {
     D2D1_MATRIX_3X2_F transform = D2D1::Matrix3x2F::Identity();
 };
 
-/* L75: SVG 文字 run —— <text>/<tspan> 或 <foreignObject> 内嵌 HTML 文字.
- * D2D ID2D1SvgDocument 只渲染形状 (shapes-only, 不画文字), core-ui 自己把文字
- * 解析出来用 DirectWrite 叠加补渲 —— 跟形状走同一个 user→screen 变换, 保证
- * 对齐 + 任意缩放矢量清晰. 覆盖 Mermaid (foreignObject) / draw.io / Graphviz
- * (<text>) 等图表 SVG. */
-// L87: SVG 渐变 fill (linear/radial), 给 <text> 叠加渲染用.
-struct SvgGradientStop {
-    float        offset = 0.0f;                 // 0..1
-    D2D1_COLOR_F color  = D2D1::ColorF(0, 0, 0, 1);
-};
-struct SvgTextGradient {
-    bool  radial    = false;
-    bool  userSpace = false;                    // gradientUnits: false=objectBoundingBox(默认)
-    D2D1_MATRIX_3X2_F transform = D2D1::Matrix3x2F::Identity();  // gradientTransform
-    float x1 = 0, y1 = 0, x2 = 1, y2 = 0;       // linear 向量 (objectBB 默认水平 0→1)
-    float cx = 0.5f, cy = 0.5f, r = 0.5f;       // radial 中心/半径
-    std::vector<SvgGradientStop> stops;
-};
-
-struct SvgTextRun {
-    std::wstring      text;        // 已解码 (实体 + <br>/</p> → \n), 可多行
-    D2D1_MATRIX_3X2_F transform = D2D1::Matrix3x2F::Identity();  // 累积 <g> transform
-    float             x = 0.0f;    // user-space 锚点 (在 transform 之前的局部坐标)
-    float             y = 0.0f;
-    float             fontSize = 16.0f;
-    std::wstring      fontFamily;  // 空 / 通用名(sans-serif…) = 主题默认字体
-    DWRITE_FONT_WEIGHT fontWeight = DWRITE_FONT_WEIGHT_NORMAL;  // L87: font-weight
-    D2D1_COLOR_F      color = D2D1::ColorF(D2D1::ColorF::Black);
-    float             opacity = 1.0f;   // L87: 累积父 <g opacity> + 自身 (fill-)opacity
-    bool              hasGradient = false;  // L87: fill="url(#id)" 命中渐变
-    SvgTextGradient   gradient;             // L87: hasGradient 时有效
-    int               anchor = 0;  // text-anchor: 0=start 1=middle 2=end
-    float             maxWidth = 0.0f;  // >0 = 换行宽度 (foreignObject width)
-    bool              block = false;    // true = foreignObject (块级, 围绕 (x,y) 居中)
-};
-
 struct SvgIcon {
     ComPtr<ID2D1PathGeometry> geometry;  // combined (legacy, used if layers empty)
+    std::vector<std::string> pathData;   // pure path-data for render-thread replay
     std::vector<SvgPathLayer> layers;    // per-path with opacity
     std::vector<SvgTextRun>   textRuns;  // L75: <text> / <foreignObject> 文字
     float viewBoxW = 24;
@@ -78,6 +46,16 @@ struct SvgIcon {
 
 class Renderer {
 public:
+    class SharedD2DGuard {
+    public:
+        SharedD2DGuard();
+        ~SharedD2DGuard();
+        SharedD2DGuard(const SharedD2DGuard&) = delete;
+        SharedD2DGuard& operator=(const SharedD2DGuard&) = delete;
+    };
+
+    ~Renderer();
+
     // Create and own factories internally (standalone mode)
     bool Init();
 
@@ -91,9 +69,12 @@ public:
     // the desktop without WS_EX_LAYERED's GDI bottleneck. Anti-aliased
     // round corners come from D2D's normal FillRoundedRectangle path.
     bool CreateRenderTargetForLayered(HWND hwnd);
+    void ReleaseRenderTarget();
     void Resize(UINT width, UINT height);
     void BeginDraw();
     HRESULT EndDraw();
+    HRESULT PresentPrepared(bool skipVSync);
+    HRESULT SetSwapChainBackgroundColor(const D2D1_COLOR_F& color);
     void FlushAndTrimGpu();
 
     // Skip VSync for next Present (used during resize for immediate feedback)
@@ -108,8 +89,18 @@ public:
     bool skipPresent = false;
 
     void Clear(const D2D1_COLOR_F& color);
+    void SetDisplayListRecorder(DisplayListRecorder* recorder);
+    DisplayListRecorder* DisplayListRecorderTarget() const { return displayListRecorder_; }
+    bool IsRecordingDisplayList() const { return ActiveDisplayListRecorder() != nullptr; }
+    bool RenderSvgDocumentToBgra(const std::string& xml,
+                                 float viewportW, float viewportH,
+                                 const std::vector<SvgDocumentRef::DropShadowLayer>& dropShadowLayers,
+                                 uint32_t width, uint32_t height,
+                                 uint8_t* outBgra);
     void FillRect(const D2D1_RECT_F& rect, const D2D1_COLOR_F& color);
     void FillRoundedRect(const D2D1_RECT_F& rect, float rx, float ry, const D2D1_COLOR_F& color);
+    bool DrawBlurredRoundedRect(const D2D1_RECT_F& rect, float rx, float ry,
+                                float blurRadius, const D2D1_COLOR_F& color);
     void DrawRect(const D2D1_RECT_F& rect, const D2D1_COLOR_F& color, float width = 1.0f);
     void DrawRoundedRect(const D2D1_RECT_F& rect, float rx, float ry, const D2D1_COLOR_F& color, float width = 1.0f);
     void DrawLine(float x1, float y1, float x2, float y2, const D2D1_COLOR_F& color, float width = 1.0f);
@@ -117,7 +108,8 @@ public:
                   float fontSize, DWRITE_TEXT_ALIGNMENT align = DWRITE_TEXT_ALIGNMENT_LEADING,
                   DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL,
                   DWRITE_PARAGRAPH_ALIGNMENT vAlign = DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
-                  bool wordWrap = false);
+                  bool wordWrap = false,
+                  const wchar_t* family = nullptr);
     float MeasureTextWidth(const std::wstring& text, float fontSize,
                            const wchar_t* family = nullptr,  /* nullptr = 用 DefaultFontFamily() */
                            DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL);
@@ -131,6 +123,12 @@ public:
     // 解析器使用：HTML <img src="logo.png"> → asset::Resolve → 这里。
     // bytes 在调用期间需有效；返回的位图自带 GPU 资源、跟字节解耦。
     ComPtr<ID2D1Bitmap> LoadImageFromBytes(const void* bytes, size_t size);
+    bool DecodeImageFileToBgraPremul(const std::wstring& path,
+                                     std::vector<uint8_t>& pixels,
+                                     int& width, int& height, int& stride);
+    bool DecodeImageBytesToBgraPremul(const void* bytes, size_t size,
+                                      std::vector<uint8_t>& pixels,
+                                      int& width, int& height, int& stride);
 
     // Animated image (GIF) support — 按需解码：维护一张 CPU 画布 + 元数据表，
     // 调用方在动画 timer 里推进帧。内存随 GIF 尺寸而非帧数增长。
@@ -174,6 +172,9 @@ public:
     ComPtr<ID2D1Bitmap> CreateEmptyBitmap(int width, int height);
     /* HICON → D2D 位图。用于把 EXE 嵌入的图标资源 / Win32 加载的图标转成
        D2D 可绘制位图。caller 仍持有 HICON 所有权，函数内不 DestroyIcon。 */
+    bool DecodeHICONToBgraPremul(HICON hicon,
+                                 std::vector<uint8_t>& pixels,
+                                 int& width, int& height, int& stride);
     ComPtr<ID2D1Bitmap> CreateBitmapFromHICON(HICON hicon);
     void DrawBitmap(ID2D1Bitmap* bitmap, const D2D1_RECT_F& destRect, float opacity = 1.0f,
                     D2D1_BITMAP_INTERPOLATION_MODE interp = D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
@@ -183,6 +184,16 @@ public:
     /* 带锐化的位图绘制（用于图片查看器） */
     void DrawBitmapSharpened(ID2D1Bitmap* bitmap, const D2D1_RECT_F& destRect, float sharpenAmount = 0.3f,
                               D2D1_INTERPOLATION_MODE interp = D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+    void RecordImage(ResourceKey key, const D2D1_RECT_F& destRect,
+                     ImageSampling sampling, float opacity = 1.0f);
+    void DrawImageResource(ResourceKey key, const D2D1_RECT_F& destRect,
+                           ImageSampling sampling, float opacity = 1.0f);
+    void FillRectWithImagePattern(ResourceKey key, ID2D1Bitmap* bitmap, const D2D1_RECT_F& rect);
+    void FillGradientRect(GradientRef gradient, const D2D1_RECT_F& rect, float radius);
+    void RecordSvgDocument(std::string xml, float viewportW, float viewportH,
+                           D2D1_MATRIX_3X2_F transform,
+                           std::vector<SvgDocumentRef::DropShadowLayer> dropShadowLayers = {});
+    bool DrawBackdropBlur(const D2D1_RECT_F& rect, float radius, float blurRadius);
     void FillRectWithBitmap(ID2D1Bitmap* bitmap, const D2D1_RECT_F& rect);
     void PushClip(const D2D1_RECT_F& rect);
     void PopClip();
@@ -194,6 +205,9 @@ public:
     void PopRoundedClip();
     void PushOpacity(float opacity, const D2D1_RECT_F& bounds);
     void PopOpacity();
+    void PushTransform(const D2D1_MATRIX_3X2_F& transform);
+    void PopTransform();
+    void ReplayDisplayList(const DisplayList& list);
 
     // SVG icon support
     SvgIcon ParseSvgIcon(const std::string& svgContent);
@@ -218,6 +232,12 @@ public:
      * Windows 10 1607 以下返回 nullptr，调用方应做 null 检查并降级。
      * ctx5_ 与 ctx_ 指向同一 D2D 对象，通过 QueryInterface 获得。*/
     ID2D1DeviceContext5* RT5() { return ctx5_.Get(); }
+    /* 创建/校验 D2D SVG document。渲染线程接管后 UI Renderer 可能没有窗口
+     * RT，此时会临时创建无 target 的 device context 解析 SVG，避免加载阶段
+     * 依赖 UI 线程 render target。outDoc 可为空，仅做校验。 */
+    bool CreateSvgDocumentFromXml(const std::string& xml,
+                                  float viewportW, float viewportH,
+                                  ComPtr<ID2D1SvgDocument>* outDoc = nullptr);
     ID2D1Factory1* Factory() { return factory_; }
     IDWriteFactory* DWFactory() { return dwFactory_; }
     IWICImagingFactory* WIC() { return wicFactory_; }
@@ -234,7 +254,14 @@ public:
                                                 DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL);
 
     // 临时设置渲染目标（用于缓存等场景）
-    void SetTarget(ID2D1DeviceContext* target) { ctx_ = target; }
+    void SetTarget(ID2D1DeviceContext* target) {
+        ctx_ = target;
+        ctx5_.Reset();
+        if (ctx_) {
+            ctx_.As(&ctx5_);
+        }
+        targetThreadId_ = GetCurrentThreadId();
+    }
 
     // ---- 字体 / 渲染模式 per-window 状态 (since 1.3.0) ----
     // 空串 = 跟随 theme:: 全局默认
@@ -297,6 +324,7 @@ private:
     ComPtr<ID2D1Factory1>      ownedFactory_;
     ComPtr<IDWriteFactory>     ownedDwFactory_;
     ComPtr<IWICImagingFactory> ownedWicFactory_;
+    ComPtr<ID2D1Factory1>      sharedDeviceFactory_;
 
     // Active pointers (may point to owned or external)
     ID2D1Factory1*      factory_    = nullptr;
@@ -308,6 +336,9 @@ private:
     static ComPtr<ID2D1Device>   s_d2dDevice;
     static int                   s_deviceRefCount;
     bool EnsureSharedDevice();
+    bool AcquireSharedDeviceRef();
+    void BindFactoryFromSharedDevice();
+    void ReleaseSharedDeviceRef();
 
 public:
     /* 启动加速: 后台线程预创建共享 D3D11 设备 (D3D11CreateDevice 占首窗
@@ -316,6 +347,7 @@ public:
      * 首窗 RT 创建从 ~39ms 降到 ~3ms。D2D 设备仍在 UI 线程创建
      * (single-threaded factory 约束)。幂等, 多次调用无害。 */
     static void PrewarmSharedDeviceAsync();
+    static void ResetSharedDeviceForDeviceLost();
 
 private:
 
@@ -327,6 +359,9 @@ private:
     ComPtr<IDXGISwapChain1>    swapChain_;
     ComPtr<ID2D1Bitmap1>       targetBitmap_;
     HWND                       hwnd_ = nullptr;
+    bool                       hasSharedDeviceRef_ = false;
+    DWORD                      targetThreadId_ = 0;
+    std::vector<D2D1_MATRIX_3X2_F> transformStack_;
     // DirectComposition objects — only populated for layered/composition
     // mode (CreateRenderTargetForLayered). Held alive so the visual tree
     // stays bound to the hwnd; destruction order is automatic via ComPtr.
@@ -342,6 +377,12 @@ private:
     ComPtr<ID2D1SolidColorBrush> GetBrush(const D2D1_COLOR_F& color);
     ComPtr<IDWriteTextFormat> GetTextFormat(float fontSize, const wchar_t* family = nullptr,
                                             DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL);
+    ComPtr<ID2D1Bitmap> GetCachedImageBitmap(ResourceKey key);
+    void PruneImageBitmapCacheTo(const std::vector<ImageRef>& imageRefs);
+    void DebugAssertTargetThread(const char* op) const;
+    DisplayListRecorder* ActiveDisplayListRecorder() const {
+        return displayListRecorderPauseDepth_ == 0 ? displayListRecorder_ : nullptr;
+    }
 
     // ---- Per-window font / render 状态 (since 1.3.0) ----
     // 空串 = 跟随 theme:: 全局
@@ -350,16 +391,14 @@ private:
     std::wstring          cjkFontOverride_;
     bool                  hasRenderModeOverride_ = false;
     theme::TextRenderMode renderModeOverride_ = theme::TextRenderMode::Smooth;
+    DisplayListRecorder*  displayListRecorder_ = nullptr;
+    int                   displayListRecorderPauseDepth_ = 0;
+    std::unordered_map<ResourceKey, ComPtr<ID2D1Bitmap>, ResourceKeyHash> imageBitmapCache_;
 
     // 根据当前 latin/cjk 设置构造 IDWriteFontFallback；如果两个都空则返回 nullptr。
     // 构造后由 Apply... 在 TextFormat3 上 SetFontFallback。
     ComPtr<IDWriteFontFallback> fontFallback_;
     void RebuildFontFallback();
 };
-
-/* 当前正在 paint 的窗口 Renderer (BeginDraw 进入时设, EndDraw 时清).
-   定义在 ui_window.cpp. 跨文件用得到的几个地方都以前是 inline extern, 这里
-   集中提一下 (避免在嵌套 namespace 里漏写命名空间限定). */
-extern Renderer* g_activeRenderer;
 
 } // namespace ui

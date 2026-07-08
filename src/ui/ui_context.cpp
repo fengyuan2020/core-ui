@@ -1,4 +1,7 @@
 #include "ui_context.h"
+#include "debug_trace.h"
+#include "overlay_service.h"
+#include "render_thread.h"
 #include "ui_window.h"
 #include <objbase.h>
 
@@ -112,6 +115,8 @@ void Context::Shutdown() {
 
     menus_.clear();
     windows_.clear();
+    OverlayService::Instance().Stop();
+    RenderThread::Instance().Stop();
     handles.Clear();
     wicFactory_.Reset();
     dwFactory_.Reset();
@@ -159,14 +164,32 @@ void Context::RemoveWindow(uint64_t id) {
 }
 
 void Context::InvalidateAllWindows() {
+    int invalidated = 0;
+    int skippedHidden = 0;
     for (auto& [id, win] : windows_) {
-        if (win) win->Invalidate();
+        if (!win) continue;
+        HWND hwnd = win->Handle();
+        if (hwnd && (!IsWindowVisible(hwnd) || IsIconic(hwnd))) {
+            ++skippedHidden;
+            continue;
+        }
+        win->Invalidate();
+        ++invalidated;
+    }
+    if (IsTraceEnabled()) {
+        TraceEvent("core_context", "invalidate_all_windows",
+                   {TraceI64("invalidated", invalidated),
+                    TraceI64("skipped_hidden", skippedHidden)});
     }
 }
 
 void Context::RelayoutAllWindows() {
     for (auto& [id, win] : windows_) {
-        if (win) { win->LayoutRoot(); win->Invalidate(); }
+        if (!win) continue;
+        win->LayoutRoot();
+        HWND hwnd = win->Handle();
+        if (hwnd && (!IsWindowVisible(hwnd) || IsIconic(hwnd))) continue;
+        win->Invalidate();
     }
 }
 
@@ -174,6 +197,15 @@ void Context::UpdateAnimTimers() {
     for (auto& [id, win] : windows_) {
         if (win) win->UpdateToggleAnimTimer();
     }
+}
+
+void Context::RegisterAnimatingWidget(Widget* w, AnimationInvalidation invalidation) {
+    if (auto* win = FindWindowByWidget(w)) {
+        win->RegisterAnimatingWidget(w, invalidation);
+        return;
+    }
+
+    UpdateAnimTimers();
 }
 
 void Context::NotifyWidgetDestroyed(Widget* w) {

@@ -1,6 +1,12 @@
 #include "renderer.h"
 
+#include "debug_trace.h"
+#include "display_list.h"
+#include "resource_store.h"
+
+#include <algorithm>
 #include <condition_variable>
+#include <d2d1effects.h>
 #include <mutex>
 #include <thread>
 #include "theme.h"
@@ -8,6 +14,7 @@
 #pragma comment(lib, "dcomp.lib")
 #include <vector>
 #include <map>
+#include <unordered_set>
 #include <string>
 #include <memory>
 #include <cmath>
@@ -15,7 +22,9 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <cctype>
 #include <limits>
+#include <shlwapi.h>
 #include <windows.h>
 
 #pragma comment(lib, "d2d1.lib")
@@ -51,6 +60,9 @@ static inline UINT GetDpiForWindow(HWND hwnd) {
 namespace ui {
 
 namespace {
+std::mutex g_sharedDeviceMu;
+std::recursive_mutex g_sharedD2DUseMu;
+
 static uint32_t FloatBits(float v) {
     uint32_t bits = 0;
     static_assert(sizeof(bits) == sizeof(v), "float size mismatch");
@@ -71,7 +83,142 @@ static const wchar_t* ResolveLocaleName() {
     }
     return locale;
 }
+
+ComPtr<ID2D1Brush> CreateDisplayListGradientBrush(ID2D1RenderTarget* rt,
+                                                  const D2D1_RECT_F& rect,
+                                                  const GradientRef& gradient) {
+    if (!rt || gradient.stops.empty()) return nullptr;
+
+    std::vector<D2D1_GRADIENT_STOP> d2dStops;
+    d2dStops.reserve(gradient.stops.size());
+    for (size_t i = 0; i < gradient.stops.size(); ++i) {
+        D2D1_GRADIENT_STOP stop{};
+        stop.position = gradient.stops[i].position >= 0.0f
+            ? gradient.stops[i].position
+            : (gradient.stops.size() > 1
+                ? static_cast<float>(i) / static_cast<float>(gradient.stops.size() - 1)
+                : 0.0f);
+        stop.color = gradient.stops[i].color;
+        d2dStops.push_back(stop);
+    }
+
+    ComPtr<ID2D1GradientStopCollection> stops;
+    rt->CreateGradientStopCollection(d2dStops.data(), static_cast<UINT32>(d2dStops.size()),
+                                     D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP,
+                                     stops.GetAddressOf());
+    if (!stops) return nullptr;
+
+    if (!gradient.radial) {
+        const float rad = gradient.angle_deg * 3.14159265f / 180.0f;
+        const float dx = std::sin(rad);
+        const float dy = -std::cos(rad);
+        const float cx = (rect.left + rect.right) * 0.5f;
+        const float cy = (rect.top + rect.bottom) * 0.5f;
+        const float halfW = (rect.right - rect.left) * 0.5f;
+        const float halfH = (rect.bottom - rect.top) * 0.5f;
+        const float halfLen = std::abs(dx) * halfW + std::abs(dy) * halfH;
+        D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES props = {
+            { cx - dx * halfLen, cy - dy * halfLen },
+            { cx + dx * halfLen, cy + dy * halfLen }
+        };
+        ComPtr<ID2D1LinearGradientBrush> brush;
+        rt->CreateLinearGradientBrush(props, stops.Get(), brush.GetAddressOf());
+        return brush;
+    }
+
+    const float w = rect.right - rect.left;
+    const float h = rect.bottom - rect.top;
+    D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES props = {};
+    props.center = {
+        rect.left + w * gradient.cx_pct / 100.0f,
+        rect.top + h * gradient.cy_pct / 100.0f
+    };
+    props.gradientOriginOffset = {0, 0};
+    const float radius = std::max(w, h) * gradient.radius_pct / 100.0f;
+    props.radiusX = radius;
+    props.radiusY = radius;
+
+    ComPtr<ID2D1RadialGradientBrush> brush;
+    rt->CreateRadialGradientBrush(props, stops.Get(), brush.GetAddressOf());
+    return brush;
+}
+
+void PaintDisplayListGradient(ID2D1RenderTarget* rt,
+                              const D2D1_RECT_F& rect,
+                              const GradientRef& gradient,
+                              float radius) {
+    if (!rt || gradient.stops.empty()) return;
+
+    const bool tiled = gradient.tile_w > 0.0f && gradient.tile_h > 0.0f;
+    if (!tiled) {
+        auto brush = CreateDisplayListGradientBrush(rt, rect, gradient);
+        if (!brush) return;
+        if (radius > 0.0f) {
+            rt->FillRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), brush.Get());
+        } else {
+            rt->FillRectangle(rect, brush.Get());
+        }
+        return;
+    }
+
+    const D2D1_SIZE_F tileSize = D2D1::SizeF(gradient.tile_w, gradient.tile_h);
+    ComPtr<ID2D1BitmapRenderTarget> tileRT;
+    if (FAILED(rt->CreateCompatibleRenderTarget(tileSize, tileRT.GetAddressOf()))) return;
+
+    const D2D1_RECT_F tileRect = {0.0f, 0.0f, gradient.tile_w, gradient.tile_h};
+    auto tileBrush = CreateDisplayListGradientBrush(tileRT.Get(), tileRect, gradient);
+    if (!tileBrush) return;
+
+    tileRT->BeginDraw();
+    tileRT->Clear(D2D1::ColorF(0, 0, 0, 0));
+    tileRT->FillRectangle(tileRect, tileBrush.Get());
+    if (FAILED(tileRT->EndDraw())) return;
+
+    ComPtr<ID2D1Bitmap> tileBmp;
+    if (FAILED(tileRT->GetBitmap(tileBmp.GetAddressOf())) || !tileBmp) return;
+
+    D2D1_BITMAP_BRUSH_PROPERTIES bbp = {
+        D2D1_EXTEND_MODE_WRAP,
+        D2D1_EXTEND_MODE_WRAP,
+        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+    };
+    D2D1_BRUSH_PROPERTIES bp = {};
+    bp.opacity = 1.0f;
+    bp.transform = D2D1::Matrix3x2F::Translation(rect.left + gradient.pos_x,
+                                                 rect.top + gradient.pos_y);
+
+    ComPtr<ID2D1BitmapBrush> brush;
+    if (FAILED(rt->CreateBitmapBrush(tileBmp.Get(), bbp, bp, brush.GetAddressOf())) || !brush) {
+        return;
+    }
+
+    if (radius > 0.0f) {
+        rt->FillRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), brush.Get());
+    } else {
+        rt->FillRectangle(rect, brush.Get());
+    }
+}
+
+void DebugBreakIfAttached() {
+#if defined(_DEBUG)
+    if (IsDebuggerPresent()) DebugBreak();
+#else
+    (void)0;
+#endif
+}
 } // namespace
+
+Renderer::SharedD2DGuard::SharedD2DGuard() {
+    g_sharedD2DUseMu.lock();
+}
+
+Renderer::SharedD2DGuard::~SharedD2DGuard() {
+    g_sharedD2DUseMu.unlock();
+}
+
+Renderer::~Renderer() {
+    ReleaseRenderTarget();
+}
 
 bool Renderer::Init() {
     D2D1_FACTORY_OPTIONS options = {};
@@ -191,21 +338,67 @@ bool Renderer::EnsureSharedDevice() {
     return true;
 }
 
-bool Renderer::CreateRenderTarget(HWND hwnd) {
-    hwnd_ = hwnd;
-    targetBitmap_.Reset();
-    swapChain_.Reset();
-    ctx_.Reset();
-    ctx5_.Reset();
+bool Renderer::AcquireSharedDeviceRef() {
+    std::lock_guard<std::mutex> deviceLock(g_sharedDeviceMu);
+    if (!EnsureSharedDevice()) return false;
+    BindFactoryFromSharedDevice();
+    if (!hasSharedDeviceRef_) {
+        ++s_deviceRefCount;
+        hasSharedDeviceRef_ = true;
+    }
+    return true;
+}
+
+void Renderer::BindFactoryFromSharedDevice() {
+    if (!s_d2dDevice) return;
+    ComPtr<ID2D1Factory> baseFactory;
+    s_d2dDevice->GetFactory(baseFactory.GetAddressOf());
+    ComPtr<ID2D1Factory1> factory1;
+    if (!baseFactory || FAILED(baseFactory.As(&factory1)) || !factory1) return;
+    if (factory_ == factory1.Get()) {
+        sharedDeviceFactory_ = factory1;
+        return;
+    }
+    sharedDeviceFactory_ = factory1;
+    factory_ = sharedDeviceFactory_.Get();
+    roundStrokeStyle_.Reset();
     brushCache_.clear();
+}
+
+void Renderer::ReleaseSharedDeviceRef() {
+    std::lock_guard<std::mutex> deviceLock(g_sharedDeviceMu);
+    if (!hasSharedDeviceRef_) return;
+    if (s_deviceRefCount > 0) {
+        --s_deviceRefCount;
+    }
+    hasSharedDeviceRef_ = false;
+    if (s_deviceRefCount == 0) {
+        s_d2dDevice.Reset();
+    }
+}
+
+void Renderer::ResetSharedDeviceForDeviceLost() {
+    std::lock_guard<std::mutex> deviceLock(g_sharedDeviceMu);
+    s_d2dDevice.Reset();
+    s_d3dDevice.Reset();
+    s_deviceRefCount = 0;
+}
+
+bool Renderer::CreateRenderTarget(HWND hwnd) {
+    ReleaseRenderTarget();
+    hwnd_ = hwnd;
+    targetThreadId_ = GetCurrentThreadId();
+    auto fail = [&]() {
+        ReleaseRenderTarget();
+        return false;
+    };
 
     /* 1. 确保共享 D3D11/D2D 设备已创建 */
-    if (!EnsureSharedDevice()) return false;
-    s_deviceRefCount++;
+    if (!AcquireSharedDeviceRef()) return false;
 
     /* 2. 为此窗口创建独立的 DeviceContext */
     HRESULT hr = s_d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, ctx_.GetAddressOf());
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) return fail();
 
     /* 2.1. 尝试 QI 到 ID2D1DeviceContext5（支持 SVG、Color Font 等 1607+ 功能）。
      * 老系统失败则 ctx5_ 为空，SVG 等能力自动降级。*/
@@ -214,15 +407,15 @@ bool Renderer::CreateRenderTarget(HWND hwnd) {
     /* 3. 创建 SwapChain */
     ComPtr<IDXGIDevice> dxgiDevice;
     hr = s_d3dDevice.As(&dxgiDevice);
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) return fail();
 
     ComPtr<IDXGIAdapter> adapter;
     hr = dxgiDevice->GetAdapter(adapter.GetAddressOf());
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) return fail();
 
     ComPtr<IDXGIFactory2> dxgiFactory;
     hr = adapter->GetParent(__uuidof(IDXGIFactory2), reinterpret_cast<void**>(dxgiFactory.GetAddressOf()));
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) return fail();
 
     RECT rc;
     GetClientRect(hwnd, &rc);
@@ -239,12 +432,13 @@ bool Renderer::CreateRenderTarget(HWND hwnd) {
 
     hr = dxgiFactory->CreateSwapChainForHwnd(s_d3dDevice.Get(), hwnd, &desc,
                                               nullptr, nullptr, swapChain_.GetAddressOf());
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) return fail();
+    SetSwapChainBackgroundColor(theme::kWindowBg());
 
     /* 4. 从 SwapChain 获取 back buffer，创建 target bitmap */
     ComPtr<IDXGISurface> surface;
     hr = swapChain_->GetBuffer(0, __uuidof(IDXGISurface), reinterpret_cast<void**>(surface.GetAddressOf()));
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) return fail();
 
     UINT dpi = GetDpiForWindow(hwnd);
     D2D1_BITMAP_PROPERTIES1 bitmapProps = {};
@@ -254,7 +448,7 @@ bool Renderer::CreateRenderTarget(HWND hwnd) {
     bitmapProps.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
 
     hr = ctx_->CreateBitmapFromDxgiSurface(surface.Get(), bitmapProps, targetBitmap_.GetAddressOf());
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) return fail();
 
     ctx_->SetTarget(targetBitmap_.Get());
 
@@ -275,32 +469,29 @@ bool Renderer::CreateRenderTarget(HWND hwnd) {
 }
 
 bool Renderer::CreateRenderTargetForLayered(HWND hwnd) {
+    ReleaseRenderTarget();
     hwnd_ = hwnd;
-    targetBitmap_.Reset();
-    swapChain_.Reset();
-    ctx_.Reset();
-    ctx5_.Reset();
-    dcompVisual_.Reset();
-    dcompTarget_.Reset();
-    dcompDevice_.Reset();
-    brushCache_.clear();
+    targetThreadId_ = GetCurrentThreadId();
+    auto fail = [&]() {
+        ReleaseRenderTarget();
+        return false;
+    };
 
-    if (!EnsureSharedDevice()) return false;
-    s_deviceRefCount++;
+    if (!AcquireSharedDeviceRef()) return false;
 
     HRESULT hr = s_d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
                                                    ctx_.GetAddressOf());
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) return fail();
     ctx_.As(&ctx5_);
 
     ComPtr<IDXGIDevice> dxgiDevice;
-    if (FAILED(s_d3dDevice.As(&dxgiDevice))) return false;
+    if (FAILED(s_d3dDevice.As(&dxgiDevice))) return fail();
     ComPtr<IDXGIAdapter> adapter;
-    if (FAILED(dxgiDevice->GetAdapter(adapter.GetAddressOf()))) return false;
+    if (FAILED(dxgiDevice->GetAdapter(adapter.GetAddressOf()))) return fail();
     ComPtr<IDXGIFactory2> dxgiFactory;
     if (FAILED(adapter->GetParent(__uuidof(IDXGIFactory2),
                                    reinterpret_cast<void**>(dxgiFactory.GetAddressOf()))))
-        return false;
+        return fail();
 
     RECT rc;
     GetClientRect(hwnd, &rc);
@@ -319,22 +510,22 @@ bool Renderer::CreateRenderTargetForLayered(HWND hwnd) {
 
     hr = dxgiFactory->CreateSwapChainForComposition(s_d3dDevice.Get(), &desc,
                                                      nullptr, swapChain_.GetAddressOf());
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) return fail();
 
     // DirectComposition: bind the swap chain into the hwnd's visual tree so
     // pixels with alpha=0 punch through to whatever is behind the popup.
     ComPtr<IDCompositionDevice> dcomp;
     hr = DCompositionCreateDevice(dxgiDevice.Get(), __uuidof(IDCompositionDevice),
                                    reinterpret_cast<void**>(dcomp.GetAddressOf()));
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) return fail();
 
     ComPtr<IDCompositionTarget> target;
     hr = dcomp->CreateTargetForHwnd(hwnd, TRUE, target.GetAddressOf());
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) return fail();
 
     ComPtr<IDCompositionVisual> visual;
     hr = dcomp->CreateVisual(visual.GetAddressOf());
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) return fail();
     visual->SetContent(swapChain_.Get());
     target->SetRoot(visual.Get());
     dcomp->Commit();
@@ -346,7 +537,7 @@ bool Renderer::CreateRenderTargetForLayered(HWND hwnd) {
     ComPtr<IDXGISurface> surface;
     hr = swapChain_->GetBuffer(0, __uuidof(IDXGISurface),
                                 reinterpret_cast<void**>(surface.GetAddressOf()));
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) return fail();
 
     UINT dpi = GetDpiForWindow(hwnd);
     D2D1_BITMAP_PROPERTIES1 bp = {};
@@ -357,7 +548,7 @@ bool Renderer::CreateRenderTargetForLayered(HWND hwnd) {
     bp.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
 
     hr = ctx_->CreateBitmapFromDxgiSurface(surface.Get(), bp, targetBitmap_.GetAddressOf());
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) return fail();
 
     ctx_->SetTarget(targetBitmap_.Get());
     ctx_->SetDpi((float)dpi, (float)dpi);
@@ -368,19 +559,61 @@ bool Renderer::CreateRenderTargetForLayered(HWND hwnd) {
     return true;
 }
 
-void Renderer::Resize(UINT width, UINT height) {
-    if (!ctx_ || !swapChain_) return;
-
-    ctx_->SetTarget(nullptr);
-    targetBitmap_.Reset();
+void Renderer::ReleaseRenderTarget() {
+    if (ctx_) {
+        ctx_->SetTarget(nullptr);
+    }
+    transformStack_.clear();
     brushCache_.clear();
+    imageBitmapCache_.clear();
+    targetBitmap_.Reset();
+    swapChain_.Reset();
+    ctx5_.Reset();
+    ctx_.Reset();
+    dcompVisual_.Reset();
+    dcompTarget_.Reset();
+    dcompDevice_.Reset();
+    hwnd_ = nullptr;
+    targetThreadId_ = 0;
+    ReleaseSharedDeviceRef();
+}
 
-    HRESULT hr = swapChain_->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
-    if (FAILED(hr)) return;
+void Renderer::Resize(UINT width, UINT height) {
+    DebugAssertTargetThread("Resize");
+    if (!ctx_ || !swapChain_) return;
+    TraceScope resizeScope("core_renderer", "renderer_resize_duration");
+    TraceEvent("core_renderer", "renderer_resize_begin",
+               {TraceU64("w_px", width), TraceU64("h_px", height)});
+
+    {
+        TraceScope scope("core_renderer", "renderer_resize_detach_duration");
+        ctx_->SetTarget(nullptr);
+        targetBitmap_.Reset();
+        brushCache_.clear();
+    }
+
+    HRESULT hr = S_OK;
+    {
+        TraceScope scope("core_renderer", "resize_buffers_duration");
+        hr = swapChain_->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
+    }
+    if (FAILED(hr)) {
+        TraceEvent("core_renderer", "resize_buffers_failed",
+                   {TraceI64("hr", static_cast<int64_t>(hr))});
+        return;
+    }
 
     ComPtr<IDXGISurface> surface;
-    hr = swapChain_->GetBuffer(0, __uuidof(IDXGISurface), reinterpret_cast<void**>(surface.GetAddressOf()));
-    if (FAILED(hr)) return;
+    {
+        TraceScope scope("core_renderer", "resize_get_buffer_duration");
+        hr = swapChain_->GetBuffer(0, __uuidof(IDXGISurface),
+                                   reinterpret_cast<void**>(surface.GetAddressOf()));
+    }
+    if (FAILED(hr)) {
+        TraceEvent("core_renderer", "resize_get_buffer_failed",
+                   {TraceI64("hr", static_cast<int64_t>(hr))});
+        return;
+    }
 
     UINT dpi = GetDpiForWindow(hwnd_);
     D2D1_BITMAP_PROPERTIES1 bitmapProps = {};
@@ -389,30 +622,87 @@ void Renderer::Resize(UINT width, UINT height) {
     bitmapProps.dpiY = (float)dpi;
     bitmapProps.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
 
-    hr = ctx_->CreateBitmapFromDxgiSurface(surface.Get(), bitmapProps, targetBitmap_.GetAddressOf());
-    if (FAILED(hr)) return;
+    {
+        TraceScope scope("core_renderer", "resize_create_target_bitmap_duration");
+        hr = ctx_->CreateBitmapFromDxgiSurface(surface.Get(), bitmapProps,
+                                               targetBitmap_.GetAddressOf());
+    }
+    if (FAILED(hr)) {
+        TraceEvent("core_renderer", "resize_create_target_bitmap_failed",
+                   {TraceI64("hr", static_cast<int64_t>(hr))});
+        return;
+    }
 
-    ctx_->SetTarget(targetBitmap_.Get());
-    ctx_->SetDpi((float)dpi, (float)dpi);
+    {
+        TraceScope scope("core_renderer", "renderer_resize_bind_target_duration");
+        ctx_->SetTarget(targetBitmap_.Get());
+        ctx_->SetDpi((float)dpi, (float)dpi);
+    }
 }
 
 void Renderer::BeginDraw() {
+    DebugAssertTargetThread("BeginDraw");
+    transformStack_.clear();
     ctx_->BeginDraw();
     ctx_->SetTransform(D2D1::Matrix3x2F::Identity());
 }
 
 HRESULT Renderer::EndDraw() {
-    HRESULT hr = ctx_->EndDraw();
+    DebugAssertTargetThread("EndDraw");
+    TraceScope scope("core_renderer", "renderer_end_draw_duration");
+    HRESULT hr = S_OK;
+    {
+        TraceScope flushScope("core_renderer", "d2d_end_draw_duration");
+        hr = ctx_->EndDraw();
+    }
     /* L177: skipPresent → 只 flush D2D 绘制 (上面 ctx_->EndDraw 已做), 不 flip 到
      * DWM。给"绘制隐藏窗但不上屏"用 (避免 DWM 未合成窗的 Present 在 AMD 死锁)。 */
     if (swapChain_ && !skipPresent) {
         DXGI_PRESENT_PARAMETERS params = {};
         UINT syncInterval = skipVSync ? 0 : 1;
-        swapChain_->Present1(syncInterval, 0, &params);
+        TraceEvent("core_renderer", "present_begin",
+                   {TraceU64("sync_interval", syncInterval),
+                    TraceBool("skip_vsync", skipVSync)});
+        {
+            TraceScope presentScope("core_renderer", "present_duration");
+            swapChain_->Present1(syncInterval, 0, &params);
+        }
     }
     skipVSync = false;
     skipPresent = false;
     return hr;
+}
+
+HRESULT Renderer::PresentPrepared(bool skipVsync) {
+    DebugAssertTargetThread("PresentPrepared");
+    if (!swapChain_) return S_FALSE;
+    DXGI_PRESENT_PARAMETERS params = {};
+    const UINT syncInterval = skipVsync ? 0 : 1;
+    TraceEvent("core_renderer", "present_prepared_begin",
+               {TraceU64("sync_interval", syncInterval),
+                TraceBool("skip_vsync", skipVsync)});
+    TraceScope presentScope("core_renderer", "present_prepared_duration");
+    return swapChain_->Present1(syncInterval, 0, &params);
+}
+
+HRESULT Renderer::SetSwapChainBackgroundColor(const D2D1_COLOR_F& color) {
+    DebugAssertTargetThread("SetSwapChainBackgroundColor");
+    if (!swapChain_) return S_FALSE;
+    DXGI_RGBA bg = {color.r, color.g, color.b, color.a};
+    return swapChain_->SetBackgroundColor(&bg);
+}
+
+void Renderer::DebugAssertTargetThread(const char* op) const {
+#if defined(_DEBUG)
+    if (targetThreadId_ != 0 && targetThreadId_ != GetCurrentThreadId()) {
+        TraceEvent("core_renderer", "renderer_wrong_thread",
+                   {TraceU64("owner_thread", targetThreadId_),
+                    TraceU64("current_thread", GetCurrentThreadId())});
+        DebugBreakIfAttached();
+    }
+#else
+    (void)op;
+#endif
 }
 
 void Renderer::FlushAndTrimGpu() {
@@ -430,7 +720,217 @@ void Renderer::FlushAndTrimGpu() {
 }
 
 void Renderer::Clear(const D2D1_COLOR_F& color) {
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        recorder->Clear(color);
+    }
+    if (!ctx_) return;
     ctx_->Clear(color);
+}
+
+void Renderer::SetDisplayListRecorder(DisplayListRecorder* recorder) {
+    displayListRecorder_ = recorder;
+}
+
+bool Renderer::CreateSvgDocumentFromXml(const std::string& xml,
+                                        float viewportW, float viewportH,
+                                        ComPtr<ID2D1SvgDocument>* outDoc) {
+    SharedD2DGuard d2dGuard;
+    if (outDoc) outDoc->Reset();
+    if (xml.empty() || viewportW <= 0.0f || viewportH <= 0.0f ||
+        xml.size() > static_cast<size_t>(std::numeric_limits<UINT>::max())) {
+        return false;
+    }
+
+    ComPtr<IStream> stream;
+    stream.Attach(SHCreateMemStream(reinterpret_cast<const BYTE*>(xml.data()),
+                                    static_cast<UINT>(xml.size())));
+    if (!stream) return false;
+
+    ComPtr<ID2D1DeviceContext5> svgCtx5 = ctx5_;
+    ComPtr<ID2D1DeviceContext> tempCtx;
+    if (!svgCtx5) {
+        std::lock_guard<std::mutex> deviceLock(g_sharedDeviceMu);
+        if (!EnsureSharedDevice() || !s_d2dDevice) return false;
+        HRESULT hr = s_d2dDevice->CreateDeviceContext(
+            D2D1_DEVICE_CONTEXT_OPTIONS_NONE, tempCtx.GetAddressOf());
+        if (FAILED(hr) || !tempCtx) return false;
+        tempCtx.As(&svgCtx5);
+    }
+    if (!svgCtx5) return false;
+
+    ComPtr<ID2D1SvgDocument> doc;
+    HRESULT hr = svgCtx5->CreateSvgDocument(
+        stream.Get(), D2D1::SizeF(viewportW, viewportH), doc.GetAddressOf());
+    if (FAILED(hr) || !doc) return false;
+    if (outDoc) *outDoc = doc;
+    return true;
+}
+
+bool Renderer::RenderSvgDocumentToBgra(
+    const std::string& xml,
+    float viewportW, float viewportH,
+    const std::vector<SvgDocumentRef::DropShadowLayer>& dropShadowLayers,
+    uint32_t width, uint32_t height,
+    uint8_t* outBgra) {
+    SharedD2DGuard d2dGuard;
+    if (xml.empty() || viewportW <= 0.0f || viewportH <= 0.0f ||
+        width == 0 || height == 0 || !outBgra ||
+        xml.size() > static_cast<size_t>(std::numeric_limits<UINT>::max())) {
+        return false;
+    }
+
+    ComPtr<ID2D1Device> d2dDevice;
+    {
+        std::lock_guard<std::mutex> deviceLock(g_sharedDeviceMu);
+        if (!EnsureSharedDevice() || !s_d2dDevice) return false;
+        d2dDevice = s_d2dDevice;
+    }
+
+    ComPtr<ID2D1DeviceContext> ctx;
+    HRESULT hr = d2dDevice->CreateDeviceContext(
+        D2D1_DEVICE_CONTEXT_OPTIONS_NONE, ctx.GetAddressOf());
+    if (FAILED(hr) || !ctx) return false;
+
+    ComPtr<ID2D1DeviceContext5> ctx5;
+    ctx.As(&ctx5);
+    if (!ctx5) return false;
+
+    auto createSvgDocument = [&](const std::string& data,
+                                 ComPtr<ID2D1SvgDocument>& outDoc) -> bool {
+        if (data.empty() ||
+            data.size() > static_cast<size_t>(std::numeric_limits<UINT>::max())) {
+            return false;
+        }
+        ComPtr<IStream> stream;
+        stream.Attach(SHCreateMemStream(
+            reinterpret_cast<const BYTE*>(data.data()),
+            static_cast<UINT>(data.size())));
+        if (!stream) return false;
+
+        outDoc.Reset();
+        return SUCCEEDED(ctx5->CreateSvgDocument(
+                   stream.Get(), D2D1::SizeF(viewportW, viewportH),
+                   outDoc.GetAddressOf())) && outDoc;
+    };
+
+    ComPtr<ID2D1SvgDocument> doc;
+    if (!createSvgDocument(xml, doc)) return false;
+
+    constexpr float kDpi = 96.0f;
+    ctx5->SetDpi(kDpi, kDpi);
+
+    D2D1_BITMAP_PROPERTIES1 targetProps = {};
+    targetProps.pixelFormat = D2D1::PixelFormat(
+        DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED);
+    targetProps.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
+    targetProps.dpiX = kDpi;
+    targetProps.dpiY = kDpi;
+
+    ComPtr<ID2D1Bitmap1> target;
+    hr = ctx5->CreateBitmap(D2D1::SizeU(width, height), nullptr, 0,
+                            targetProps, target.GetAddressOf());
+    if (FAILED(hr) || !target) return false;
+
+    ctx5->SetTarget(target.Get());
+    ctx5->BeginDraw();
+    ctx5->Clear(D2D1::ColorF(0, 0, 0, 0));
+
+    const float sx = static_cast<float>(width) / viewportW;
+    const float sy = static_cast<float>(height) / viewportH;
+    const D2D1_MATRIX_3X2_F svgXform = D2D1::Matrix3x2F::Scale(sx, sy);
+    ctx5->SetTransform(svgXform);
+    doc->SetViewportSize(D2D1::SizeF(viewportW, viewportH));
+    ctx5->DrawSvgDocument(doc.Get());
+
+    for (const auto& layer : dropShadowLayers) {
+        ComPtr<ID2D1SvgDocument> shadowDoc;
+        ComPtr<ID2D1SvgDocument> coverDoc;
+        if (!createSvgDocument(layer.shadow_xml, shadowDoc) ||
+            !createSvgDocument(layer.cover_xml, coverDoc)) {
+            continue;
+        }
+
+        ComPtr<ID2D1CommandList> shadowList;
+        if (FAILED(ctx5->CreateCommandList(shadowList.GetAddressOf())) || !shadowList) {
+            continue;
+        }
+
+        ComPtr<ID2D1Image> oldTarget;
+        ctx5->GetTarget(&oldTarget);
+        ctx5->SetTarget(shadowList.Get());
+        ctx5->SetTransform(D2D1::Matrix3x2F::Identity());
+        ctx5->Clear(D2D1::ColorF(0, 0, 0, 0));
+        shadowDoc->SetViewportSize(D2D1::SizeF(viewportW, viewportH));
+        ctx5->DrawSvgDocument(shadowDoc.Get());
+        ctx5->SetTarget(oldTarget.Get());
+        if (FAILED(shadowList->Close())) {
+            ctx5->SetTransform(svgXform);
+            continue;
+        }
+
+        ComPtr<ID2D1Effect> blur;
+        if (FAILED(ctx5->CreateEffect(CLSID_D2D1GaussianBlur, blur.GetAddressOf())) ||
+            !blur) {
+            ctx5->SetTransform(svgXform);
+            continue;
+        }
+
+        blur->SetInput(0, shadowList.Get());
+        blur->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
+                       layer.std_deviation);
+        blur->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE,
+                       D2D1_BORDER_MODE_SOFT);
+
+        D2D1_MATRIX_3X2_F shadowXform =
+            D2D1::Matrix3x2F::Translation(layer.dx, layer.dy) * svgXform;
+        ctx5->SetTransform(shadowXform);
+        ctx5->DrawImage(blur.Get(), D2D1::Point2F(0, 0),
+                        D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+
+        ctx5->SetTransform(svgXform);
+        coverDoc->SetViewportSize(D2D1::SizeF(viewportW, viewportH));
+        ctx5->DrawSvgDocument(coverDoc.Get());
+    }
+
+    ctx5->SetTransform(D2D1::Matrix3x2F::Identity());
+    hr = ctx5->EndDraw();
+    ctx5->SetTarget(nullptr);
+    if (FAILED(hr)) return false;
+
+    D2D1_BITMAP_PROPERTIES1 cpuProps = {};
+    cpuProps.pixelFormat = D2D1::PixelFormat(
+        DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED);
+    cpuProps.bitmapOptions = D2D1_BITMAP_OPTIONS_CPU_READ |
+                             D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
+    cpuProps.dpiX = kDpi;
+    cpuProps.dpiY = kDpi;
+
+    ComPtr<ID2D1Bitmap1> cpu;
+    hr = ctx5->CreateBitmap(D2D1::SizeU(width, height), nullptr, 0,
+                            cpuProps, cpu.GetAddressOf());
+    if (FAILED(hr) || !cpu) return false;
+
+    D2D1_POINT_2U dst = {0, 0};
+    D2D1_RECT_U src = {0, 0, width, height};
+    hr = cpu->CopyFromBitmap(&dst, target.Get(), &src);
+    if (FAILED(hr)) return false;
+
+    D2D1_MAPPED_RECT mapped = {};
+    hr = cpu->Map(D2D1_MAP_OPTIONS_READ, &mapped);
+    if (FAILED(hr)) return false;
+
+    const size_t dstRow = static_cast<size_t>(width) * 4u;
+    const size_t srcRow = std::min(dstRow, static_cast<size_t>(mapped.pitch));
+    for (uint32_t y = 0; y < height; ++y) {
+        uint8_t* dstRowPtr = outBgra + static_cast<size_t>(y) * dstRow;
+        const uint8_t* srcRowPtr = mapped.bits + static_cast<size_t>(y) * mapped.pitch;
+        std::memcpy(dstRowPtr, srcRowPtr, srcRow);
+        if (srcRow < dstRow) {
+            std::memset(dstRowPtr + srcRow, 0, dstRow - srcRow);
+        }
+    }
+    cpu->Unmap();
+    return true;
 }
 
 ComPtr<ID2D1SolidColorBrush> Renderer::GetBrush(const D2D1_COLOR_F& color) {
@@ -631,11 +1131,17 @@ void Renderer::RebuildFontFallback() {
 }
 
 void Renderer::FillRect(const D2D1_RECT_F& rect, const D2D1_COLOR_F& color) {
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        recorder->FillRect(rect, color);
+    }
     auto brush = GetBrush(color);
     if (brush) ctx_->FillRectangle(rect, brush.Get());
 }
 
 void Renderer::FillRoundedRect(const D2D1_RECT_F& rect, float rx, float ry, const D2D1_COLOR_F& color) {
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        recorder->FillRoundedRect(rect, rx, ry, color);
+    }
     auto brush = GetBrush(color);
     if (brush) {
         D2D1_ROUNDED_RECT rr = {rect, rx, ry};
@@ -643,12 +1149,70 @@ void Renderer::FillRoundedRect(const D2D1_RECT_F& rect, float rx, float ry, cons
     }
 }
 
+bool Renderer::DrawBlurredRoundedRect(const D2D1_RECT_F& rect, float rx, float ry,
+                                      float blurRadius, const D2D1_COLOR_F& color) {
+    if (!ctx_ || !ctx5_ || color.a <= 0.0f) return false;
+    if (rect.right <= rect.left || rect.bottom <= rect.top) return false;
+    if (blurRadius < 0.5f) {
+        FillRoundedRect(rect, rx, ry, color);
+        return true;
+    }
+
+    ComPtr<ID2D1CommandList> mask;
+    if (FAILED(ctx5_->CreateCommandList(mask.GetAddressOf())) || !mask) {
+        return false;
+    }
+
+    ComPtr<ID2D1Image> oldTarget;
+    ctx5_->GetTarget(oldTarget.GetAddressOf());
+    if (!oldTarget) return false;
+
+    D2D1_MATRIX_3X2_F oldXform = D2D1::Matrix3x2F::Identity();
+    ctx5_->GetTransform(&oldXform);
+
+    ctx5_->SetTarget(mask.Get());
+    ctx5_->SetTransform(D2D1::Matrix3x2F::Identity());
+    ctx5_->Clear(D2D1::ColorF(0, 0, 0, 0));
+    if (auto brush = GetBrush(color)) {
+        ctx5_->FillRoundedRectangle(D2D1::RoundedRect(rect, rx, ry), brush.Get());
+    }
+    ctx5_->SetTarget(oldTarget.Get());
+    ctx5_->SetTransform(oldXform);
+
+    if (FAILED(mask->Close())) return false;
+
+    ComPtr<ID2D1Effect> blur;
+    if (FAILED(ctx5_->CreateEffect(CLSID_D2D1GaussianBlur, blur.GetAddressOf())) || !blur) {
+        return false;
+    }
+
+    blur->SetInput(0, mask.Get());
+    blur->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
+                   std::max(0.5f, blurRadius * 0.5f));
+    blur->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE, D2D1_BORDER_MODE_SOFT);
+
+    ctx5_->DrawImage(blur.Get(), D2D1::Point2F(0, 0),
+                     D2D1_INTERPOLATION_MODE_LINEAR,
+                     D2D1_COMPOSITE_MODE_SOURCE_OVER);
+
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        recorder->DrawBlurredRoundedRect(rect, rx, ry, blurRadius, color);
+    }
+    return true;
+}
+
 void Renderer::DrawRect(const D2D1_RECT_F& rect, const D2D1_COLOR_F& color, float width) {
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        recorder->DrawRect(rect, color, width);
+    }
     auto brush = GetBrush(color);
     if (brush) ctx_->DrawRectangle(rect, brush.Get(), width);
 }
 
 void Renderer::DrawRoundedRect(const D2D1_RECT_F& rect, float rx, float ry, const D2D1_COLOR_F& color, float width) {
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        recorder->DrawRoundedRect(rect, rx, ry, color, width);
+    }
     auto brush = GetBrush(color);
     if (brush) {
         D2D1_ROUNDED_RECT rr = {rect, rx, ry};
@@ -657,24 +1221,49 @@ void Renderer::DrawRoundedRect(const D2D1_RECT_F& rect, float rx, float ry, cons
 }
 
 void Renderer::DrawLine(float x1, float y1, float x2, float y2, const D2D1_COLOR_F& color, float width) {
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        recorder->DrawLine(D2D1::Point2F(x1, y1), D2D1::Point2F(x2, y2), color, width);
+    }
     auto brush = GetBrush(color);
     if (brush) ctx_->DrawLine({x1, y1}, {x2, y2}, brush.Get(), width);
 }
 
 void Renderer::DrawText(const std::wstring& text, const D2D1_RECT_F& rect, const D2D1_COLOR_F& color,
                          float fontSize, DWRITE_TEXT_ALIGNMENT align, DWRITE_FONT_WEIGHT weight,
-                         DWRITE_PARAGRAPH_ALIGNMENT vAlign, bool wordWrap) {
+                         DWRITE_PARAGRAPH_ALIGNMENT vAlign, bool wordWrap, const wchar_t* family) {
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        TextStyle style;
+        style.color = color;
+        style.font_size = fontSize;
+        if (family && *family) style.font_family = family;
+        style.alignment = static_cast<int>(align);
+        style.paragraph_alignment = static_cast<int>(vAlign);
+        style.weight = static_cast<int>(weight);
+        style.word_wrap = wordWrap;
+        recorder->DrawText(text, rect, style);
+    }
     auto brush = GetBrush(color);
-    auto fmt = GetTextFormat(fontSize, theme::kFontFamily, weight);
+    auto fmt = GetTextFormat(fontSize, (family && *family) ? family : theme::kFontFamily, weight);
     if (!brush || !fmt || !dwFactory_) return;
 
     float layoutW = rect.right - rect.left;
     float layoutH = rect.bottom - rect.top;
     if (layoutW <= 0 || layoutH <= 0) return;
 
+    float drawTop = rect.top;
+    float drawLayoutH = layoutH;
+    if (!wordWrap && vAlign == DWRITE_PARAGRAPH_ALIGNMENT_CENTER) {
+        // Some CJK fallback glyphs overhang the nominal line box by a pixel or
+        // two at fractional DPI scales. Expand the layout symmetrically so the
+        // visual center stays unchanged while DirectWrite has room for ink.
+        constexpr float kVerticalOverhangPad = 2.0f;
+        drawTop -= kVerticalOverhangPad;
+        drawLayoutH += kVerticalOverhangPad * 2.0f;
+    }
+
     ComPtr<IDWriteTextLayout> layout;
     HRESULT hr = dwFactory_->CreateTextLayout(
-        text.c_str(), (UINT32)text.length(), fmt.Get(), layoutW, layoutH, &layout);
+        text.c_str(), (UINT32)text.length(), fmt.Get(), layoutW, drawLayoutH, &layout);
     if (FAILED(hr) || !layout) return;
 
     layout->SetTextAlignment(align);
@@ -691,7 +1280,7 @@ void Renderer::DrawText(const std::wstring& text, const D2D1_RECT_F& rect, const
         if (ellipsis) layout->SetTrimming(&trimming, ellipsis.Get());
     }
 
-    ctx_->DrawTextLayout({rect.left, rect.top}, layout.Get(), brush.Get());
+    ctx_->DrawTextLayout({rect.left, drawTop}, layout.Get(), brush.Get());
 }
 
 ComPtr<IDWriteTextLayout> Renderer::CreateTextLayout(const std::wstring& text,
@@ -758,13 +1347,82 @@ float Renderer::MeasureTextHeight(const std::wstring& text, float maxWidth, floa
 }
 
 void Renderer::DrawIcon(const std::wstring& glyph, const D2D1_RECT_F& rect, const D2D1_COLOR_F& color, float fontSize) {
-    auto brush = GetBrush(color);
-    auto fmt = GetTextFormat(fontSize, L"Segoe MDL2 Assets");
-    if (brush && fmt) {
-        fmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        fmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-        ctx_->DrawTextW(glyph.c_str(), (UINT32)glyph.length(), fmt.Get(), rect, brush.Get());
+    DrawText(glyph,
+             rect,
+             color,
+             fontSize,
+             DWRITE_TEXT_ALIGNMENT_CENTER,
+             DWRITE_FONT_WEIGHT_NORMAL,
+             DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+             false,
+             L"Segoe MDL2 Assets");
+}
+
+/* 从已经创建好的 IWICBitmapDecoder 抽取最大帧 → CPU BGRA premul bytes。
+   DisplayList 资源路径用这个，失败返回 false。 */
+static bool DecodeDecoderToBgraPremul(IWICImagingFactory* wic,
+                                      IWICBitmapDecoder* decoder,
+                                      std::vector<uint8_t>& pixels,
+                                      int& width,
+                                      int& height,
+                                      int& stride) {
+    pixels.clear();
+    width = height = stride = 0;
+    if (!wic || !decoder) return false;
+
+    UINT frameCount = 0;
+    decoder->GetFrameCount(&frameCount);
+    UINT bestFrame = 0;
+    UINT bestArea = 0;
+    if (frameCount > 1) {
+        for (UINT i = 0; i < frameCount; i++) {
+            ComPtr<IWICBitmapFrameDecode> f;
+            if (SUCCEEDED(decoder->GetFrame(i, f.GetAddressOf()))) {
+                UINT fw = 0, fh = 0;
+                f->GetSize(&fw, &fh);
+                UINT area = fw * fh;
+                if (area > bestArea) { bestArea = area; bestFrame = i; }
+            }
+        }
     }
+
+    ComPtr<IWICBitmapFrameDecode> frame;
+    HRESULT hr = decoder->GetFrame(bestFrame, frame.GetAddressOf());
+    if (FAILED(hr)) return false;
+
+    ComPtr<IWICFormatConverter> converter;
+    hr = wic->CreateFormatConverter(converter.GetAddressOf());
+    if (FAILED(hr)) return false;
+
+    hr = converter->Initialize(
+        frame.Get(), GUID_WICPixelFormat32bppPBGRA,
+        WICBitmapDitherTypeNone, nullptr, 0.0f, WICBitmapPaletteTypeMedianCut);
+    if (FAILED(hr)) return false;
+
+    UINT imgW = 0, imgH = 0;
+    hr = converter->GetSize(&imgW, &imgH);
+    if (FAILED(hr) || imgW == 0 || imgH == 0) return false;
+    if (imgW > static_cast<UINT>(std::numeric_limits<int>::max() / 4) ||
+        imgH > static_cast<UINT>(std::numeric_limits<int>::max())) {
+        return false;
+    }
+
+    const UINT rowStride = imgW * 4;
+    const uint64_t totalBytes = static_cast<uint64_t>(rowStride) * imgH;
+    if (totalBytes > static_cast<uint64_t>(std::numeric_limits<UINT>::max()) ||
+        totalBytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        return false;
+    }
+
+    std::vector<uint8_t> out(static_cast<size_t>(totalBytes));
+    hr = converter->CopyPixels(nullptr, rowStride, static_cast<UINT>(out.size()), out.data());
+    if (FAILED(hr)) return false;
+
+    pixels = std::move(out);
+    width = static_cast<int>(imgW);
+    height = static_cast<int>(imgH);
+    stride = static_cast<int>(rowStride);
+    return true;
 }
 
 /* 从已经创建好的 IWICBitmapDecoder 抽取最大帧 → strip 解码 → D2D 位图。
@@ -868,6 +1526,44 @@ ComPtr<ID2D1Bitmap> Renderer::LoadImageFromBytes(const void* bytes, size_t size)
         stream.Get(), nullptr, WICDecodeMetadataCacheOnLoad, decoder.GetAddressOf());
     if (FAILED(hr)) return nullptr;
     return BitmapFromDecoder(wicFactory_, decoder.Get(), *this);
+}
+
+bool Renderer::DecodeImageFileToBgraPremul(const std::wstring& path,
+                                           std::vector<uint8_t>& pixels,
+                                           int& width, int& height, int& stride) {
+    pixels.clear();
+    width = height = stride = 0;
+    if (!wicFactory_ || path.empty()) return false;
+
+    ComPtr<IWICBitmapDecoder> decoder;
+    HRESULT hr = wicFactory_->CreateDecoderFromFilename(
+        path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, decoder.GetAddressOf());
+    if (FAILED(hr)) return false;
+
+    return DecodeDecoderToBgraPremul(wicFactory_, decoder.Get(), pixels, width, height, stride);
+}
+
+bool Renderer::DecodeImageBytesToBgraPremul(const void* bytes, size_t size,
+                                            std::vector<uint8_t>& pixels,
+                                            int& width, int& height, int& stride) {
+    pixels.clear();
+    width = height = stride = 0;
+    if (!wicFactory_ || !bytes || size == 0) return false;
+
+    ComPtr<IWICStream> stream;
+    HRESULT hr = wicFactory_->CreateStream(stream.GetAddressOf());
+    if (FAILED(hr)) return false;
+    hr = stream->InitializeFromMemory(
+        const_cast<BYTE*>(reinterpret_cast<const BYTE*>(bytes)),
+        static_cast<DWORD>(size));
+    if (FAILED(hr)) return false;
+
+    ComPtr<IWICBitmapDecoder> decoder;
+    hr = wicFactory_->CreateDecoderFromStream(
+        stream.Get(), nullptr, WICDecodeMetadataCacheOnLoad, decoder.GetAddressOf());
+    if (FAILED(hr)) return false;
+
+    return DecodeDecoderToBgraPremul(wicFactory_, decoder.Get(), pixels, width, height, stride);
 }
 
 /* ---- AnimatedPlayer（按需解码的 GIF 播放器） ---- */
@@ -1093,27 +1789,59 @@ ComPtr<ID2D1Bitmap> Renderer::CreateBitmapFromPixelsStraight(
     return CreateBitmapFromPixels(premul.data(), width, height, row);
 }
 
-ComPtr<ID2D1Bitmap> Renderer::CreateBitmapFromHICON(HICON hicon) {
-    if (!ctx_ || !wicFactory_ || !hicon) return nullptr;
+bool Renderer::DecodeHICONToBgraPremul(HICON hicon,
+                                       std::vector<uint8_t>& pixels,
+                                       int& width, int& height, int& stride) {
+    pixels.clear();
+    width = height = stride = 0;
+    if (!wicFactory_ || !hicon) return false;
 
     /* WIC 直接消化 HICON：解开 AND mask + color bits，输出 32bpp BGRA */
     ComPtr<IWICBitmap> wicBmp;
     HRESULT hr = wicFactory_->CreateBitmapFromHICON(hicon, wicBmp.GetAddressOf());
-    if (FAILED(hr)) return nullptr;
+    if (FAILED(hr)) return false;
 
-    /* 转成 D2D 偏好的 premultiplied PBGRA */
+    /* 转成 DisplayList 资源和 D2D 都偏好的 premultiplied PBGRA。 */
     ComPtr<IWICFormatConverter> converter;
     hr = wicFactory_->CreateFormatConverter(converter.GetAddressOf());
-    if (FAILED(hr)) return nullptr;
+    if (FAILED(hr)) return false;
     hr = converter->Initialize(
         wicBmp.Get(), GUID_WICPixelFormat32bppPBGRA,
         WICBitmapDitherTypeNone, nullptr, 0.0f, WICBitmapPaletteTypeMedianCut);
-    if (FAILED(hr)) return nullptr;
+    if (FAILED(hr)) return false;
 
-    ComPtr<ID2D1Bitmap> bitmap;
-    hr = ctx_->CreateBitmapFromWicBitmap(converter.Get(), nullptr, bitmap.GetAddressOf());
-    if (FAILED(hr)) return nullptr;
-    return bitmap;
+    UINT imgW = 0, imgH = 0;
+    hr = converter->GetSize(&imgW, &imgH);
+    if (FAILED(hr) || imgW == 0 || imgH == 0) return false;
+    if (imgW > static_cast<UINT>(std::numeric_limits<int>::max() / 4) ||
+        imgH > static_cast<UINT>(std::numeric_limits<int>::max())) {
+        return false;
+    }
+
+    const UINT rowStride = imgW * 4;
+    const uint64_t totalBytes = static_cast<uint64_t>(rowStride) * imgH;
+    if (totalBytes > static_cast<uint64_t>(std::numeric_limits<UINT>::max()) ||
+        totalBytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        return false;
+    }
+
+    std::vector<uint8_t> out(static_cast<size_t>(totalBytes));
+    hr = converter->CopyPixels(nullptr, rowStride, static_cast<UINT>(out.size()), out.data());
+    if (FAILED(hr)) return false;
+
+    pixels = std::move(out);
+    width = static_cast<int>(imgW);
+    height = static_cast<int>(imgH);
+    stride = static_cast<int>(rowStride);
+    return true;
+}
+
+ComPtr<ID2D1Bitmap> Renderer::CreateBitmapFromHICON(HICON hicon) {
+    std::vector<uint8_t> pixels;
+    int width = 0, height = 0, stride = 0;
+    if (!DecodeHICONToBgraPremul(hicon, pixels, width, height, stride)) return nullptr;
+
+    return CreateBitmapFromPixels(pixels.data(), width, height, stride);
 }
 
 ComPtr<ID2D1Bitmap> Renderer::CreateEmptyBitmap(int width, int height) {
@@ -1138,7 +1866,7 @@ ComPtr<ID2D1Bitmap> Renderer::CreateEmptyBitmap(int width, int height) {
 
 void Renderer::DrawBitmap(ID2D1Bitmap* bitmap, const D2D1_RECT_F& destRect, float opacity,
                            D2D1_BITMAP_INTERPOLATION_MODE interp) {
-    if (bitmap) {
+    if (bitmap && ctx_) {
         /* 检查 bitmap 是否有 alpha 通道需要混合 */
         auto fmt = bitmap->GetPixelFormat();
         bool hasAlpha = (fmt.alphaMode == D2D1_ALPHA_MODE_PREMULTIPLIED ||
@@ -1212,6 +1940,261 @@ void Renderer::DrawBitmapSharpened(ID2D1Bitmap* bitmap, const D2D1_RECT_F& destR
     ctx_->SetTransform(oldXform);
 }
 
+void Renderer::RecordImage(ResourceKey key, const D2D1_RECT_F& destRect,
+                           ImageSampling sampling, float opacity) {
+    auto* recorder = ActiveDisplayListRecorder();
+    if (!recorder || !key.IsValid()) return;
+
+    ImageRef image;
+    image.key = key;
+    auto res = GlobalResourceStore().Acquire(key);
+    if (res) {
+        image.width = res->width;
+        image.height = res->height;
+        image.stride = res->stride;
+        image.format = res->format;
+    }
+    recorder->DrawImage(image, destRect, sampling, opacity);
+}
+
+ComPtr<ID2D1Bitmap> Renderer::GetCachedImageBitmap(ResourceKey key) {
+    if (!ctx_ || !key.IsValid()) return {};
+    auto cached = imageBitmapCache_.find(key);
+    if (cached != imageBitmapCache_.end() && cached->second) {
+        return cached->second;
+    }
+
+    auto res = GlobalResourceStore().Acquire(key);
+    if (!res || !res->bytes) return {};
+
+    ComPtr<ID2D1Bitmap> bitmap;
+    switch (res->format) {
+    case PixelFormat::BgraPremul:
+    case PixelFormat::Rgba:
+        bitmap = CreateBitmapFromPixels(res->bytes->data(), res->width, res->height, res->stride);
+        break;
+    case PixelFormat::BgraStraight:
+        bitmap = CreateBitmapFromPixelsStraight(res->bytes->data(), res->width, res->height, res->stride);
+        break;
+    }
+    if (!bitmap) return {};
+
+    imageBitmapCache_[key] = bitmap;
+    TraceEvent("core_renderer", "resource_bitmap_upload",
+               {TraceU64("generation", key.image_generation),
+                TraceU64("resource_id", key.resource_id),
+                TraceU64("kind", static_cast<uint64_t>(key.kind)),
+                TraceU64("bytes", static_cast<uint64_t>(res->byte_size)),
+                TraceU64("cache_size", static_cast<uint64_t>(imageBitmapCache_.size()))});
+    return bitmap;
+}
+
+void Renderer::DrawImageResource(ResourceKey key, const D2D1_RECT_F& destRect,
+                                 ImageSampling sampling, float opacity) {
+    RecordImage(key, destRect, sampling, opacity);
+    if (!ctx_) return;
+
+    auto bitmap = GetCachedImageBitmap(key);
+    if (!bitmap) return;
+
+    if (sampling == ImageSampling::HighQualityCubic) {
+        DrawBitmapHQ(bitmap.Get(), destRect, opacity,
+                     D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+    } else {
+        auto interp = (sampling == ImageSampling::Nearest)
+            ? D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+            : D2D1_BITMAP_INTERPOLATION_MODE_LINEAR;
+        DrawBitmap(bitmap.Get(), destRect, opacity, interp);
+    }
+}
+
+void Renderer::PruneImageBitmapCacheTo(const std::vector<ImageRef>& imageRefs) {
+    if (imageBitmapCache_.empty()) return;
+    std::unordered_set<ResourceKey, ResourceKeyHash> live;
+    live.reserve(imageRefs.size());
+    for (const auto& ref : imageRefs) {
+        if (ref.key.IsValid()) live.insert(ref.key);
+    }
+
+    size_t removed = 0;
+    for (auto it = imageBitmapCache_.begin(); it != imageBitmapCache_.end(); ) {
+        if (live.find(it->first) != live.end()) {
+            ++it;
+        } else {
+            it = imageBitmapCache_.erase(it);
+            ++removed;
+        }
+    }
+    if (removed > 0) {
+        TraceEvent("core_renderer", "resource_bitmap_cache_pruned",
+                   {TraceU64("removed", static_cast<uint64_t>(removed)),
+                    TraceU64("cache_size", static_cast<uint64_t>(imageBitmapCache_.size()))});
+    }
+}
+
+void Renderer::FillRectWithImagePattern(ResourceKey key, ID2D1Bitmap* bitmap,
+                                        const D2D1_RECT_F& rect) {
+    auto* recorder = ActiveDisplayListRecorder();
+    if (recorder && key.IsValid()) {
+        ImageRef image;
+        image.key = key;
+        auto res = GlobalResourceStore().Acquire(key);
+        if (res) {
+            image.width = res->width;
+            image.height = res->height;
+            image.stride = res->stride;
+            image.format = res->format;
+        }
+        recorder->FillImagePattern(image, rect);
+    }
+
+    if (!ctx_) return;
+
+    ComPtr<ID2D1Bitmap> localBitmap;
+    if (!bitmap && key.IsValid()) {
+        localBitmap = GetCachedImageBitmap(key);
+        bitmap = localBitmap.Get();
+    }
+
+    FillRectWithBitmap(bitmap, rect);
+}
+
+void Renderer::FillGradientRect(GradientRef gradient, const D2D1_RECT_F& rect, float radius) {
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        recorder->FillGradient(gradient, rect, radius);
+    }
+    if (!ctx_) return;
+    PaintDisplayListGradient(ctx_.Get(), rect, gradient, radius);
+}
+
+void Renderer::RecordSvgDocument(std::string xml, float viewportW, float viewportH,
+                                 D2D1_MATRIX_3X2_F transform,
+                                 std::vector<SvgDocumentRef::DropShadowLayer> dropShadowLayers) {
+    auto* recorder = ActiveDisplayListRecorder();
+    if (!recorder || xml.empty() || viewportW <= 0.0f || viewportH <= 0.0f) return;
+
+    SvgDocumentRef ref;
+    ref.xml = std::move(xml);
+    ref.viewport_w = viewportW;
+    ref.viewport_h = viewportH;
+    ref.drop_shadow_layers = std::move(dropShadowLayers);
+    recorder->DrawSvgDocument(std::move(ref), transform);
+}
+
+bool Renderer::DrawBackdropBlur(const D2D1_RECT_F& rect, float radius, float blurRadius) {
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        recorder->DrawBackdropBlur(rect, radius, blurRadius);
+    }
+    if (!ctx_ || blurRadius <= 0.5f) return false;
+    if (rect.right <= rect.left || rect.bottom <= rect.top) return false;
+
+    ComPtr<ID2D1Image> targetImage;
+    ctx_->GetTarget(targetImage.GetAddressOf());
+    ComPtr<ID2D1Bitmap1> target;
+    if (!targetImage || FAILED(targetImage.As(&target)) || !target) return false;
+
+    D2D1_MATRIX_3X2_F oldXform = D2D1::Matrix3x2F::Identity();
+    ctx_->GetTransform(&oldXform);
+    const float det = oldXform._11 * oldXform._22 - oldXform._12 * oldXform._21;
+    if (std::fabs(det) < 1e-6f) return false;
+    D2D1_MATRIX_3X2_F inv = {};
+    inv._11 =  oldXform._22 / det;
+    inv._12 = -oldXform._12 / det;
+    inv._21 = -oldXform._21 / det;
+    inv._22 =  oldXform._11 / det;
+    inv._31 = (oldXform._21 * oldXform._32 - oldXform._31 * oldXform._22) / det;
+    inv._32 = (oldXform._12 * oldXform._31 - oldXform._11 * oldXform._32) / det;
+
+    auto transformPoint = [](const D2D1_MATRIX_3X2_F& m, D2D1_POINT_2F p) {
+        return D2D1::Point2F(
+            p.x * m._11 + p.y * m._21 + m._31,
+            p.x * m._12 + p.y * m._22 + m._32);
+    };
+    auto toDeviceRect = [&](const D2D1_RECT_F& r) {
+        D2D1_POINT_2F p0 = transformPoint(oldXform, D2D1::Point2F(r.left,  r.top));
+        D2D1_POINT_2F p1 = transformPoint(oldXform, D2D1::Point2F(r.right, r.top));
+        D2D1_POINT_2F p2 = transformPoint(oldXform, D2D1::Point2F(r.right, r.bottom));
+        D2D1_POINT_2F p3 = transformPoint(oldXform, D2D1::Point2F(r.left,  r.bottom));
+        return D2D1::RectF(std::min({p0.x, p1.x, p2.x, p3.x}),
+                           std::min({p0.y, p1.y, p2.y, p3.y}),
+                           std::max({p0.x, p1.x, p2.x, p3.x}),
+                           std::max({p0.y, p1.y, p2.y, p3.y}));
+    };
+
+    float dpiX = 96.0f, dpiY = 96.0f;
+    ctx_->GetDpi(&dpiX, &dpiY);
+    const float sx = dpiX / 96.0f;
+    const float sy = dpiY / 96.0f;
+    const float pad = std::ceil(blurRadius * 3.0f);
+    D2D1_RECT_F captureDip = toDeviceRect({rect.left - pad, rect.top - pad,
+                                           rect.right + pad, rect.bottom + pad});
+
+    auto targetSize = target->GetPixelSize();
+    auto floorClamp = [](float v, float scale, UINT maxv) -> UINT {
+        int iv = static_cast<int>(std::floor(v * scale));
+        iv = std::max(0, std::min(iv, static_cast<int>(maxv)));
+        return static_cast<UINT>(iv);
+    };
+    auto ceilClamp = [](float v, float scale, UINT maxv) -> UINT {
+        int iv = static_cast<int>(std::ceil(v * scale));
+        iv = std::max(0, std::min(iv, static_cast<int>(maxv)));
+        return static_cast<UINT>(iv);
+    };
+
+    D2D1_RECT_U srcPx{
+        floorClamp(captureDip.left,   sx, targetSize.width),
+        floorClamp(captureDip.top,    sy, targetSize.height),
+        ceilClamp (captureDip.right,  sx, targetSize.width),
+        ceilClamp (captureDip.bottom, sy, targetSize.height),
+    };
+    if (srcPx.right <= srcPx.left || srcPx.bottom <= srcPx.top) return false;
+
+    UINT w = srcPx.right - srcPx.left;
+    UINT h = srcPx.bottom - srcPx.top;
+    D2D1_BITMAP_PROPERTIES1 props = {};
+    props.pixelFormat = D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                                           D2D1_ALPHA_MODE_PREMULTIPLIED);
+    props.dpiX = dpiX;
+    props.dpiY = dpiY;
+    props.bitmapOptions = D2D1_BITMAP_OPTIONS_NONE;
+
+    ComPtr<ID2D1Bitmap1> backdrop;
+    HRESULT hr = ctx_->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0,
+                                    props, backdrop.GetAddressOf());
+    if (FAILED(hr) || !backdrop) return false;
+
+    ctx_->Flush();
+    hr = backdrop->CopyFromBitmap(nullptr, target.Get(), &srcPx);
+    if (FAILED(hr)) return false;
+
+    ComPtr<ID2D1Effect> blur;
+    hr = ctx_->CreateEffect(CLSID_D2D1GaussianBlur, blur.GetAddressOf());
+    if (FAILED(hr) || !blur) return false;
+    blur->SetInput(0, backdrop.Get());
+    blur->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, blurRadius);
+    blur->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE, D2D1_BORDER_MODE_HARD);
+
+    D2D1_RECT_F captureLocal{
+        static_cast<float>(srcPx.left) / sx,
+        static_cast<float>(srcPx.top) / sy,
+        static_cast<float>(srcPx.right) / sx,
+        static_cast<float>(srcPx.bottom) / sy,
+    };
+    D2D1_POINT_2F origin = transformPoint(inv, D2D1::Point2F(captureLocal.left,
+                                                             captureLocal.top));
+
+    ++displayListRecorderPauseDepth_;
+    if (radius > 0.0f) PushRoundedClip(rect, radius, radius);
+    else PushClip(rect);
+    ctx_->DrawImage(blur.Get(), origin,
+                    D2D1_INTERPOLATION_MODE_LINEAR,
+                    D2D1_COMPOSITE_MODE_SOURCE_OVER);
+    if (radius > 0.0f) PopRoundedClip();
+    else PopClip();
+    --displayListRecorderPauseDepth_;
+    return true;
+}
+
 void Renderer::FillRectWithBitmap(ID2D1Bitmap* bitmap, const D2D1_RECT_F& rect) {
     if (!ctx_ || !bitmap) return;
 
@@ -1228,15 +2211,26 @@ void Renderer::FillRectWithBitmap(ID2D1Bitmap* bitmap, const D2D1_RECT_F& rect) 
 }
 
 void Renderer::PushClip(const D2D1_RECT_F& rect) {
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        recorder->PushClip(rect);
+    }
+    if (!ctx_) return;
     ctx_->PushAxisAlignedClip(rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 }
 
 void Renderer::PopClip() {
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        recorder->PopClip();
+    }
+    if (!ctx_) return;
     ctx_->PopAxisAlignedClip();
 }
 
 void Renderer::PushRoundedClip(const D2D1_RECT_F& rect, float rx, float ry) {
-    if (!factory_) return;
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        recorder->PushRoundedClip(rect, rx, ry);
+    }
+    if (!factory_ || !ctx_) return;
     ComPtr<ID2D1RoundedRectangleGeometry> geom;
     factory_->CreateRoundedRectangleGeometry(D2D1::RoundedRect(rect, rx, ry),
                                              geom.GetAddressOf());
@@ -1260,10 +2254,18 @@ void Renderer::PushRoundedClip(const D2D1_RECT_F& rect, float rx, float ry) {
 }
 
 void Renderer::PopRoundedClip() {
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        recorder->PopRoundedClip();
+    }
+    if (!ctx_) return;
     ctx_->PopLayer();
 }
 
 void Renderer::PushOpacity(float opacity, const D2D1_RECT_F& bounds) {
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        recorder->PushOpacity(opacity, bounds);
+    }
+    if (!ctx_) return;
     ComPtr<ID2D1Layer> layer;
     ctx_->CreateLayer(nullptr, layer.GetAddressOf());
     if (layer) {
@@ -1275,7 +2277,281 @@ void Renderer::PushOpacity(float opacity, const D2D1_RECT_F& bounds) {
 }
 
 void Renderer::PopOpacity() {
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        recorder->PopOpacity();
+    }
+    if (!ctx_) return;
     ctx_->PopLayer();
+}
+
+void Renderer::PushTransform(const D2D1_MATRIX_3X2_F& transform) {
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        recorder->PushTransform(transform);
+    }
+    if (!ctx_) return;
+    D2D1_MATRIX_3X2_F saved = D2D1::Matrix3x2F::Identity();
+    ctx_->GetTransform(&saved);
+    transformStack_.push_back(saved);
+    ctx_->SetTransform(transform * saved);
+}
+
+void Renderer::PopTransform() {
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        recorder->PopTransform();
+    }
+    if (!ctx_ || transformStack_.empty()) return;
+    ctx_->SetTransform(transformStack_.back());
+    transformStack_.pop_back();
+}
+
+namespace svg_detail {
+static bool BuildGeometry(ID2D1Factory* factory, const std::vector<std::string>& pathDatas,
+                          ID2D1PathGeometry** outGeometry);
+}
+
+void Renderer::ReplayDisplayList(const DisplayList& list) {
+    if (!ctx_) return;
+    std::vector<D2D1_MATRIX_3X2_F> transformStack;
+    for (const auto& cmd : list.commands) {
+        switch (cmd.type) {
+        case DrawCommandType::Clear:
+            Clear(cmd.color);
+            break;
+        case DrawCommandType::PushClip:
+            PushClip(cmd.rect);
+            break;
+        case DrawCommandType::PopClip:
+            PopClip();
+            break;
+        case DrawCommandType::PushRoundedClip:
+            PushRoundedClip(cmd.rect, cmd.radius_x, cmd.radius_y);
+            break;
+        case DrawCommandType::PopRoundedClip:
+            PopRoundedClip();
+            break;
+        case DrawCommandType::PushOpacity:
+            PushOpacity(cmd.opacity, cmd.rect);
+            break;
+        case DrawCommandType::PopOpacity:
+            PopOpacity();
+            break;
+        case DrawCommandType::PushTransform: {
+            D2D1_MATRIX_3X2_F saved = D2D1::Matrix3x2F::Identity();
+            ctx_->GetTransform(&saved);
+            transformStack.push_back(saved);
+            ctx_->SetTransform(cmd.transform * saved);
+            break;
+        }
+        case DrawCommandType::PopTransform:
+            if (!transformStack.empty()) {
+                ctx_->SetTransform(transformStack.back());
+                transformStack.pop_back();
+            }
+            break;
+        case DrawCommandType::FillRect:
+            FillRect(cmd.rect, cmd.color);
+            break;
+        case DrawCommandType::DrawRect:
+            DrawRect(cmd.rect, cmd.color, cmd.stroke_width);
+            break;
+        case DrawCommandType::FillRoundedRect:
+            FillRoundedRect(cmd.rect, cmd.radius_x, cmd.radius_y, cmd.color);
+            break;
+        case DrawCommandType::DrawRoundedRect:
+            DrawRoundedRect(cmd.rect, cmd.radius_x, cmd.radius_y, cmd.color, cmd.stroke_width);
+            break;
+        case DrawCommandType::DrawBlurredRoundedRect:
+            DrawBlurredRoundedRect(cmd.rect, cmd.radius_x, cmd.radius_y,
+                                   cmd.blur_radius, cmd.color);
+            break;
+        case DrawCommandType::DrawLine:
+            DrawLine(cmd.p0.x, cmd.p0.y, cmd.p1.x, cmd.p1.y, cmd.color, cmd.stroke_width);
+            break;
+        case DrawCommandType::DrawText: {
+            if (cmd.text_index >= list.text_pool.size()) break;
+            DrawText(list.text_pool[cmd.text_index],
+                     cmd.rect,
+                     cmd.text_style.color,
+                     cmd.text_style.font_size,
+                     static_cast<DWRITE_TEXT_ALIGNMENT>(cmd.text_style.alignment),
+                     static_cast<DWRITE_FONT_WEIGHT>(cmd.text_style.weight),
+                     static_cast<DWRITE_PARAGRAPH_ALIGNMENT>(cmd.text_style.paragraph_alignment),
+                     cmd.text_style.word_wrap,
+                     cmd.text_style.font_family.empty() ? nullptr : cmd.text_style.font_family.c_str());
+            break;
+        }
+        case DrawCommandType::DrawImage: {
+            if (cmd.image_ref_index >= list.image_refs.size()) break;
+            const auto& ref = list.image_refs[cmd.image_ref_index];
+            DrawImageResource(ref.key, cmd.rect, cmd.sampling, cmd.opacity);
+            break;
+        }
+        case DrawCommandType::FillImagePattern: {
+            if (cmd.image_ref_index >= list.image_refs.size()) break;
+            const auto& ref = list.image_refs[cmd.image_ref_index];
+            FillRectWithImagePattern(ref.key, nullptr, cmd.rect);
+            break;
+        }
+        case DrawCommandType::FillGradient: {
+            if (cmd.gradient_ref_index >= list.gradient_refs.size()) break;
+            FillGradientRect(list.gradient_refs[cmd.gradient_ref_index], cmd.rect, cmd.radius_x);
+            break;
+        }
+        case DrawCommandType::DrawSvgIcon: {
+            if (cmd.svg_ref_index >= list.svg_icon_refs.size()) break;
+            const auto& icon = list.svg_icon_refs[cmd.svg_ref_index];
+            if (!factory_ || icon.view_box_w <= 0.0f || icon.view_box_h <= 0.0f) break;
+
+            float destW = cmd.rect.right - cmd.rect.left;
+            float destH = cmd.rect.bottom - cmd.rect.top;
+            if (destW <= 0.0f || destH <= 0.0f) break;
+            float scale = std::min(destW / icon.view_box_w, destH / icon.view_box_h);
+            float offX = cmd.rect.left + (destW - icon.view_box_w * scale) / 2.0f;
+            float offY = cmd.rect.top + (destH - icon.view_box_h * scale) / 2.0f;
+
+            D2D1_MATRIX_3X2_F oldXform = D2D1::Matrix3x2F::Identity();
+            ctx_->GetTransform(&oldXform);
+            auto iconTransform = D2D1::Matrix3x2F::Scale(scale, scale) *
+                                 D2D1::Matrix3x2F::Translation(offX, offY) *
+                                 oldXform;
+
+            if (!icon.layers.empty()) {
+                for (const auto& layer : icon.layers) {
+                    if (layer.path_data.empty()) continue;
+                    ID2D1PathGeometry* raw = nullptr;
+                    if (!svg_detail::BuildGeometry(factory_, layer.path_data, &raw)) continue;
+                    ComPtr<ID2D1PathGeometry> geom;
+                    geom.Attach(raw);
+                    D2D1_COLOR_F layerColor = cmd.color;
+                    layerColor.a *= layer.opacity;
+                    auto brush = GetBrush(layerColor);
+                    if (!brush) continue;
+                    ctx_->SetTransform(layer.transform * iconTransform);
+                    if (layer.stroke_width > 0.0f) {
+                        ctx_->DrawGeometry(geom.Get(), brush.Get(),
+                                           layer.stroke_width, GetRoundStrokeStyle());
+                    } else {
+                        ctx_->FillGeometry(geom.Get(), brush.Get());
+                    }
+                }
+            } else if (!icon.path_data.empty()) {
+                ID2D1PathGeometry* raw = nullptr;
+                if (svg_detail::BuildGeometry(factory_, icon.path_data, &raw)) {
+                    ComPtr<ID2D1PathGeometry> geom;
+                    geom.Attach(raw);
+                    auto brush = GetBrush(cmd.color);
+                    if (brush) {
+                        ctx_->SetTransform(iconTransform);
+                        ctx_->FillGeometry(geom.Get(), brush.Get());
+                    }
+                }
+            }
+            ctx_->SetTransform(oldXform);
+            break;
+        }
+        case DrawCommandType::DrawSvgDocument: {
+            if (cmd.svg_document_ref_index >= list.svg_document_refs.size()) break;
+            const auto& ref = list.svg_document_refs[cmd.svg_document_ref_index];
+            if (!ctx5_ || ref.xml.empty() || ref.viewport_w <= 0.0f || ref.viewport_h <= 0.0f) {
+                break;
+            }
+
+            auto createSvgDocument = [&](const std::string& xml,
+                                         ComPtr<ID2D1SvgDocument>& outDoc) -> bool {
+                if (xml.empty() ||
+                    xml.size() > static_cast<size_t>(std::numeric_limits<UINT>::max())) {
+                    return false;
+                }
+                ComPtr<IStream> stream;
+                stream.Attach(SHCreateMemStream(
+                    reinterpret_cast<const BYTE*>(xml.data()),
+                    static_cast<UINT>(xml.size())));
+                if (!stream) return false;
+
+                outDoc.Reset();
+                return SUCCEEDED(ctx5_->CreateSvgDocument(
+                           stream.Get(), D2D1::SizeF(ref.viewport_w, ref.viewport_h),
+                           outDoc.GetAddressOf())) && outDoc;
+            };
+
+            ComPtr<ID2D1SvgDocument> doc;
+            if (!createSvgDocument(ref.xml, doc)) {
+                break;
+            }
+
+            D2D1_MATRIX_3X2_F oldXform = D2D1::Matrix3x2F::Identity();
+            ctx5_->GetTransform(&oldXform);
+            D2D1_MATRIX_3X2_F svgXform = cmd.transform * oldXform;
+            ctx5_->SetTransform(svgXform);
+            doc->SetViewportSize(D2D1::SizeF(ref.viewport_w, ref.viewport_h));
+            ctx5_->DrawSvgDocument(doc.Get());
+
+            for (const auto& layer : ref.drop_shadow_layers) {
+                ComPtr<ID2D1SvgDocument> shadowDoc;
+                ComPtr<ID2D1SvgDocument> coverDoc;
+                if (!createSvgDocument(layer.shadow_xml, shadowDoc) ||
+                    !createSvgDocument(layer.cover_xml, coverDoc)) {
+                    continue;
+                }
+
+                ComPtr<ID2D1CommandList> shadowList;
+                if (FAILED(ctx5_->CreateCommandList(shadowList.GetAddressOf()))) {
+                    continue;
+                }
+
+                ComPtr<ID2D1Image> oldTarget;
+                ctx5_->GetTarget(&oldTarget);
+                ctx5_->SetTarget(shadowList.Get());
+                ctx5_->SetTransform(D2D1::Matrix3x2F::Identity());
+                ctx5_->Clear(D2D1::ColorF(0, 0, 0, 0));
+                shadowDoc->SetViewportSize(D2D1::SizeF(ref.viewport_w, ref.viewport_h));
+                ctx5_->DrawSvgDocument(shadowDoc.Get());
+                ctx5_->SetTarget(oldTarget.Get());
+
+                if (FAILED(shadowList->Close())) {
+                    ctx5_->SetTransform(svgXform);
+                    continue;
+                }
+
+                ComPtr<ID2D1Effect> blur;
+                if (FAILED(ctx5_->CreateEffect(CLSID_D2D1GaussianBlur, blur.GetAddressOf())) ||
+                    !blur) {
+                    ctx5_->SetTransform(svgXform);
+                    continue;
+                }
+
+                blur->SetInput(0, shadowList.Get());
+                blur->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
+                               layer.std_deviation);
+                blur->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE,
+                               D2D1_BORDER_MODE_SOFT);
+
+                D2D1_MATRIX_3X2_F shadowXform =
+                    D2D1::Matrix3x2F::Translation(layer.dx, layer.dy) * svgXform;
+                ctx5_->SetTransform(shadowXform);
+                ctx5_->DrawImage(blur.Get(), D2D1::Point2F(0, 0),
+                                 D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+
+                ctx5_->SetTransform(svgXform);
+                coverDoc->SetViewportSize(D2D1::SizeF(ref.viewport_w, ref.viewport_h));
+                ctx5_->DrawSvgDocument(coverDoc.Get());
+            }
+
+            ctx5_->SetTransform(oldXform);
+            break;
+        }
+        case DrawCommandType::DrawSvgTextRuns: {
+            if (cmd.svg_text_ref_index >= list.svg_text_refs.size()) break;
+            const auto& ref = list.svg_text_refs[cmd.svg_text_ref_index];
+            DrawSvgTextRuns(ref.runs, ref.base_transform);
+            break;
+        }
+        case DrawCommandType::DrawBackdropBlur:
+            DrawBackdropBlur(cmd.rect, cmd.radius_x, cmd.blur_radius);
+            break;
+        }
+    }
+    PruneImageBitmapCacheTo(list.image_refs);
 }
 
 // ---- SVG icon parsing and rendering ----
@@ -1674,6 +2950,28 @@ static std::wstring ResolveFontFamily(const std::string& css) {
     if (lc.empty() || lc=="sans-serif" || lc=="serif" || lc=="system-ui" ||
         lc=="ui-sans-serif" || lc=="inherit") return L"";   // → 主题默认
     return Utf8ToWide(t);
+}
+
+static std::vector<std::wstring> ResolveFontFamilyList(const std::string& css) {
+    std::vector<std::wstring> out;
+    size_t pos = 0;
+    while (pos < css.size()) {
+        size_t start = pos;
+        char quote = 0;
+        while (pos < css.size()) {
+            char c = css[pos];
+            if ((c == '"' || c == '\'') && (pos == start || css[pos - 1] != '\\')) {
+                quote = quote == c ? 0 : (quote ? quote : c);
+            } else if (c == ',' && !quote) {
+                break;
+            }
+            ++pos;
+        }
+        std::wstring fam = ResolveFontFamily(css.substr(start, pos - start));
+        if (!fam.empty()) out.push_back(std::move(fam));
+        if (pos < css.size() && css[pos] == ',') ++pos;
+    }
+    return out;
 }
 
 // L87: font-weight 解析. "bold"/"normal"/"bolder"/"lighter" + 数字 100..900.
@@ -2182,6 +3480,7 @@ SvgIcon Renderer::ParseSvgIcon(const std::string& svgContent) {
             if (svg_detail::BuildGeometry(factory_, single, &geom)) {
                 SvgPathLayer layer;
                 layer.geometry.Attach(geom);
+                layer.pathData = std::move(single);
                 layer.opacity = pi.opacity;
                 layer.strokeWidth = pi.strokeWidth;
                 layer.transform = pi.transform;
@@ -2196,6 +3495,7 @@ SvgIcon Renderer::ParseSvgIcon(const std::string& svgContent) {
         ID2D1PathGeometry* geom = nullptr;
         if (svg_detail::BuildGeometry(factory_, datas, &geom)) {
             icon.geometry.Attach(geom);
+            icon.pathData = std::move(datas);
             icon.valid = true;
         }
     }
@@ -2204,7 +3504,24 @@ SvgIcon Renderer::ParseSvgIcon(const std::string& svgContent) {
 
 void Renderer::DrawSvgIcon(const SvgIcon& icon, const D2D1_RECT_F& rect,
                             const D2D1_COLOR_F& color) {
-    if (!icon.valid || !ctx_) return;
+    if (!icon.valid) return;
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        SvgIconRef ref;
+        ref.view_box_w = icon.viewBoxW;
+        ref.view_box_h = icon.viewBoxH;
+        ref.path_data = icon.pathData;
+        ref.layers.reserve(icon.layers.size());
+        for (const auto& layer : icon.layers) {
+            SvgPathLayerRef layerRef;
+            layerRef.path_data = layer.pathData;
+            layerRef.opacity = layer.opacity;
+            layerRef.stroke_width = layer.strokeWidth;
+            layerRef.transform = layer.transform;
+            ref.layers.push_back(std::move(layerRef));
+        }
+        recorder->DrawSvgIcon(std::move(ref), rect, color);
+    }
+    if (!ctx_) return;
 
     float destW = rect.right - rect.left;
     float destH = rect.bottom - rect.top;
@@ -2212,8 +3529,12 @@ void Renderer::DrawSvgIcon(const SvgIcon& icon, const D2D1_RECT_F& rect,
     float offX = rect.left + (destW - icon.viewBoxW * scale) / 2.0f;
     float offY = rect.top + (destH - icon.viewBoxH * scale) / 2.0f;
 
-    auto iconTransform = D2D1::Matrix3x2F::Scale(scale, scale) *
-                         D2D1::Matrix3x2F::Translation(offX, offY);
+    D2D1_MATRIX_3X2_F oldXform = D2D1::Matrix3x2F::Identity();
+    ctx_->GetTransform(&oldXform);
+    D2D1_MATRIX_3X2_F iconTransform =
+        D2D1::Matrix3x2F::Scale(scale, scale) *
+        D2D1::Matrix3x2F::Translation(offX, offY) *
+        oldXform;
     ctx_->SetTransform(iconTransform);
 
     if (!icon.layers.empty()) {
@@ -2239,7 +3560,7 @@ void Renderer::DrawSvgIcon(const SvgIcon& icon, const D2D1_RECT_F& rect,
         if (brush) ctx_->FillGeometry(icon.geometry.Get(), brush.Get());
     }
 
-    ctx_->SetTransform(D2D1::Matrix3x2F::Identity());
+    ctx_->SetTransform(oldXform);
 }
 
 // L75: 只解析文字 run (D2D 原生 SVG 路径用 —— D2D 画形状, 这里补文字).
@@ -2380,6 +3701,423 @@ static std::string XmlAttrEscape(const std::string& s) {
     return o;
 }
 
+static std::string TrimAscii(std::string s) {
+    size_t a = s.find_first_not_of(" \t\r\n\"'");
+    if (a == std::string::npos) return {};
+    size_t b = s.find_last_not_of(" \t\r\n\"'");
+    return s.substr(a, b - a + 1);
+}
+
+static std::string LowerAscii(std::string s) {
+    for (char& c : s) c = (char)tolower((unsigned char)c);
+    return s;
+}
+
+static float ParseSvgCssLength(const std::string& value, float fontSize, float fallback = 0.0f) {
+    std::string s = TrimAscii(value);
+    if (s.empty()) return fallback;
+
+    const char* p = s.c_str();
+    char* end = nullptr;
+    float v = strtof(p, &end);
+    if (end == p) return fallback;
+
+    while (*end && isspace((unsigned char)*end)) ++end;
+    std::string unit = LowerAscii(TrimAscii(end));
+    if (unit.empty() || unit == "px") return v;
+    if (unit == "pt") return v * (96.0f / 72.0f);
+    if (unit == "pc") return v * 16.0f;
+    if (unit == "in") return v * 96.0f;
+    if (unit == "cm") return v * (96.0f / 2.54f);
+    if (unit == "mm") return v * (96.0f / 25.4f);
+    if (unit == "q")  return v * (96.0f / 101.6f);
+    if (unit == "em") return v * (fontSize > 0.0f ? fontSize : 16.0f);
+    if (unit == "ex") return v * (fontSize > 0.0f ? fontSize * 0.5f : 8.0f);
+    return v;
+}
+
+static std::string CssDeclValue(const std::string& block, const char* prop) {
+    std::string lower = LowerAscii(block);
+    std::string key = LowerAscii(prop);
+    size_t p = lower.find(key);
+    while (p != std::string::npos) {
+        bool leftOk = (p == 0) || !(isalnum((unsigned char)lower[p - 1]) || lower[p - 1] == '-');
+        size_t q = p + key.size();
+        while (q < lower.size() && isspace((unsigned char)lower[q])) ++q;
+        if (leftOk && q < lower.size() && lower[q] == ':') {
+            size_t v0 = q + 1;
+            size_t v1 = block.size();
+            int paren = 0;
+            char quote = 0;
+            for (size_t i = v0; i < block.size(); ++i) {
+                char c = block[i];
+                if (quote) {
+                    if (c == quote) quote = 0;
+                    continue;
+                }
+                if (c == '"' || c == '\'') { quote = c; continue; }
+                if (c == '(') { ++paren; continue; }
+                if (c == ')' && paren > 0) { --paren; continue; }
+                if (c == ';' && paren == 0) { v1 = i; break; }
+            }
+            return TrimAscii(block.substr(v0, v1 - v0));
+        }
+        p = lower.find(key, p + key.size());
+    }
+    return {};
+}
+
+static std::vector<uint8_t> DecodeBase64Ascii(const std::string& text) {
+    int map[256];
+    for (int& v : map) v = -1;
+    const char* alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (int i = 0; alphabet[i]; ++i) map[(unsigned char)alphabet[i]] = i;
+    std::vector<uint8_t> out;
+    int val = 0, bits = -8;
+    for (unsigned char c : text) {
+        if (isspace(c)) continue;
+        if (c == '=') break;
+        int m = map[c];
+        if (m < 0) continue;
+        val = (val << 6) | m;
+        bits += 6;
+        if (bits >= 0) {
+            out.push_back((uint8_t)((val >> bits) & 0xFF));
+            bits -= 8;
+        }
+    }
+    return out;
+}
+
+static std::vector<uint8_t> ExtractWoff2DataUrl(const std::string& src) {
+    std::string lower = LowerAscii(src);
+    size_t u = lower.find("url(");
+    if (u == std::string::npos) return {};
+    u += 4;
+    size_t e = src.find(')', u);
+    if (e == std::string::npos || e <= u) return {};
+    std::string url = TrimAscii(src.substr(u, e - u));
+    std::string lurl = LowerAscii(url);
+    size_t b64 = lurl.find("base64,");
+    if (b64 == std::string::npos) return {};
+    if (lurl.find("woff2") == std::string::npos && lurl.find("font/woff2") == std::string::npos)
+        return {};
+    return DecodeBase64Ascii(url.substr(b64 + 7));
+}
+
+struct EmbeddedSvgFonts {
+    struct Face {
+        std::wstring cssFamily;
+        std::wstring alias;
+        ComPtr<IDWriteFontFace3> face;
+        DWRITE_FONT_METRICS metrics{};
+    };
+
+    ComPtr<IDWriteFactory5> factory5;
+    ComPtr<IDWriteInMemoryFontFileLoader> loader;
+    ComPtr<IDWriteFontCollection1> collection;
+    std::vector<std::vector<uint8_t>> fontBuffers;
+    std::vector<Face> faces;
+    std::map<std::wstring, std::vector<size_t>> familyFaces;
+    std::map<std::wstring, std::vector<std::wstring>> aliases;
+
+    ~EmbeddedSvgFonts() {
+        if (factory5 && loader) factory5->UnregisterFontFileLoader(loader.Get());
+    }
+
+    bool HasFamily(const std::wstring& family) const {
+        if (!collection || family.empty()) return false;
+        UINT32 idx = 0; BOOL exists = FALSE;
+        return SUCCEEDED(collection->FindFamilyName(family.c_str(), &idx, &exists)) && exists;
+    }
+
+    const Face* FindFaceForChar(const std::vector<std::wstring>& families,
+                                wchar_t ch, UINT16* outGlyph) const {
+        if (outGlyph) *outGlyph = 0;
+        if (faces.empty() || ch == 0) return nullptr;
+        for (const auto& fam : families) {
+            auto it = familyFaces.find(fam);
+            if (it == familyFaces.end()) continue;
+            for (size_t idx : it->second) {
+                if (idx >= faces.size() || !faces[idx].face) continue;
+                UINT16 glyph = 0;
+                UINT32 codePoint = (UINT32)ch;
+                if (SUCCEEDED(faces[idx].face->GetGlyphIndicesW(&codePoint, 1, &glyph)) && glyph != 0) {
+                    if (outGlyph) *outGlyph = glyph;
+                    return &faces[idx];
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    std::vector<std::wstring> ExpandFamilies(const std::vector<std::wstring>& families) const {
+        std::vector<std::wstring> expanded;
+        expanded.reserve(families.size());
+        for (const auto& fam : families) {
+            auto it = aliases.find(fam);
+            if (it != aliases.end()) {
+                for (const auto& alias : it->second) {
+                    if (HasFamily(alias)) expanded.push_back(alias);
+                }
+            } else if (HasFamily(fam)) {
+                expanded.push_back(fam);
+            }
+        }
+        return expanded;
+    }
+
+    ComPtr<IDWriteFontFallback> MakeFallback(IDWriteFactory* dwFactory,
+                                             const std::vector<std::wstring>& families,
+                                             IDWriteFontFallback* tail,
+                                             const wchar_t* locale,
+                                             const wchar_t* skipFirst) const {
+        if (!collection || families.empty() || !dwFactory) return nullptr;
+        std::vector<std::wstring> expanded = ExpandFamilies(families);
+        if (skipFirst && !expanded.empty() && expanded.front() == skipFirst) {
+            expanded.erase(expanded.begin());
+        }
+        std::vector<const WCHAR*> names;
+        names.reserve(expanded.size());
+        for (const auto& fam : expanded) {
+            names.push_back(fam.c_str());
+        }
+        if (names.empty()) return nullptr;
+
+        ComPtr<IDWriteFactory2> factory2;
+        if (FAILED(dwFactory->QueryInterface(__uuidof(IDWriteFactory2),
+                reinterpret_cast<void**>(factory2.GetAddressOf()))) || !factory2)
+            return nullptr;
+
+        ComPtr<IDWriteFontFallbackBuilder> builder;
+        if (FAILED(factory2->CreateFontFallbackBuilder(builder.GetAddressOf())) || !builder)
+            return nullptr;
+        DWRITE_UNICODE_RANGE range{0x0000, 0x10FFFF};
+        if (FAILED(builder->AddMapping(&range, 1, names.data(), (UINT32)names.size(),
+                collection.Get(), locale, nullptr, 1.0f)))
+            return nullptr;
+        if (tail) builder->AddMappings(tail);
+        ComPtr<IDWriteFontFallback> fallback;
+        if (FAILED(builder->CreateFontFallback(fallback.GetAddressOf()))) return nullptr;
+        return fallback;
+    }
+};
+
+static bool CopyFontFileStream(IDWriteFontFileStream* stream, std::vector<uint8_t>& out) {
+    if (!stream) return false;
+    UINT64 size64 = 0;
+    if (FAILED(stream->GetFileSize(&size64)) || size64 == 0 || size64 > UINT32_MAX)
+        return false;
+    const void* fragment = nullptr;
+    void* ctx = nullptr;
+    if (FAILED(stream->ReadFileFragment(&fragment, 0, size64, &ctx)) || !fragment)
+        return false;
+    out.resize((size_t)size64);
+    std::memcpy(out.data(), fragment, (size_t)size64);
+    stream->ReleaseFileFragment(ctx);
+    return true;
+}
+
+static std::vector<uint8_t> UnpackFontContainer(IDWriteFactory5* factory5,
+                                                const std::vector<uint8_t>& data) {
+    if (!factory5 || data.empty()) return data;
+    DWRITE_CONTAINER_TYPE type = factory5->AnalyzeContainerType(data.data(), (UINT32)data.size());
+    if (type == DWRITE_CONTAINER_TYPE_UNKNOWN) return data;
+    ComPtr<IDWriteFontFileStream> stream;
+    if (FAILED(factory5->UnpackFontFile(type, data.data(), (UINT32)data.size(),
+            stream.GetAddressOf())) || !stream)
+        return {};
+    std::vector<uint8_t> unpacked;
+    return CopyFontFileStream(stream.Get(), unpacked) ? unpacked : std::vector<uint8_t>{};
+}
+
+static const std::wstring* FirstEmbeddedAlias(const EmbeddedSvgFonts* fonts,
+                                              const std::vector<std::wstring>& families) {
+    if (!fonts || families.empty()) return nullptr;
+    auto it = fonts->aliases.find(families.front());
+    if (it != fonts->aliases.end() && !it->second.empty())
+        return &it->second.front();
+    return fonts->HasFamily(families.front()) ? &families.front() : nullptr;
+}
+
+static std::unique_ptr<EmbeddedSvgFonts> BuildEmbeddedSvgFonts(IDWriteFactory* dwFactory,
+                                                               const std::string& svg) {
+    if (!dwFactory || svg.find("@font-face") == std::string::npos) return nullptr;
+    ComPtr<IDWriteFactory5> factory5;
+    if (FAILED(dwFactory->QueryInterface(__uuidof(IDWriteFactory5),
+            reinterpret_cast<void**>(factory5.GetAddressOf()))) || !factory5)
+        return nullptr;
+
+    auto ctx = std::make_unique<EmbeddedSvgFonts>();
+    ctx->factory5 = factory5;
+    if (FAILED(factory5->CreateInMemoryFontFileLoader(ctx->loader.GetAddressOf())) || !ctx->loader)
+        return nullptr;
+    if (FAILED(factory5->RegisterFontFileLoader(ctx->loader.Get())))
+        return nullptr;
+
+    ComPtr<IDWriteFontSetBuilder1> builder;
+    if (FAILED(factory5->CreateFontSetBuilder(builder.GetAddressOf())) || !builder)
+        return nullptr;
+
+    bool added = false;
+    uint32_t fontIndex = 0;
+    size_t pos = 0;
+    while ((pos = svg.find("@font-face", pos)) != std::string::npos) {
+        size_t lb = svg.find('{', pos);
+        size_t rb = lb == std::string::npos ? std::string::npos : svg.find('}', lb + 1);
+        if (lb == std::string::npos || rb == std::string::npos) break;
+        std::string block = svg.substr(lb + 1, rb - lb - 1);
+        pos = rb + 1;
+
+        std::string family8 = CssDeclValue(block, "font-family");
+        std::string src = CssDeclValue(block, "src");
+        if (family8.empty() || src.empty()) continue;
+        std::vector<uint8_t> fontData = ExtractWoff2DataUrl(src);
+        if (fontData.empty()) continue;
+        fontData = UnpackFontContainer(factory5.Get(), fontData);
+        if (fontData.empty()) continue;
+
+        std::wstring family = svg_detail::Utf8ToWide(TrimAscii(family8));
+        if (family.empty()) continue;
+        std::wstring alias = family + L"__svgfont_" + std::to_wstring(fontIndex++);
+
+        ctx->fontBuffers.push_back(std::move(fontData));
+        const auto& storedFont = ctx->fontBuffers.back();
+        ComPtr<IDWriteFontFile> fontFile;
+        if (FAILED(ctx->loader->CreateInMemoryFontFileReference(
+                dwFactory, storedFont.data(), (UINT32)storedFont.size(), nullptr,
+                fontFile.GetAddressOf())) || !fontFile)
+            continue;
+
+        ComPtr<IDWriteFontFaceReference> ref;
+        if (FAILED(factory5->CreateFontFaceReference(
+                fontFile.Get(), 0, DWRITE_FONT_SIMULATIONS_NONE, ref.GetAddressOf())) || !ref)
+            continue;
+
+        ComPtr<IDWriteFontFace3> face;
+        if (FAILED(ref->CreateFontFace(face.GetAddressOf())) || !face)
+            continue;
+
+        DWRITE_FONT_PROPERTY prop{DWRITE_FONT_PROPERTY_ID_FAMILY_NAME, alias.c_str(), L"en-us"};
+        if (SUCCEEDED(builder->AddFontFaceReference(ref.Get(), &prop, 1))) {
+            EmbeddedSvgFonts::Face f;
+            f.cssFamily = family;
+            f.alias = alias;
+            f.face = face;
+            f.face->GetMetrics(&f.metrics);
+            ctx->familyFaces[family].push_back(ctx->faces.size());
+            ctx->faces.push_back(std::move(f));
+            ctx->aliases[family].push_back(std::move(alias));
+            added = true;
+        }
+    }
+
+    if (!added) return nullptr;
+    ComPtr<IDWriteFontSet> fontSet;
+    if (FAILED(builder->CreateFontSet(fontSet.GetAddressOf())) || !fontSet)
+        return nullptr;
+    if (FAILED(factory5->CreateFontCollectionFromFontSet(fontSet.Get(), ctx->collection.GetAddressOf())) ||
+        !ctx->collection)
+        return nullptr;
+    return ctx;
+}
+
+static bool RenderEmbeddedGlyphRun(const EmbeddedSvgFonts* fonts,
+                                   const std::wstring& txt,
+                                   float fontSize,
+                                   const std::vector<std::wstring>& families,
+                                   DWRITE_FONT_WEIGHT weight,
+                                   DWRITE_FONT_STYLE fstyle,
+                                   float svgX, float svgY,
+                                   int anchor,
+                                   bool block,
+                                   std::string* outPath,
+                                   float* outAdv) {
+    if (outPath) outPath->clear();
+    if (outAdv) *outAdv = 0.0f;
+    if (!fonts || txt.empty() || fontSize <= 0.0f || families.empty())
+        return false;
+    if (weight != DWRITE_FONT_WEIGHT_NORMAL || fstyle != DWRITE_FONT_STYLE_NORMAL)
+        return false;
+
+    struct Glyph {
+        const EmbeddedSvgFonts::Face* face = nullptr;
+        UINT16 glyph = 0;
+        float advance = 0.0f;
+    };
+    std::vector<Glyph> glyphs;
+    glyphs.reserve(txt.size());
+
+    float totalAdvance = 0.0f;
+    float maxAscent = 0.0f;
+    float maxLineHeight = 0.0f;
+    for (size_t i = 0; i < txt.size(); ++i) {
+        wchar_t ch = txt[i];
+        if (ch == L'\r') continue;
+        if (ch == L'\n') return false;  // keep complex multiline layout on the DWrite path
+        if (ch >= 0xD800 && ch <= 0xDFFF) return false; // keep surrogate pairs on DWrite shaping
+
+        UINT16 glyph = 0;
+        const auto* face = fonts->FindFaceForChar(families, ch, &glyph);
+        if (!face || !face->face) {
+            if (ch == L' ' || ch == L'\t') {
+                float adv = (ch == L'\t') ? fontSize : fontSize * 0.33f;
+                glyphs.push_back(Glyph{nullptr, 0, adv});
+                totalAdvance += adv;
+                continue;
+            }
+            return false;
+        }
+
+        const float upm = face->metrics.designUnitsPerEm > 0
+            ? (float)face->metrics.designUnitsPerEm : 1000.0f;
+        const float scale = fontSize / upm;
+        DWRITE_GLYPH_METRICS gm{};
+        if (FAILED(face->face->GetDesignGlyphMetrics(&glyph, 1, &gm, FALSE)))
+            return false;
+        float adv = (float)gm.advanceWidth * scale;
+        if (adv <= 0.0f) adv = fontSize * 0.5f;
+        totalAdvance += adv;
+        maxAscent = std::max(maxAscent, (float)face->metrics.ascent * scale);
+        maxLineHeight = std::max(maxLineHeight,
+            (float)(face->metrics.ascent + face->metrics.descent + face->metrics.lineGap) * scale);
+        glyphs.push_back(Glyph{face, glyph, adv});
+    }
+
+    if (glyphs.empty()) return false;
+    if (outAdv) *outAdv = totalAdvance;
+
+    float x = svgX;
+    if (anchor == 1)      x -= totalAdvance * 0.5f;
+    else if (anchor == 2) x -= totalAdvance;
+    float baseline = svgY;
+    if (block) {
+        const float h = maxLineHeight > 0.0f ? maxLineHeight : fontSize;
+        const float a = maxAscent > 0.0f ? maxAscent : fontSize * 0.8f;
+        x = svgX - totalAdvance * 0.5f;
+        baseline = svgY - h * 0.5f + a;
+    }
+
+    SvgGlyphPathSink sink;
+    float pen = 0.0f;
+    for (const auto& g : glyphs) {
+        if (!g.face || !g.face->face || g.glyph == 0) {
+            pen += g.advance;
+            continue;
+        }
+        DWRITE_GLYPH_OFFSET off{0.0f, 0.0f};
+        FLOAT adv = g.advance;
+        sink.setOffset(x + pen, baseline);
+        if (FAILED(g.face->face->GetGlyphRunOutline(
+                fontSize, &g.glyph, &adv, &off, 1, FALSE, FALSE, &sink)))
+            return false;
+        pen += g.advance;
+    }
+
+    if (outPath) *outPath = std::move(sink.data());
+    return outPath && !outPath->empty();
+}
+
 } // namespace
 
 std::string Renderer::SvgInlineTextAsPaths(const std::string& svg) {
@@ -2387,16 +4125,119 @@ std::string Renderer::SvgInlineTextAsPaths(const std::string& svg) {
     using svg_detail::extractAttrFromTag;
     using svg_detail::CssProp;
     using svg_detail::ResolveFontFamily;
+    using svg_detail::ResolveFontFamilyList;
     using svg_detail::ParseFontWeight;
     using svg_detail::ExtractInnerText;
     using svg_detail::AppendDecoded;
     using svg_detail::Utf8ToWide;
 
+    auto embeddedFonts = BuildEmbeddedSvgFonts(dwFactory_, svg);
+    auto shouldSkipForeignObject = [&](const std::string& tag, size_t foStart, size_t foEnd) {
+        auto isPercentLength = [](const std::string& v) {
+            return v.find('%') != std::string::npos;
+        };
+        if (isPercentLength(extractAttrFromTag(tag, "width")) ||
+            isPercentLength(extractAttrFromTag(tag, "height")))
+            return true;
+
+        size_t swOpen = svg.rfind("<switch", foStart);
+        if (swOpen == std::string::npos) return false;
+        size_t prevSwClose = svg.rfind("</switch>", foStart);
+        if (prevSwClose != std::string::npos && prevSwClose > swOpen) return false;
+        size_t swClose = svg.find("</switch>", foEnd);
+        if (swClose == std::string::npos) return false;
+        size_t img = svg.find("<image", foEnd);
+        return img != std::string::npos && img < swClose;
+    };
+    auto cleanCssColor = [](std::string v) -> std::string {
+        std::string lc = LowerAscii(v);
+        size_t bang = lc.find("!important");
+        if (bang != std::string::npos) v = v.substr(0, bang);
+        v = TrimAscii(v);
+        lc = LowerAscii(v);
+        if (lc.empty() || lc == "inherit" || lc == "initial" ||
+            lc == "unset" || lc == "currentcolor") {
+            return {};
+        }
+        return v;
+    };
+    auto foreignObjectTextColor = [&](size_t start, size_t end) -> std::string {
+        std::string color;
+        size_t p = start;
+        while (p < end) {
+            size_t lt2 = svg.find('<', p);
+            if (lt2 == std::string::npos || lt2 >= end) break;
+            if (lt2 + 1 < end && svg[lt2 + 1] == '/') {
+                p = lt2 + 2;
+                continue;
+            }
+            size_t te2 = svg.find('>', lt2);
+            if (te2 == std::string::npos || te2 >= end) break;
+            std::string childTag = svg.substr(lt2, te2 - lt2 + 1);
+            std::string v = extractAttrFromTag(childTag, "color");
+            if (v.empty()) v = CssProp(extractAttrFromTag(childTag, "style"), "color");
+            v = cleanCssColor(v);
+            if (!v.empty()) color = std::move(v);
+            p = te2 + 1;
+        }
+        return color;
+    };
+    struct SvgFoBackground {
+        bool valid = false;
+        std::string fill;
+        std::string opacity;
+    };
+    auto formatFloatAttr = [](float v) -> std::string {
+        char buf[48];
+        int n = snprintf(buf, sizeof(buf), "%.3f", (double)v);
+        if (n <= 0) return "0";
+        int e = n;
+        while (e > 0 && buf[e - 1] == '0') --e;
+        if (e > 0 && buf[e - 1] == '.') --e;
+        if (e <= 0) return "0";
+        return std::string(buf, static_cast<size_t>(e));
+    };
+    auto colorToSvgAttrs = [&](const std::string& cssColor, SvgFoBackground& out) {
+        D2D1_COLOR_F c{};
+        if (!svg_detail::ParseSvgColor(cleanCssColor(cssColor), c) || c.a <= 0.0f) return;
+        auto byte = [](float x) -> int {
+            int v = static_cast<int>(std::round(x * 255.0f));
+            return v < 0 ? 0 : (v > 255 ? 255 : v);
+        };
+        char fill[16];
+        snprintf(fill, sizeof(fill), "#%02x%02x%02x", byte(c.r), byte(c.g), byte(c.b));
+        out.valid = true;
+        out.fill = fill;
+        out.opacity = c.a < 0.999f ? formatFloatAttr(c.a) : std::string();
+    };
+    auto foreignObjectBackground = [&](size_t start, size_t end) -> SvgFoBackground {
+        SvgFoBackground bg;
+        size_t p = start;
+        while (p < end) {
+            size_t lt2 = svg.find('<', p);
+            if (lt2 == std::string::npos || lt2 >= end) break;
+            if (lt2 + 1 < end && svg[lt2 + 1] == '/') {
+                p = lt2 + 2;
+                continue;
+            }
+            size_t te2 = svg.find('>', lt2);
+            if (te2 == std::string::npos || te2 >= end) break;
+            std::string childTag = svg.substr(lt2, te2 - lt2 + 1);
+            std::string v = extractAttrFromTag(childTag, "background-color");
+            if (v.empty()) {
+                v = CssProp(extractAttrFromTag(childTag, "style"), "background-color");
+            }
+            if (!v.empty()) colorToSvgAttrs(v, bg);
+            p = te2 + 1;
+        }
+        return bg;
+    };
+
     /* 沿 <g> 链继承的"文字呈现属性"(只继承 font/fill, 不碰 transform/opacity ——
      * 那两样留给 DOM 作用在生成的 <path> 祖先上, 避免双重应用). */
     struct GFont {
         float fontSize = 0.0f;                                   // 0 = 未设
-        std::wstring family; bool familySet = false;
+        std::vector<std::wstring> families; bool familySet = false;
         DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL; bool weightSet = false;
         DWRITE_FONT_STYLE  fstyle = DWRITE_FONT_STYLE_NORMAL;  bool styleSet  = false;  // L122: italic
         std::string fill; bool fillSet = false;                  // url()/#hex/named, "" = 未设
@@ -2407,9 +4248,13 @@ std::string Renderer::SvgInlineTextAsPaths(const std::string& svg) {
         if (s.empty()) s = CssProp(style, "color");
         if (!s.empty()) { st.fill = s; st.fillSet = true; }
         if ((s = extractAttrFromTag(tag, "font-size")).empty()) s = CssProp(style, "font-size");
-        if (!s.empty()) { float v = (float)atof(s.c_str()); if (v > 0) st.fontSize = v; }
+        if (!s.empty()) {
+            float base = st.fontSize > 0.0f ? st.fontSize : 16.0f;
+            float v = ParseSvgCssLength(s, base, 0.0f);
+            if (v > 0) st.fontSize = v;
+        }
         if ((s = extractAttrFromTag(tag, "font-family")).empty()) s = CssProp(style, "font-family");
-        if (!s.empty()) { st.family = ResolveFontFamily(s); st.familySet = true; }
+        if (!s.empty()) { st.families = ResolveFontFamilyList(s); st.familySet = true; }
         if ((s = extractAttrFromTag(tag, "font-weight")).empty()) s = CssProp(style, "font-weight");
         if (!s.empty()) { st.weight = ParseFontWeight(s); st.weightSet = true; }
         if ((s = extractAttrFromTag(tag, "font-style")).empty()) s = CssProp(style, "font-style");
@@ -2425,22 +4270,38 @@ std::string Renderer::SvgInlineTextAsPaths(const std::string& svg) {
      * anchor: 0=start 1=middle 2=end; block=围绕(svgX,svgY)居中(foreignObject)。
      * *outAdv 回填布局自然宽 (供 tspan 无显式 x 时接续)。每次新建 format (转换在
      * load 时一次性跑, 不必缓存), 带 font-style + 字体回退。 */
-    auto renderRun = [&](const std::wstring& txt, float fontSize, const wchar_t* family,
+    auto renderRun = [&](const std::wstring& txt, float fontSize, const std::vector<std::wstring>& families,
                          DWRITE_FONT_WEIGHT weight, DWRITE_FONT_STYLE fstyle,
                          float svgX, float svgY, int anchor, bool block, float maxW,
                          float* outAdv) -> std::string {
         if (outAdv) *outAdv = 0.0f;
         if (txt.empty()) return {};
-        const wchar_t* fam = family ? family : DefaultFontFamily();
-        if (!fam) fam = L"Segoe UI";
+        std::string embeddedPath;
+        if (RenderEmbeddedGlyphRun(embeddedFonts.get(), txt, fontSize, families,
+                                   weight, fstyle, svgX, svgY, anchor, block,
+                                   &embeddedPath, outAdv)) {
+            return embeddedPath;
+        }
+        const std::wstring* embeddedPrimary = FirstEmbeddedAlias(embeddedFonts.get(), families);
+        const wchar_t* fam = embeddedPrimary ? embeddedPrimary->c_str()
+                            : (!families.empty() ? families.front().c_str() : DefaultFontFamily());
+        if (!fam || !fam[0]) fam = L"Segoe UI";
+        IDWriteFontCollection* collection =
+            embeddedPrimary
+                ? embeddedFonts->collection.Get() : nullptr;
         ComPtr<IDWriteTextFormat> fmt;
-        if (FAILED(dwFactory_->CreateTextFormat(fam, nullptr, weight, fstyle,
+        if (FAILED(dwFactory_->CreateTextFormat(fam, collection, weight, fstyle,
                 DWRITE_FONT_STRETCH_NORMAL, fontSize, ResolveLocaleName(),
                 fmt.GetAddressOf())) || !fmt)
             return {};
-        if (fontFallback_) {
+        ComPtr<IDWriteFontFallback> embeddedFallback =
+            embeddedFonts ? embeddedFonts->MakeFallback(dwFactory_, families, fontFallback_.Get(),
+                                                        ResolveLocaleName(), embeddedPrimary ? embeddedPrimary->c_str() : nullptr)
+                          : nullptr;
+        if (embeddedFallback || fontFallback_) {
             ComPtr<IDWriteTextFormat3> f3;
-            if (SUCCEEDED(fmt.As(&f3)) && f3) f3->SetFontFallback(fontFallback_.Get());
+            if (SUCCEEDED(fmt.As(&f3)) && f3)
+                f3->SetFontFallback(embeddedFallback ? embeddedFallback.Get() : fontFallback_.Get());
         }
         float layoutMaxW = maxW > 1.0f ? maxW : 100000.0f;
         ComPtr<IDWriteTextLayout> layout;
@@ -2451,7 +4312,7 @@ std::string Renderer::SvgInlineTextAsPaths(const std::string& svg) {
                                             : DWRITE_WORD_WRAPPING_NO_WRAP);
         DWRITE_TEXT_METRICS tm{};
         layout->GetMetrics(&tm);
-        if (block || anchor != 0) {
+        if (block) {
             layout->SetMaxWidth(tm.width + 1.0f);
             layout->SetTextAlignment(anchor == 2 ? DWRITE_TEXT_ALIGNMENT_TRAILING
                                                  : DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -2476,16 +4337,476 @@ std::string Renderer::SvgInlineTextAsPaths(const std::string& svg) {
                          const std::string& xfStr) -> std::string {
         std::string p = "<path d=\""; p += d;
         p += "\" fill=\"" + XmlAttrEscape(fillStr) + "\" fill-rule=\"nonzero\"";
+        p += " stroke=\"none\" stroke-width=\"0\"";
         if (!opacityStr.empty())     p += " opacity=\"" + XmlAttrEscape(opacityStr) + "\"";
         if (!fillOpacityStr.empty()) p += " fill-opacity=\"" + XmlAttrEscape(fillOpacityStr) + "\"";
         if (!xfStr.empty())          p += " transform=\"" + XmlAttrEscape(xfStr) + "\"";
         p += "/>";
         return p;
     };
+    auto buildRect = [&](float x, float y, float w, float h,
+                         const SvgFoBackground& bg, const std::string& xfStr) -> std::string {
+        if (!bg.valid || w <= 0.0f || h <= 0.0f) return {};
+        std::string r = "<rect x=\"";
+        r += formatFloatAttr(x);
+        r += "\" y=\"";
+        r += formatFloatAttr(y);
+        r += "\" width=\"";
+        r += formatFloatAttr(w);
+        r += "\" height=\"";
+        r += formatFloatAttr(h);
+        r += "\" fill=\"";
+        r += XmlAttrEscape(bg.fill);
+        r += "\" stroke=\"none\" stroke-width=\"0\"";
+        if (!bg.opacity.empty()) {
+            r += " fill-opacity=\"";
+            r += XmlAttrEscape(bg.opacity);
+            r += "\"";
+        }
+        if (!xfStr.empty()) {
+            r += " transform=\"";
+            r += XmlAttrEscape(xfStr);
+            r += "\"";
+        }
+        r += "/>";
+        return r;
+    };
+
+    struct Repl { size_t start, end; std::string text; };
+
+    struct DrawIoHtmlStyle {
+        float fontSize = 16.0f;
+        std::vector<std::wstring> families;
+        DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL;
+        DWRITE_FONT_STYLE fstyle = DWRITE_FONT_STYLE_NORMAL;
+        std::string fill = "#000000";
+        float lineHeight = 0.0f;
+        int baseline = 0;  // negative=sup, positive=sub
+    };
+    struct DrawIoTextRun {
+        std::wstring text;
+        DrawIoHtmlStyle style;
+        float width = 0.0f;
+        float height = 0.0f;
+        float baseline = 0.0f;
+    };
+    struct DrawIoLine {
+        std::vector<DrawIoTextRun> runs;
+        float width = 0.0f;
+        float height = 0.0f;
+        float baselineFromTop = 0.0f;
+        float maxFontSize = 0.0f;
+    };
+    struct DrawIoLabelBox {
+        float x = 0.0f;
+        float y = 0.0f;
+        float w = 0.0f;
+        float h = 0.0f;
+        int anchor = 1;
+        bool valid = false;
+    };
+
+    auto drawIoTagName = [](const std::string& tag) -> std::string {
+        size_t i = 1;
+        while (i < tag.size() && (tag[i] == '/' || tag[i] == '!' || tag[i] == '?')) ++i;
+        while (i < tag.size() && std::isspace((unsigned char)tag[i])) ++i;
+        size_t s = i;
+        while (i < tag.size()) {
+            unsigned char c = (unsigned char)tag[i];
+            if (!(std::isalnum(c) || c == ':' || c == '-' || c == '_')) break;
+            ++i;
+        }
+        std::string name = LowerAscii(tag.substr(s, i - s));
+        size_t colon = name.rfind(':');
+        return colon == std::string::npos ? name : name.substr(colon + 1);
+    };
+    auto drawIoSelfClosing = [](const std::string& tag) -> bool {
+        size_t i = tag.size();
+        while (i > 0 && std::isspace((unsigned char)tag[i - 1])) --i;
+        return i >= 2 && tag[i - 2] == '/' && tag[i - 1] == '>';
+    };
+    auto drawIoVoidTag = [](const std::string& name) -> bool {
+        return name == "br" || name == "hr" || name == "img" ||
+               name == "input" || name == "meta" || name == "link";
+    };
+    auto drawIoLineHeight = [&](const std::string& value, float fontSize) -> float {
+        std::string s = LowerAscii(TrimAscii(value));
+        if (s.empty() || s == "normal") return fontSize * 1.2f;
+        char* end = nullptr;
+        float v = std::strtof(s.c_str(), &end);
+        if (end == s.c_str() || v <= 0.0f) return fontSize * 1.2f;
+        while (*end && std::isspace((unsigned char)*end)) ++end;
+        if (!*end) return v * fontSize;
+        return ParseSvgCssLength(s, fontSize, fontSize * 1.2f);
+    };
+    auto drawIoSameStyle = [](const DrawIoHtmlStyle& a, const DrawIoHtmlStyle& b) {
+        return a.fontSize == b.fontSize &&
+               a.families == b.families &&
+               a.weight == b.weight &&
+               a.fstyle == b.fstyle &&
+               a.fill == b.fill &&
+               a.lineHeight == b.lineHeight &&
+               a.baseline == b.baseline;
+    };
+    auto drawIoBaselineShift = [](const DrawIoTextRun& run, float maxFontSize) -> float {
+        if (run.style.baseline > 0)
+            return maxFontSize * 0.22f * (float)run.style.baseline;
+        if (run.style.baseline < 0)
+            return -maxFontSize * 0.38f * (float)(-run.style.baseline);
+        return 0.0f;
+    };
+    auto drawIoApplyStyle = [&](DrawIoHtmlStyle& st,
+                                const std::string& name,
+                                const std::string& tag) {
+        std::string style = extractAttrFromTag(tag, "style");
+        if (name == "b" || name == "strong") st.weight = DWRITE_FONT_WEIGHT_BOLD;
+        if (name == "i" || name == "em")     st.fstyle = DWRITE_FONT_STYLE_ITALIC;
+        if (name == "sub") {
+            st.baseline += 1;
+            st.fontSize *= 0.65f;
+        } else if (name == "sup") {
+            st.baseline -= 1;
+            st.fontSize *= 0.65f;
+        }
+
+        std::string s;
+        if (name == "font") {
+            s = extractAttrFromTag(tag, "face");
+            if (!s.empty()) {
+                auto families = ResolveFontFamilyList(s);
+                if (!families.empty()) st.families = std::move(families);
+            }
+            s = extractAttrFromTag(tag, "color");
+            s = cleanCssColor(s);
+            if (!s.empty()) st.fill = std::move(s);
+        }
+
+        s = CssProp(style, "font-size");
+        if (!s.empty()) {
+            float v = ParseSvgCssLength(s, st.fontSize > 0.0f ? st.fontSize : 16.0f, 0.0f);
+            if (v > 0.0f) st.fontSize = v;
+        }
+        s = CssProp(style, "font-family");
+        if (!s.empty()) {
+            auto families = ResolveFontFamilyList(s);
+            if (!families.empty()) st.families = std::move(families);
+        }
+        s = CssProp(style, "font-weight");
+        if (!s.empty()) st.weight = ParseFontWeight(s);
+        s = CssProp(style, "font-style");
+        if (!s.empty()) {
+            std::string lc = LowerAscii(s);
+            st.fstyle = lc.find("italic") != std::string::npos ? DWRITE_FONT_STYLE_ITALIC
+                      : lc.find("oblique") != std::string::npos ? DWRITE_FONT_STYLE_OBLIQUE
+                      : DWRITE_FONT_STYLE_NORMAL;
+        }
+        s = CssProp(style, "color");
+        if (s.empty()) s = extractAttrFromTag(tag, "color");
+        s = cleanCssColor(s);
+        if (!s.empty()) st.fill = std::move(s);
+        s = CssProp(style, "line-height");
+        if (!s.empty()) st.lineHeight = drawIoLineHeight(s, st.fontSize);
+        s = CssProp(style, "vertical-align");
+        if (!s.empty()) {
+            std::string lc = LowerAscii(s);
+            if (lc.find("sub") != std::string::npos) st.baseline += 1;
+            else if (lc.find("super") != std::string::npos ||
+                     lc.find("sup") != std::string::npos) st.baseline -= 1;
+        }
+    };
+    auto drawIoParseBox = [&](const std::string& tag,
+                              size_t contentStart,
+                              size_t contentEnd,
+                              float baseFontSize,
+                              DrawIoLabelBox& box) -> bool {
+        std::string fw = extractAttrFromTag(tag, "width");
+        std::string fh = extractAttrFromTag(tag, "height");
+        if (fw.find('%') == std::string::npos && fh.find('%') == std::string::npos) {
+            box.x = ParseSvgCssLength(extractAttrFromTag(tag, "x"), baseFontSize, 0.0f);
+            box.y = ParseSvgCssLength(extractAttrFromTag(tag, "y"), baseFontSize, 0.0f);
+            box.w = ParseSvgCssLength(fw, baseFontSize, 0.0f);
+            box.h = ParseSvgCssLength(fh, baseFontSize, 0.0f);
+            box.valid = box.w > 0.0f && box.h >= 0.0f;
+        }
+
+        size_t p = contentStart;
+        while (p < contentEnd) {
+            size_t lt2 = svg.find('<', p);
+            if (lt2 == std::string::npos || lt2 >= contentEnd) break;
+            size_t te2 = svg.find('>', lt2);
+            if (te2 == std::string::npos || te2 >= contentEnd) break;
+            std::string childTag = svg.substr(lt2, te2 - lt2 + 1);
+            p = te2 + 1;
+            if (lt2 + 1 < svg.size() && svg[lt2 + 1] == '/') continue;
+            std::string name = drawIoTagName(childTag);
+            if (name != "div" && name != "span") continue;
+            std::string style = extractAttrFromTag(childTag, "style");
+            if (style.empty()) continue;
+
+            std::string align = CssProp(style, "text-align");
+            if (!align.empty()) {
+                align = LowerAscii(align);
+                if (align.find("right") != std::string::npos) box.anchor = 2;
+                else if (align.find("center") != std::string::npos) box.anchor = 1;
+                else if (align.find("left") != std::string::npos) box.anchor = 0;
+            }
+            std::string justify = CssProp(style, "justify-content");
+            if (!justify.empty()) {
+                justify = LowerAscii(justify);
+                if (justify.find("flex-end") != std::string::npos ||
+                    justify.find("end") != std::string::npos) {
+                    box.anchor = 2;
+                } else if (justify.find("center") != std::string::npos) {
+                    box.anchor = 1;
+                } else if (justify.find("flex-start") != std::string::npos ||
+                           justify.find("start") != std::string::npos) {
+                    box.anchor = 0;
+                }
+            }
+
+            std::string w = CssProp(style, "width");
+            std::string h = CssProp(style, "height");
+            std::string ml = CssProp(style, "margin-left");
+            std::string mt = CssProp(style, "margin-top");
+            std::string pt = CssProp(style, "padding-top");
+            if (!w.empty() && (!ml.empty() || !pt.empty() || !mt.empty())) {
+                box.x = ParseSvgCssLength(ml, baseFontSize, box.x);
+                box.y = ParseSvgCssLength(!pt.empty() ? pt : mt, baseFontSize, box.y);
+                box.w = ParseSvgCssLength(w, baseFontSize, box.w);
+                box.h = ParseSvgCssLength(h, baseFontSize, box.h);
+                box.valid = box.w > 0.0f && box.h >= 0.0f;
+                return box.valid;
+            }
+        }
+        return box.valid;
+    };
+    auto drawIoMeasureRun = [&](const DrawIoTextRun& run,
+                                float* outWidth,
+                                float* outHeight,
+                                float* outBaseline) -> bool {
+        if (outWidth) *outWidth = 0.0f;
+        if (outHeight) *outHeight = 0.0f;
+        if (outBaseline) *outBaseline = 0.0f;
+        if (run.text.empty()) return false;
+        const std::wstring* embeddedPrimary = FirstEmbeddedAlias(embeddedFonts.get(), run.style.families);
+        const wchar_t* fam = embeddedPrimary ? embeddedPrimary->c_str()
+                            : (!run.style.families.empty() ? run.style.families.front().c_str()
+                                                           : DefaultFontFamily());
+        if (!fam || !fam[0]) fam = L"Segoe UI";
+        IDWriteFontCollection* collection = embeddedPrimary ? embeddedFonts->collection.Get() : nullptr;
+        ComPtr<IDWriteTextFormat> fmt;
+        if (FAILED(dwFactory_->CreateTextFormat(fam, collection, run.style.weight,
+                run.style.fstyle, DWRITE_FONT_STRETCH_NORMAL, run.style.fontSize,
+                ResolveLocaleName(), fmt.GetAddressOf())) || !fmt)
+            return false;
+        ComPtr<IDWriteFontFallback> embeddedFallback =
+            embeddedFonts ? embeddedFonts->MakeFallback(dwFactory_, run.style.families,
+                                                        fontFallback_.Get(), ResolveLocaleName(),
+                                                        embeddedPrimary ? embeddedPrimary->c_str() : nullptr)
+                          : nullptr;
+        if (embeddedFallback || fontFallback_) {
+            ComPtr<IDWriteTextFormat3> f3;
+            if (SUCCEEDED(fmt.As(&f3)) && f3)
+                f3->SetFontFallback(embeddedFallback ? embeddedFallback.Get() : fontFallback_.Get());
+        }
+        ComPtr<IDWriteTextLayout> layout;
+        if (FAILED(dwFactory_->CreateTextLayout(run.text.c_str(), (UINT32)run.text.size(),
+                fmt.Get(), 100000.0f, 100000.0f, layout.GetAddressOf())) || !layout)
+            return false;
+        layout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        DWRITE_TEXT_METRICS tm{};
+        layout->GetMetrics(&tm);
+        DWRITE_LINE_METRICS lm{};
+        UINT32 lineCount = 0;
+        layout->GetLineMetrics(&lm, 1, &lineCount);
+        float width = std::max(tm.width, tm.widthIncludingTrailingWhitespace);
+        float height = tm.height > 0.0f ? tm.height : run.style.fontSize * 1.2f;
+        float baseline = lineCount >= 1 && lm.baseline > 0.0f
+            ? lm.baseline : run.style.fontSize * 0.8f;
+        if (outWidth) *outWidth = width;
+        if (outHeight) *outHeight = height;
+        if (outBaseline) *outBaseline = baseline;
+        return width > 0.0f || height > 0.0f;
+    };
+    auto tryRenderDrawIoForeignObject = [&](const std::string& tag,
+                                            size_t elemStart,
+                                            size_t elemEnd,
+                                            size_t contentStart,
+                                            size_t contentEnd,
+                                            float baseFontSize,
+                                            const std::vector<std::wstring>& baseFamilies,
+                                            DWRITE_FONT_WEIGHT baseWeight,
+                                            DWRITE_FONT_STYLE baseStyle,
+                                            const std::string& baseFill,
+                                            const std::string& opacityStr,
+                                            const std::string& fillOpacityStr,
+                                            const std::string& xfStr,
+                                            Repl& out) -> bool {
+        if (contentStart >= contentEnd || svg.find("http://www.w3.org/1999/xhtml", contentStart) >= contentEnd)
+            return false;
+        DrawIoLabelBox box;
+        if (!drawIoParseBox(tag, contentStart, contentEnd, baseFontSize, box) || !box.valid)
+            return false;
+
+        DrawIoHtmlStyle base;
+        base.fontSize = baseFontSize > 0.0f ? baseFontSize : 16.0f;
+        base.families = baseFamilies;
+        base.weight = baseWeight;
+        base.fstyle = baseStyle;
+        base.fill = baseFill.empty() ? "#000000" : baseFill;
+        base.lineHeight = base.fontSize * 1.2f;
+
+        std::vector<DrawIoLine> lines(1);
+        std::vector<DrawIoHtmlStyle> htmlStack;
+        htmlStack.push_back(base);
+
+        auto trimLineEnd = [&]() {
+            if (lines.empty() || lines.back().runs.empty()) return;
+            auto& t = lines.back().runs.back().text;
+            while (!t.empty() && t.back() == L' ') t.pop_back();
+            if (t.empty()) lines.back().runs.pop_back();
+        };
+        auto lineBreak = [&]() {
+            trimLineEnd();
+            if (!lines.back().runs.empty()) lines.push_back(DrawIoLine{});
+        };
+        auto appendText = [&](const std::string& raw) {
+            std::string decoded;
+            AppendDecoded(decoded, raw);
+            if (decoded.empty()) return;
+            std::string norm;
+            bool haveText = !lines.back().runs.empty() && !lines.back().runs.back().text.empty();
+            bool lastSpace = haveText && lines.back().runs.back().text.back() == L' ';
+            for (unsigned char c : decoded) {
+                if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                    if ((haveText || !norm.empty()) && !lastSpace) {
+                        norm.push_back(' ');
+                        lastSpace = true;
+                    }
+                } else {
+                    norm.push_back((char)c);
+                    haveText = true;
+                    lastSpace = false;
+                }
+            }
+            if (norm.empty()) return;
+            std::wstring text = Utf8ToWide(norm);
+            if (text.empty()) return;
+            const DrawIoHtmlStyle& st = htmlStack.back();
+            if (!lines.back().runs.empty() &&
+                drawIoSameStyle(lines.back().runs.back().style, st)) {
+                lines.back().runs.back().text += text;
+            } else {
+                DrawIoTextRun run;
+                run.text = std::move(text);
+                run.style = st;
+                lines.back().runs.push_back(std::move(run));
+            }
+        };
+
+        size_t p = contentStart;
+        while (p < contentEnd) {
+            size_t lt2 = svg.find('<', p);
+            if (lt2 == std::string::npos || lt2 >= contentEnd) {
+                appendText(svg.substr(p, contentEnd - p));
+                break;
+            }
+            if (lt2 > p) appendText(svg.substr(p, lt2 - p));
+            size_t te2 = svg.find('>', lt2);
+            if (te2 == std::string::npos || te2 >= contentEnd) break;
+            std::string childTag = svg.substr(lt2, te2 - lt2 + 1);
+            bool closing = lt2 + 1 < svg.size() && svg[lt2 + 1] == '/';
+            std::string name = drawIoTagName(childTag);
+            if (closing) {
+                if (htmlStack.size() > 1) htmlStack.pop_back();
+            } else if (name == "br") {
+                lineBreak();
+            } else if (!name.empty() && !drawIoVoidTag(name)) {
+                DrawIoHtmlStyle st = htmlStack.back();
+                drawIoApplyStyle(st, name, childTag);
+                if (!drawIoSelfClosing(childTag)) htmlStack.push_back(std::move(st));
+            }
+            p = te2 + 1;
+        }
+        trimLineEnd();
+        while (!lines.empty() && lines.back().runs.empty()) lines.pop_back();
+        if (lines.empty()) return false;
+
+        float totalHeight = 0.0f;
+        for (auto& line : lines) {
+            float topRel = std::numeric_limits<float>::max();
+            float bottomRel = -std::numeric_limits<float>::max();
+            float cssLineHeight = 0.0f;
+            for (auto& run : line.runs) {
+                if (!drawIoMeasureRun(run, &run.width, &run.height, &run.baseline))
+                    continue;
+                line.width += run.width;
+                line.maxFontSize = std::max(line.maxFontSize, run.style.fontSize);
+                cssLineHeight = std::max(cssLineHeight, run.style.lineHeight);
+            }
+            if (line.maxFontSize <= 0.0f) line.maxFontSize = base.fontSize;
+            for (const auto& run : line.runs) {
+                float shift = drawIoBaselineShift(run, line.maxFontSize);
+                topRel = std::min(topRel, -run.baseline + shift);
+                bottomRel = std::max(bottomRel, run.height - run.baseline + shift);
+            }
+            if (topRel == std::numeric_limits<float>::max()) {
+                topRel = -line.maxFontSize * 0.8f;
+                bottomRel = line.maxFontSize * 0.2f;
+            }
+            line.height = std::max(bottomRel - topRel, cssLineHeight);
+            line.baselineFromTop = -topRel + std::max(0.0f, line.height - (bottomRel - topRel)) * 0.5f;
+            totalHeight += line.height;
+        }
+
+        float anchorX = box.x;
+        if (box.anchor == 1) anchorX = box.x + box.w * 0.5f;
+        else if (box.anchor == 2) anchorX = box.x + box.w;
+        float top = box.y + box.h * 0.5f - totalHeight * 0.5f;
+
+        std::string paths;
+        SvgFoBackground bg = foreignObjectBackground(contentStart, contentEnd);
+        paths += buildRect(box.x, box.y, box.w, box.h, bg, xfStr);
+        for (const auto& line : lines) {
+            float x = anchorX;
+            if (box.anchor == 1) x -= line.width * 0.5f;
+            else if (box.anchor == 2) x -= line.width;
+            float pen = 0.0f;
+            for (const auto& run : line.runs) {
+                if (run.text.empty() || run.width <= 0.0f) continue;
+                float baseline = top + line.baselineFromTop +
+                                 drawIoBaselineShift(run, line.maxFontSize);
+                float adv = 0.0f;
+                std::string d = renderRun(run.text, run.style.fontSize, run.style.families,
+                                          run.style.weight, run.style.fstyle,
+                                          x + pen, baseline, 0, false, 0.0f, &adv);
+                if (!d.empty())
+                    paths += buildPath(d, run.style.fill, opacityStr, fillOpacityStr, xfStr);
+                pen += run.width > 0.0f ? run.width : adv;
+            }
+            top += line.height;
+        }
+        if (paths.empty()) return false;
+
+        out.start = elemStart;
+        out.end = elemEnd;
+        size_t swOpen = svg.rfind("<switch", elemStart);
+        if (swOpen != std::string::npos) {
+            size_t prevClose = svg.rfind("</switch>", elemStart);
+            if (prevClose == std::string::npos || prevClose < swOpen) {
+                size_t swClose = svg.find("</switch>", elemEnd);
+                if (swClose != std::string::npos) {
+                    out.start = swOpen;
+                    out.end = swClose + 9;
+                }
+            }
+        }
+        out.text = std::move(paths);
+        return true;
+    };
 
     std::vector<GFont> stack;
     GFont cur;
-    struct Repl { size_t start, end; std::string text; };
     std::vector<Repl> repls;
 
     size_t pos = 0;
@@ -2524,33 +4845,59 @@ std::string Renderer::SvgInlineTextAsPaths(const std::string& svg) {
         size_t close = selfClose ? te : svg.find(closeTag, te);
         size_t contentEnd = (close == std::string::npos) ? svg.size() : close;
         size_t elemEnd    = (close == std::string::npos) ? svg.size() : close + closeLen;
-        pos = elemEnd;
 
         // ---- text 级属性 (tspan 缺省时继承) ----
         GFont ts = cur;
         std::string style = extractAttrFromTag(tag, "style");
         applyFont(ts, tag, style);
         float tFontSize = ts.fontSize > 0 ? ts.fontSize : 16.0f;
-        const wchar_t* tFam = (ts.familySet && !ts.family.empty()) ? ts.family.c_str() : nullptr;
+        const std::vector<std::wstring>& tFam =
+            (ts.familySet && !ts.families.empty()) ? ts.families : cur.families;
         DWRITE_FONT_WEIGHT tWeight = ts.weightSet ? ts.weight : DWRITE_FONT_WEIGHT_NORMAL;
         DWRITE_FONT_STYLE  tStyle  = ts.styleSet  ? ts.fstyle : DWRITE_FONT_STYLE_NORMAL;
         std::string tFill = (ts.fillSet && !ts.fill.empty()) ? ts.fill : std::string("#000000");
+        if (isFO) {
+            std::string htmlColor = foreignObjectTextColor(te + 1, contentEnd);
+            if (!htmlColor.empty()) tFill = std::move(htmlColor);
+        }
 
-        float tx = (float)atof(extractAttrFromTag(tag, "x").c_str());
-        float ty = (float)atof(extractAttrFromTag(tag, "y").c_str());
+        float tx = ParseSvgCssLength(extractAttrFromTag(tag, "x"), tFontSize, 0.0f);
+        float ty = ParseSvgCssLength(extractAttrFromTag(tag, "y"), tFontSize, 0.0f);
+        float foX = tx, foY = ty, foW = 0.0f, foH = 0.0f;
+        SvgFoBackground foBg = isFO ? foreignObjectBackground(te + 1, contentEnd)
+                                    : SvgFoBackground();
         std::string xfStr          = extractAttrFromTag(tag, "transform");
         std::string opacityStr     = extractAttrFromTag(tag, "opacity");
         std::string fillOpacityStr = extractAttrFromTag(tag, "fill-opacity");
+
+        if (isFO) {
+            Repl drawIoRepl{};
+            if (tryRenderDrawIoForeignObject(tag, lt, elemEnd, te + 1, contentEnd,
+                                             tFontSize, tFam, tWeight, tStyle, tFill,
+                                             opacityStr, fillOpacityStr, xfStr,
+                                             drawIoRepl)) {
+                pos = drawIoRepl.end;
+                repls.push_back(std::move(drawIoRepl));
+                continue;
+            }
+
+            // Non-text draw.io fallbacks may intentionally rely on an image branch.
+            if (shouldSkipForeignObject(tag, lt, elemEnd)) {
+                pos = elemEnd;
+                continue;
+            }
+        }
+        pos = elemEnd;
 
         int  anchor = 0;
         bool block  = false;
         float maxW  = 0.0f;
         if (isFO) {
             block = true; anchor = 1;
-            float w = (float)atof(extractAttrFromTag(tag, "width").c_str());
-            float h = (float)atof(extractAttrFromTag(tag, "height").c_str());
-            tx += w / 2.0f; ty += h / 2.0f;
-            if (w > 1.0f) maxW = w;
+            foW = ParseSvgCssLength(extractAttrFromTag(tag, "width"), tFontSize, 0.0f);
+            foH = ParseSvgCssLength(extractAttrFromTag(tag, "height"), tFontSize, 0.0f);
+            tx += foW / 2.0f; ty += foH / 2.0f;
+            if (foW > 1.0f) maxW = foW;
         } else {
             std::string a = extractAttrFromTag(tag, "text-anchor");
             if (a.empty()) a = CssProp(style, "text-anchor");
@@ -2569,7 +4916,10 @@ std::string Renderer::SvgInlineTextAsPaths(const std::string& svg) {
             std::string d = renderRun(text, tFontSize, tFam, tWeight, tStyle,
                                       tx, ty, anchor, block, maxW, nullptr);
             if (d.empty()) continue;
-            repls.push_back({lt, elemEnd, buildPath(d, tFill, opacityStr, fillOpacityStr, xfStr)});
+            std::string replacement;
+            if (isFO) replacement += buildRect(foX, foY, foW, foH, foBg, xfStr);
+            replacement += buildPath(d, tFill, opacityStr, fillOpacityStr, xfStr);
+            repls.push_back({lt, elemEnd, std::move(replacement)});
             continue;
         }
 
@@ -2584,6 +4934,14 @@ std::string Renderer::SvgInlineTextAsPaths(const std::string& svg) {
             byFill.push_back({fill, d});
         };
         float penX = tx, penY = ty;
+        auto xmlSpacePreserve = [&](const std::string& elementTag, bool inherited) {
+            std::string space = extractAttrFromTag(elementTag, "xml:space");
+            if (space.empty()) space = extractAttrFromTag(elementTag, "space");
+            if (space == "preserve") return true;
+            if (space == "default") return false;
+            return inherited;
+        };
+        const bool textPreserveSpace = xmlSpacePreserve(tag, false);
         size_t tp = te + 1;
         while (tp < contentEnd) {
             size_t lt2 = svg.find("<tspan", tp);
@@ -2599,31 +4957,43 @@ std::string Renderer::SvgInlineTextAsPaths(const std::string& svg) {
             std::string tstyle = extractAttrFromTag(ttag, "style");
             applyFont(es, ttag, tstyle);
             float fs = es.fontSize > 0 ? es.fontSize : tFontSize;
-            const wchar_t* fam = (es.familySet && !es.family.empty()) ? es.family.c_str() : tFam;
+            const std::vector<std::wstring>& fam =
+                (es.familySet && !es.families.empty()) ? es.families : tFam;
             DWRITE_FONT_WEIGHT wt = es.weightSet ? es.weight : tWeight;
             DWRITE_FONT_STYLE  st2 = es.styleSet  ? es.fstyle : tStyle;
             std::string fill = (es.fillSet && !es.fill.empty()) ? es.fill : tFill;
 
             std::string sx = extractAttrFromTag(ttag, "x"),  sy = extractAttrFromTag(ttag, "y");
             std::string sdx = extractAttrFromTag(ttag, "dx"), sdy = extractAttrFromTag(ttag, "dy");
-            if (!sx.empty())  penX = (float)atof(sx.c_str());
-            if (!sy.empty())  penY = (float)atof(sy.c_str());
-            if (!sdx.empty()) penX += (float)atof(sdx.c_str());
-            if (!sdy.empty()) penY += (float)atof(sdy.c_str());
+            int runAnchor = (!sx.empty() || !sy.empty()) ? anchor : 0;
+            std::string ta = extractAttrFromTag(ttag, "text-anchor");
+            if (ta.empty()) ta = CssProp(tstyle, "text-anchor");
+            if (ta == "middle") runAnchor = 1;
+            else if (ta == "end") runAnchor = 2;
+            else if (ta == "start") runAnchor = 0;
+            if (!sx.empty())  penX = ParseSvgCssLength(sx, fs, penX);
+            if (!sy.empty())  penY = ParseSvgCssLength(sy, fs, penY);
+            if (!sdx.empty()) penX += ParseSvgCssLength(sdx, fs, 0.0f);
+            if (!sdy.empty()) penY += ParseSvgCssLength(sdy, fs, 0.0f);
 
             std::wstring txt;
             if (!tSelf) {
                 std::string raw; AppendDecoded(raw, svg.substr(tgEnd + 1, tCEnd - (tgEnd + 1)));
-                std::string norm; bool sp = false, started = false;   // 折叠空白 + trim
-                for (char c : raw) {
-                    if (c==' '||c=='\t'||c=='\n'||c=='\r') { if (started) sp = true; }
-                    else { if (sp) { norm += ' '; sp = false; } norm += c; started = true; }
+                if (xmlSpacePreserve(ttag, textPreserveSpace)) {
+                    txt = Utf8ToWide(raw);
+                } else {
+                    std::string norm; bool sp = false, started = false;   // collapse whitespace + trim
+                    for (char c : raw) {
+                        if (c==' '||c=='\t'||c=='\n'||c=='\r') { if (started) sp = true; }
+                        else { if (sp) { norm += ' '; sp = false; } norm += c; started = true; }
+                    }
+                    txt = Utf8ToWide(norm);
                 }
-                txt = Utf8ToWide(norm);
             }
             float adv = 0.0f;
             if (!txt.empty()) {
-                std::string d = renderRun(txt, fs, fam, wt, st2, penX, penY, 0, false, 0, &adv);
+                std::string d = renderRun(txt, fs, fam, wt, st2, penX, penY,
+                                          runAnchor, false, 0, &adv);
                 if (!d.empty()) addD(fill, d);
             }
             penX += adv;                                // 无下个显式 x 时接续
@@ -2631,6 +5001,7 @@ std::string Renderer::SvgInlineTextAsPaths(const std::string& svg) {
         }
         if (byFill.empty()) continue;
         std::string allPaths;
+        if (isFO) allPaths += buildRect(foX, foY, foW, foH, foBg, xfStr);
         for (auto& kv : byFill)
             allPaths += buildPath(kv.second, kv.first, opacityStr, fillOpacityStr, xfStr);
         repls.push_back({lt, elemEnd, std::move(allPaths)});
@@ -2698,6 +5069,12 @@ static ComPtr<ID2D1Brush> MakeSvgTextGradientBrush(
 
 void Renderer::DrawSvgTextRuns(const std::vector<SvgTextRun>& runs,
                                 const D2D1_MATRIX_3X2_F& baseXf) {
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        SvgTextRunListRef ref;
+        ref.runs = runs;
+        ref.base_transform = baseXf;
+        recorder->DrawSvgTextRuns(std::move(ref));
+    }
     if (runs.empty() || !ctx_ || !dwFactory_) return;
 
     D2D1_MATRIX_3X2_F saved;

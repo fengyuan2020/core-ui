@@ -15,11 +15,18 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 #include "renderer.h"
+#include "measure_context.h"
 #include "widget.h"
 #include "event.h"
 #include "context_menu.h"
+#include "animation.h"
+#include "animation_host.h"
+#include "display_list.h"
+#include "frame_scheduler.h"
+#include "render_window.h"
 
 namespace ui {
 
@@ -35,7 +42,7 @@ public:
                 bool toolWindow = false,
                 HWND ownerHwnd = nullptr);  /* Build 65+ (L14) */
     void Show();
-    void ShowImmediate();  /* 跳过开场动画 */
+    void ShowImmediate(bool activate = true);  /* 跳过开场动画 */
     /* PrepareRT 已完成 frame 确立 (premax 的 SW_SHOWMAXIMIZED 或普通分支的
      * SWP_FRAMECHANGED) — ShowImmediate 跳过重复的 SetWindowPos(FRAMECHANGED)
      * (~10ms DWM 事务)。未走 prepare 的独立调用方仍执行, 行为不变。 */
@@ -44,6 +51,9 @@ public:
     void PrepareRT();      /* 预创建渲染目标 */
     void Hide();
     void Invalidate();
+    void InvalidateNow();
+    void BeginCanvasVisualTransaction();
+    void EndCanvasVisualTransaction();
     void SetRoot(WidgetPtr root);
     void SetTitle(const std::wstring& title);
     HWND Handle() const { return hwnd_; }
@@ -51,14 +61,25 @@ public:
 
     // Window ID in the context registry
     uint64_t windowId = 0;
+    void RegisterRenderWindow(uint64_t id);
 
     // Callbacks
     std::function<void()> onClose;
+    std::function<bool()> onCloseRequest;
     std::function<void(int, int)> onResize;
+    std::function<void(int, int)> onPageResize;
     std::function<void(const std::wstring&)> onDrop;
     std::function<void(int)> onKey;
     std::function<void(float, float)> onRightClick;
     std::function<void(const MenuClickInfo*)> onMenuItemClick;  // 点击项 id+属性载荷
+    /* L219: 标题栏背景被"拖动"(按下后超过系统拖动阈值)时触发。仅当
+     * titlebarDragIntercept_=true(宿主开启, 如全屏态)时拦截 —— 此时不进系统移动
+     * 循环, lib 自己跟踪位移, 超阈值才 fire(纯点击不 fire)。宿主用它在全屏拖标题栏
+     * 时退出全屏。intercept=false 时标题栏拖动走正常系统移动(拖窗)。 */
+    std::function<void()> onTitleBarDrag;
+    bool titlebarDragIntercept_ = false;
+    bool tbDragTracking_ = false;
+    POINT tbDragStartScreen_{};
 
     // Focus management
     Widget* focusedWidget_ = nullptr;
@@ -82,10 +103,7 @@ public:
     // icon: 0=none, 1=success(green✓), 2=error(red✕), 3=warning(yellow⚠)
     // anim: 0=slide(默认, 旧行为), 1=fade(纯渐入渐出, y 不变)
     void ShowToast(const std::wstring& text, int durationMs = 2000, int position = 0, int icon = 0, int anim = 0);
-    /* Build 165+ (L172 follow-up): toast 改成独立 DirectComposition 透明叠加窗
-     * (照 ContextMenu 弹窗). 淡入淡出只重渲这个小窗, 不碰主窗 D2D RT → 大图下
-     * 丝滑. PaintToast 把绘制逻辑画到 toast 窗 (0,0) 原点; ToastWndProc 在 toast
-     * 窗自己的 WM_TIMER 上推进 phase. 旧的主窗 DrawToast / 主窗 WM_TIMER 路径已删. */
+    // Toast 由 OverlayService 的独立窗口线程承载, 主窗只发请求/销毁归属弹层.
 
     static bool RegisterWindowClass();
 
@@ -101,14 +119,43 @@ public:
     // Public so Context::UpdateAnimTimers can fire it after a binding
     // application flips a widget into animating_=true outside an event handler.
     void UpdateToggleAnimTimer();
+    void RegisterAnimatingWidget(Widget* w,
+                                 AnimationInvalidation invalidation = AnimationInvalidation::Paint);
+    void AnimateProperty(Widget* target, AnimProperty prop, float from, float to,
+                         float durationMs = 300.0f,
+                         EasingFunction easing = EasingFunction::EaseOutCubic,
+                         std::function<void()> onComplete = nullptr);
 
 private:
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
     LRESULT HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam);
 
-    void OnPaint();
+    void ActivateForMouseInput();
+    DisplayList OnPaint(uint64_t frameGeneration = 0);
+    bool HasPendingPaint() const;
+    void RequestRenderFrame(FrameReason reason, PresentPolicy policy = PresentPolicy::Deferred);
+    void FlushRenderFrameNow(FrameReason reason, PresentPolicy policy);
+    void SubmitFrameJob(const FrameRequest& frame, DisplayList displayList);
+    void ActivateRenderThreadPresent();
+    bool WaitForRenderGeneration(const FrameRequest& frame, bool force, bool prepared = false);
+    void SubmitRenderThreadFrameNow(FrameReason reason, PresentPolicy policy);
+    bool FlushVisualTransactionFrame(bool resizeDirty, bool paintDirty, bool final = false,
+                                     bool deferPresent = false);
+    void PrepareDeferredVisualWindowRect(int xScreen, int yScreen, int wDip, int hDip,
+                                         int wPx, int hPx);
+    bool WaitForVisualTransactionDwmBarrier(uint64_t generation);
+    void CommitDeferredVisualWindowRect();
+    bool PresentPreparedVisualWindowFrame(uint64_t generation);
+    void BeginAnimationFrame();
+    void EnsureAnimationTimer();
+    void StopAnimationTimer();
+    bool HasAnimationFrameWork() const;
+    void PaintAndValidate();
     void OnResize(UINT width, UINT height);
     void OnDpiChanged(UINT dpi, const RECT* suggested);
+    void RefreshClientSizeCache();
+    void UpdateClientSizeCache(UINT widthPx, UINT heightPx);
+    D2D1_SIZE_F CachedClientSizeDip() const;
     void OnMouseMove(float x, float y);
     void OnMouseDown(float x, float y);
     void OnMouseUp(float x, float y);
@@ -123,15 +170,20 @@ private:
     LRESULT OnNcCalcSize(WPARAM wParam, LPARAM lParam);
     LRESULT OnNcHitTest(int x, int y);
     void OnGetMinMaxInfo(MINMAXINFO* mmi);
+    bool IsCanvasDragHit(int sx, int sy) const;
+    void UpdateDwmFrameMargins();
+    void NotifyResizeCallback(UINT width, UINT height);
     bool HasFocusedTextInput() const;
     void UpdateCaretBlinkTimer();
     void StartWindowOpenAnimation();
     void StartWindowCloseAnimation();
+    void UnregisterRenderWindow();
 
     HWND        hwnd_ = nullptr;
     HICON       hIcon_ = nullptr;
     bool        borderless_ = false;
     bool        resizable_ = true;
+    bool        canvasMode_ = false;
     bool        toolWindow_ = false;
     bool        maximized_ = false;
     int         configWidth_ = 0, configHeight_ = 0;
@@ -148,49 +200,34 @@ private:
     int         aspectLockW_ = 0, aspectLockH_ = 0;
     UINT        dpi_ = 96;
     float       dpiScale_ = 1.0f;
+    UINT        clientWidthPx_ = 0;
+    UINT        clientHeightPx_ = 0;
+    float       clientWidthDip_ = 0.0f;
+    float       clientHeightDip_ = 0.0f;
     std::wstring title_;
+    uint64_t    hwndGeneration_ = 0;
+    RenderWindowId renderWindowId_{};
+    bool        renderThreadPresentActive_ = false;
+    uint64_t    lastDeviceRecoveryGeneration_ = 0;
 
     Renderer    renderer_;
+    FrameScheduler frameScheduler_;
+    MeasureContext measureContext_;
     WidgetPtr   root_;
     Widget*     hoveredWidget_ = nullptr;
     Widget*     pressedWidget_ = nullptr;
     ContextMenuPtr activeMenu_;
 
-    // Toast
-    std::wstring toastText_;
-    float toastAlpha_ = 0.0f;
-    float toastSlide_ = 0.0f;  // 0=隐藏位置, 1=完全显示
-    int   toastPos_ = 0;       // 0=top, 1=center, 2=bottom
-    int   toastPhase_ = 0;     // 0=idle, 1=slideIn, 2=hold, 3=slideOut
-    int   toastIcon_ = 0;     // 0=none, 1=success, 2=error, 3=warning
-    int   toastAnim_ = 0;     // 0=slide(旧行为), 1=fade(纯透明度过渡, y 不变)
-    UINT_PTR toastTimerId_ = 0;
-    bool  toastFading_ = false;
-    int   holdDurationMs_ = 2000;
-    int   holdElapsed_ = 0;        /* deprecated, kept for ABI 兼容; 新代码用 toastShownTick_ */
-    /* Build 68+ (L18): toast 动画起点, time-based 推进, 防 WM_TIMER 合并 tick 时
-     * 进度卡顿. ShowToast 时记一次 GetTickCount64, tick handler 用 now-shown 算
-     * phase + slide. */
-    uint64_t toastShownTick_ = 0;
-    /* Build 165+ (L172 follow-up): toast 独立叠加窗. */
-    HWND     toastHwnd_ = nullptr;        // 透明 DComp 叠加窗 (owner = hwnd_)
-    Renderer toastRenderer_;              // 该窗专属 composition-mode RT
-    bool     toastTimePeriodSet_ = false; // timeBeginPeriod(1) 已生效? (配对 timeEndPeriod)
-    /* 这次 toast 的几何 (DIP) + 屏幕落位 (物理像素), ShowToast 算一次缓存,
-     * PaintToast / ToastWndProc 复用 (避免 settle 期反复重算). */
-    float    toastBoxW_ = 0.0f, toastBoxH_ = 0.0f;   // 框尺寸 (DIP)
-    int      toastScreenX_ = 0;                       // 窗口左上 X (物理像素, 全程不变)
-    int      toastScreenTargetY_ = 0;                 // 目标 Y (物理像素, FADE 钉死, SLIDE 终点)
-    int      toastSlideRangePx_ = 0;                  // SLIDE: hideOffset 像素幅度 (带符号)
-    void     PaintToast();                            // 画到 toast 窗 (0,0) 原点
-    void     DestroyToast();                          // 销毁叠加窗 + KillTimer + timeEndPeriod 配对
-    static bool s_toastClassRegistered_;
-    static LRESULT CALLBACK ToastWndProc(HWND, UINT, WPARAM, LPARAM);
+    void     DestroyToast();
 
     bool        startupRevealPending_ = false;
     bool        startupRevealPosted_ = false;
     bool        caretBlinkTimerRunning_ = false;
     bool        toggleAnimTimerRunning_ = false;
+    bool        renderFramePosted_ = false;
+    AnimationHost animationHost_;
+    AnimationManager propertyAnimations_;
+    uint64_t    lastAnimationFrameTick_ = 0;
 
     // Tooltip
     Widget*     tooltipWidget_ = nullptr;
@@ -206,6 +243,25 @@ private:
     bool        windowClosing_ = false;
     bool        isMoving_ = false;   // 窗口正在移动/调整大小
     bool        isResizing_ = false; // 本次 sizemove 是 resize（非纯移动）
+    int         visualUpdateDepth_ = 0;
+    bool        visualPaintDirty_ = false;
+    bool        visualResizeDirty_ = false;
+    bool        deferNextFramePresent_ = false;
+    uint64_t    deferredPresentGeneration_ = 0;
+    bool        deferredPresentPrepared_ = false;
+    bool        deferredVisualWindowRectPending_ = false;
+    int         deferredVisualWindowXScreen_ = 0;
+    int         deferredVisualWindowYScreen_ = 0;
+    int         deferredVisualWindowWDip_ = 0;
+    int         deferredVisualWindowHDip_ = 0;
+    int         deferredVisualWindowWPx_ = 0;
+    int         deferredVisualWindowHPx_ = 0;
+    bool        preparedVisualResizeNotified_ = false;
+    UINT        preparedVisualResizeWPx_ = 0;
+    UINT        preparedVisualResizeHPx_ = 0;
+    bool        canvasDragTracking_ = false;
+    POINT       canvasDragStartScreen_{};
+    RECT        canvasDragStartRect_{};
 
     float       windowAnimProgress_ = 0.0f;
     LARGE_INTEGER windowAnimStartTick_ = {};   // 动画起始时间（高精度）
@@ -277,6 +333,7 @@ public:
      * 内部用 SetWindowLongPtr 改 GWL_STYLE 再 SetWindowPos(SWP_FRAMECHANGED) 刷新。 */
     void SetFrameless(bool frameless);
     bool IsFrameless() const { return borderless_; }
+    void SetResizable(bool resizable);
 
     /* Active context menu popup (nullptr if none open) */
     ContextMenuPtr ActiveMenu() const { return activeMenu_; }

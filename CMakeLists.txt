@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
-set(UI_CORE_VERSION "1.6.5")
-set(UI_CORE_INTERNAL_VERSION "175")
+set(UI_CORE_VERSION "1.7.0")
+set(UI_CORE_INTERNAL_VERSION "253")
 project(core-ui-project VERSION ${UI_CORE_VERSION} LANGUAGES C CXX)
 
 set(UI_CORE_VERSION_TAG "v${PROJECT_VERSION}")
@@ -51,10 +51,13 @@ set(QJS_BUILD_CLI_STATIC OFF CACHE BOOL "" FORCE)
 set(QJS_ENABLE_INSTALL   OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(quickjs)
 
-# ---- LunaSVG (+ plutovg) — 统一 SVG 引擎 (L173 / core-ui Phase 4) ----
+# ---- LunaSVG (+ plutovg) — SVG CPU raster backend (L173 / core-ui Phase 4) ----
 # vendored 源码 (含 gh-svg 自研 feDropShadow 滤镜层 + 提速), 静态编译折进 core-ui。
-# 与 gh-img-decode 用同一份引擎 → 看图器 SVG 渲染跟缩略图行为一致 (统一)。
-# 取代原 D2D ID2D1SvgDocument 路径: 支持 filter/text/mask 等 D2D 子集外能力。
+# core-ui 当前是 D2D + LunaSVG 混合路径:
+#   - 主交互视图优先用 D2D ID2D1SvgDocument, 保持纯矢量缩放清晰。
+#   - LunaSVG 负责 SVG 缩略图 BGRA、内嵌位图/复杂 SVG 的主视图栅格化,
+#     以及放大/平移时按可见源矩形做视口重栅。
+# 与 gh-img-decode 的 vendored LunaSVG 补丁保持同步, 避免主视图与缩略图行为分叉。
 set(LUNASVG_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(PLUTOVG_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 # lunasvg/plutovg 静态折进 core-ui.dll, 不单独安装到 release/。用 EXCLUDE_FROM_ALL
@@ -87,13 +90,23 @@ set(UI_CORE_SOURCES
     src/ui/handle_table.cpp
     src/ui/asset.cpp
     src/ui/context_menu.cpp
+    src/ui/overlay_service.cpp
+    src/ui/easing.cpp
     src/ui/msgbox.cpp
+    src/ui/display_list.cpp
+    src/ui/frame_scheduler.cpp
+    src/ui/render_resources.cpp
+    src/ui/render_thread.cpp
+    src/ui/render_window.cpp
+    src/ui/resource_store.cpp
+    src/ui/trace.cpp
     src/ui/ui_window.cpp
     src/ui/ui_context.cpp
     src/ui/ui_api.cpp
     src/ui/ui_debug.cpp
     src/ui/ui_debug_server.cpp
     src/ui/animation.cpp
+    src/ui/animation_host.cpp
     src/ui/markup/markup_parser.cpp
     src/ui/markup/markup_builder.cpp
     src/ui/markup/markup.cpp
@@ -217,6 +230,77 @@ target_compile_definitions(core-ui PUBLIC ${UI_CORE_VERSION_DEFS})
 # ui_core_version_string() 永远报错版本。
 if(TARGET core-ui-static)
     target_compile_definitions(core-ui-static PUBLIC ${UI_CORE_VERSION_DEFS})
+endif()
+
+add_executable(svg_normalize_test EXCLUDE_FROM_ALL
+    test/src/svg_normalize_test.cpp
+    src/ui/svg_style_inliner.cpp
+    src/ui/css/css_parser.cpp
+    src/ui/css/selector.cpp
+)
+target_compile_definitions(svg_normalize_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(svg_normalize_test PRIVATE src)
+
+add_executable(frame_scheduler_test EXCLUDE_FROM_ALL
+    test/src/frame_scheduler_test.cpp
+    src/ui/frame_scheduler.cpp
+)
+target_compile_definitions(frame_scheduler_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(frame_scheduler_test PRIVATE src)
+
+add_executable(image_cpu_backing_test EXCLUDE_FROM_ALL
+    test/src/image_cpu_backing_test.cpp
+)
+target_compile_definitions(image_cpu_backing_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(image_cpu_backing_test PRIVATE src)
+if(TARGET core-ui-static)
+    target_link_libraries(image_cpu_backing_test PRIVATE core-ui-static)
+else()
+    target_link_libraries(image_cpu_backing_test PRIVATE core-ui)
+endif()
+
+add_executable(render_recovery_test EXCLUDE_FROM_ALL
+    test/src/render_recovery_test.cpp
+)
+target_compile_definitions(render_recovery_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(render_recovery_test PRIVATE src)
+if(TARGET core-ui-static)
+    target_link_libraries(render_recovery_test PRIVATE core-ui-static)
+else()
+    target_link_libraries(render_recovery_test PRIVATE core-ui)
+endif()
+
+add_executable(resource_store_budget_test EXCLUDE_FROM_ALL
+    test/src/resource_store_budget_test.cpp
+)
+target_compile_definitions(resource_store_budget_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(resource_store_budget_test PRIVATE src)
+if(TARGET core-ui-static)
+    target_link_libraries(resource_store_budget_test PRIVATE core-ui-static)
+else()
+    target_link_libraries(resource_store_budget_test PRIVATE core-ui)
+endif()
+
+add_executable(svg_text_path_test EXCLUDE_FROM_ALL
+    test/src/svg_text_path_test.cpp
+)
+target_compile_definitions(svg_text_path_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(svg_text_path_test PRIVATE src)
+if(TARGET core-ui-static)
+    target_link_libraries(svg_text_path_test PRIVATE core-ui-static)
+else()
+    target_link_libraries(svg_text_path_test PRIVATE core-ui)
+endif()
+
+add_executable(svg_drop_shadow_layer_test EXCLUDE_FROM_ALL
+    test/src/svg_drop_shadow_layer_test.cpp
+)
+target_compile_definitions(svg_drop_shadow_layer_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(svg_drop_shadow_layer_test PRIVATE src)
+if(TARGET core-ui-static)
+    target_link_libraries(svg_drop_shadow_layer_test PRIVATE core-ui-static)
+else()
+    target_link_libraries(svg_drop_shadow_layer_test PRIVATE core-ui)
 endif()
 
 if(WIN32)

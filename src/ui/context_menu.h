@@ -1,5 +1,7 @@
 #pragma once
 #include <windows.h>
+#include "overlay_service.h"
+#include "render_handles.h"
 #include "renderer.h"
 #include "theme.h"
 #include "widget.h"
@@ -44,7 +46,8 @@ struct MenuClickInfo {
     }
 };
 
-class ContextMenu : public std::enable_shared_from_this<ContextMenu> {
+class ContextMenu : public std::enable_shared_from_this<ContextMenu>,
+                    public OverlayWindowHandler {
 public:
     // Debug 模拟模式：为 true 时菜单 popup 的 WM_TIMER 不会因为前台窗口切换而自动关闭，
     // 便于自动化脚本（PowerShell / Python 等持有前台）操作已打开的菜单。
@@ -65,6 +68,8 @@ public:
     void AddSubmenu(WidgetPtr entryContent, ContextMenuPtr submenu);
     void SetEnabled(int id, bool enabled);
     void SetBgColor(D2D1_COLOR_F color) { bgColor_ = color; hasBgColor_ = true; }
+    void SetFrostedMaterial(bool enabled) { frostedMaterial_ = enabled; ReleaseBackdropResource(); }
+    void SetBackdropBlur(float radius) { backdropBlurRadius_ = radius; ReleaseBackdropResource(); }
     /* Build 69+ (L19): 设单个菜单的圆角半径. <0 表示恢复 kCornerRadius 默认.
      * 影响 shadow + card bg 的 FillRoundedRect, hover item highlight (6px)
      * 不动 (那是 item 级视觉不属于容器圆角). */
@@ -96,18 +101,18 @@ public:
      * 扫所有 CompiledMenuItems 的 shortcut (含 v-if=false 隐藏的) 算 max,
      * 喂这个字段后 MenuWidth 把它当 shortcut 列宽 floor, 隐藏 item 也预留
      * shortcut 空间. 结果: 无图 / 有图 menu width 一致. <=0 = 不预留. */
-    void SetReservedShortcutWidth(float w) { reservedShortcutWidth_ = w; }
+    void SetReservedShortcutWidth(float w) { reservedShortcutWidth_ = w; InvalidateLayout(); }
     /* Build 80+: 同上, submenu arrow col 预留 — 任何 item 有 submenu (含
      * v-if=false 的) 都让 arrow col 永远占位, 两态视觉宽度一致. */
-    void SetReservedHasSubmenu(bool has) { reservedHasSubmenu_ = has; }
+    void SetReservedHasSubmenu(bool has) { reservedHasSubmenu_ = has; InvalidateLayout(); }
     /* Build 81+: 同上 — content (wrapper SizeHint) max 也按"全 items"预留,
      * 两态彻底同款宽度. PageState 扫所有 items 的 wrapper natural width
      * 算 max, 喂这里. */
-    void SetReservedContentWidth(float w) { reservedContentWidth_ = w; }
+    void SetReservedContentWidth(float w) { reservedContentWidth_ = w; InvalidateLayout(); }
     /* Build 85+: 跨菜单树共享同款宽度 — PageState 把整树 (parent + 所有
      * submenu) 计算出的最大 MenuWidth 回写到每个 ContextMenu, submenu 至少
      * 跟主菜单同宽. 用户视觉感受 "菜单系列宽度一致". */
-    void SetMinPropagatedWidth(float w) { minPropagatedWidth_ = w; }
+    void SetMinPropagatedWidth(float w) { minPropagatedWidth_ = w; InvalidateLayout(); }
     /* build 85: expose MenuWidth — PageState 算完 reserved 后查 final 宽,
      * 再 propagate 到 submenu. */
     float MenuWidth() const;
@@ -141,9 +146,8 @@ public:
     HWND ParentHwnd() const { return parentHwnd_; }
     HWND PopupHwnd() const { return popupHwnd_; }
 
-    // Build 27: 把当前 popup 内容(D2D RT 回读)存成 PNG. 跟
-    // UiWindowImpl::Screenshot 同款 readback 路径, 但读的是 popupRenderer_
-    // 而不是窗口 renderer. 0 = 成功, 负数 = 失败 code.
+    // Build 27: 把当前 popup 内容存成 PNG. render-thread present 启用后，
+    // 这里是显式同步 screenshot request，不在 UI 线程读 D2D target。
     int Screenshot(const wchar_t* outPath);
 
     // 模拟"用户点击某一项"，等同 HandleMouseUp 命中 + 回传 WM_APP+100 + Close
@@ -176,6 +180,11 @@ private:
     std::vector<std::pair<std::string,std::string>> clickedAttrs_;       // 点击项全部属性
     D2D1_COLOR_F bgColor_ = {};
     bool hasBgColor_ = false;
+    bool frostedMaterial_ = false;
+    /* Frosted-material blur radius in DIP. -1 = default auto radius, 0 = no
+     * backdrop capture, >0 = explicit caller-controlled radius. The material
+     * itself is controlled by frostedMaterial_. */
+    float backdropBlurRadius_ = -1.0f;
     /* Build 69+ (L19): per-menu 圆角. -1 = 用 kCornerRadius 默认. 公共 API
      * ui_menu_set_corner_radius 写这个字段. */
     float cornerRadius_ = -1.0f;
@@ -192,6 +201,10 @@ private:
     float reservedContentWidth_ = 0.0f;
     /* Build 85+: tree-wide max MenuWidth, submenu 至少跟主菜单同宽. */
     float minPropagatedWidth_ = 0.0f;
+    bool layoutValid_ = false;
+    float layoutWidth_ = 0.0f;
+    float layoutHeight_ = 0.0f;
+    std::vector<D2D1_RECT_F> itemRects_;
 
     // Layout constants — compact menu (13px body, small icons, tight rows).
     static constexpr float kItemHeight = 30.0f;
@@ -209,8 +222,8 @@ private:
      * submenu 往左移, 跟 parent 右边重叠. macOS / Win11 风格 submenu 微
      * 微叠在 parent 上. */
     static constexpr float kSubmenuOverlap = 6.0f;
-    static constexpr float kFontSize     = 13.0f;       // body text size
-    static constexpr float kShortcutFont = 12.0f;
+    static constexpr float kFontSize     = 13.5f;       // body text size
+    static constexpr float kShortcutFont = 13.5f;
     // Soft drop shadow margin around the popup card. The popup HWND is
     // expanded by 2× this on each axis; menu content draws at offset
     // (kShadowMargin, kShadowMargin), leaving room for the blurred shadow
@@ -219,23 +232,43 @@ private:
 
     // (MenuWidth / MenuHeight 移到 public)
     bool HasAnyIcon() const;
+    void InvalidateLayout();
+    void LayoutItems();
     D2D1_RECT_F ItemRect(int index) const;
     int HitTest(float x, float y) const;
 
-    // Popup window (owns its own HWND + Renderer)
+    // Popup window and renderer live on OverlayService's window thread.
     HWND popupHwnd_ = nullptr;
     Renderer popupRenderer_;
     HWND parentHwnd_ = nullptr;
+    bool popupRendererReady_ = false;
+    int popupWidthPx_ = 0;
+    int popupHeightPx_ = 0;
+    ComPtr<ID3D11Device> popupD3DDevice_;
+    ComPtr<ID2D1Device> popupD2DDevice_;
+    ComPtr<ID2D1DeviceContext> popupD2DContext_;
+    ComPtr<IDXGISwapChain1> popupSwapChain_;
+    ComPtr<ID2D1Bitmap1> popupTargetBitmap_;
+    ComPtr<IUnknown> popupDcompDevice_;
+    ComPtr<IUnknown> popupDcompTarget_;
+    ComPtr<IUnknown> popupDcompVisual_;
+    ResourceKey backdropResourceKey_{};
     // 父级菜单（子菜单对象里指向打开它的那个菜单）。ROOT 为 nullptr。
     // 用于子菜单 leaf 被点击后沿链向上 Close，避免 root 菜单残留。
     ContextMenu* parentMenu_ = nullptr;
 
     void CreatePopupWindow(HWND parent, int screenX, int screenY);
     void DestroyPopupWindow();
-    void PaintPopup();
+    void CaptureBackdrop(int screenX, int screenY, int width, int height, float dpiScale);
+    void ReleaseBackdropResource();
+    bool EnsurePopupRenderer(int widthPx, int heightPx);
+    bool BindPopupTarget(int widthPx, int heightPx);
+    void ReleasePopupRenderer();
+    void RenderPopupFrame();
+    int  WritePopupScreenshot(const wchar_t* outPath);
 
-    static bool popupClassRegistered_;
-    static LRESULT CALLBACK PopupWndProc(HWND, UINT, WPARAM, LPARAM);
+    LRESULT HandleOverlayMessage(HWND hwnd, UINT msg, WPARAM wParam,
+                                 LPARAM lParam, bool& handled) override;
 };
 
 } // namespace ui

@@ -579,6 +579,8 @@ ui_menu_add_item(sub, 10, L"Sub Item");
 ui_menu_add_submenu(menu, L"More", sub);
 
 ui_menu_set_enabled(menu, 99, 0);
+ui_menu_set_bg_color(menu, (UiColor){1.0f, 1.0f, 1.0f, 0.52f});  // 半透明 tint
+ui_menu_set_backdrop_blur(menu, 18.0f);                       // 0 关闭, <0 默认
 ui_menu_show(win, menu, x, y);
 ui_menu_close(win);
 ui_menu_destroy(menu);
@@ -675,6 +677,8 @@ export default {
 - 子菜单（嵌套 `<menu text="...">`）
 - per-item 颜色覆盖（`style="color: ..."`）
 - 快捷键提示（`shortcut="Ctrl+S"`，仅显示，实际绑定走 `ui_window_on_key`）
+- 菜单树行样式覆盖（`row-class="..."` 会追加到自动生成的 `.menuitem-row`）
+- 可选关闭父子菜单同宽（`share-width="false"`）
 - 禁用项 / 自动定位 / 鼠标 hover submenu 展开
 
 ### 自动化

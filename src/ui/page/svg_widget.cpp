@@ -9,7 +9,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <sstream>
 
 using Microsoft::WRL::ComPtr;
 
@@ -392,6 +394,86 @@ ComPtr<ID2D1Brush> MakeBrush(ID2D1RenderTarget* rt,
     return outBrush;
 }
 
+D2D1_COLOR_F ResolveCurrentColor(const Widget* start) {
+    for (const Widget* w = start; w; w = w->Parent()) {
+        if (w->css.hasFg) return w->css.fg;
+    }
+    return ::theme::Current().foreground1;
+}
+
+static std::string XmlEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char ch : s) {
+        switch (ch) {
+        case '&': out += "&amp;"; break;
+        case '<': out += "&lt;"; break;
+        case '>': out += "&gt;"; break;
+        case '"': out += "&quot;"; break;
+        case '\'': out += "&apos;"; break;
+        default: out += ch; break;
+        }
+    }
+    return out;
+}
+
+static std::string ColorHex(D2D1_COLOR_F c) {
+    auto toByte = [](float v) {
+        v = std::clamp(v, 0.0f, 1.0f);
+        return static_cast<unsigned>(std::lround(v * 255.0f));
+    };
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "#%02X%02X%02X",
+                  toByte(c.r), toByte(c.g), toByte(c.b));
+    return buf;
+}
+
+static const char* CapName(SvgShape::Cap c) {
+    switch (c) {
+    case SvgShape::Cap::Round: return "round";
+    case SvgShape::Cap::Square: return "square";
+    default: return "butt";
+    }
+}
+
+static const char* JoinName(SvgShape::Join j) {
+    switch (j) {
+    case SvgShape::Join::Round: return "round";
+    case SvgShape::Join::Bevel: return "bevel";
+    default: return "miter";
+    }
+}
+
+static void AppendFloatList(std::ostringstream& os, const std::vector<float>& values) {
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i) os << ' ';
+        os << values[i];
+    }
+}
+
+static void AppendPaintAttrs(std::ostringstream& os,
+                             const char* prefix,
+                             bool hasPaint,
+                             bool isCurrentColor,
+                             D2D1_COLOR_F color,
+                             const std::string& gradientId,
+                             float opacity,
+                             const SvgWidget* owner) {
+    os << ' ' << prefix << "=\"";
+    if (!hasPaint) {
+        os << "none\"";
+        return;
+    }
+    if (!gradientId.empty()) {
+        os << "url(#" << XmlEscape(gradientId) << ")\"";
+    } else {
+        if (isCurrentColor) color = ResolveCurrentColor(owner);
+        os << ColorHex(color) << "\"";
+        opacity *= color.a;
+    }
+    os << ' ' << prefix << "-opacity=\"" << std::clamp(opacity, 0.0f, 1.0f) << "\"";
+}
+
 void DrawShape(Renderer& r, float offX, float offY, float scale, const SvgShape& s,
                const SvgWidget* owner) {
     auto* rt = r.RT();
@@ -406,19 +488,10 @@ void DrawShape(Renderer& r, float offX, float offY, float scale, const SvgShape&
     // system, so walk up parent chain to find the closest widget with `color`
     // explicitly set (css.hasFg=true). Falls back to opaque black like browser
     // initial color.
-    auto inheritFg = [](const Widget* start) -> D2D1_COLOR_F {
-        for (const Widget* w = start; w; w = w->Parent()) {
-            if (w->css.hasFg) return w->css.fg;
-        }
-        // No `color` anywhere in the chain — fall back to the theme's
-        // primary text color so `<svg fill="currentColor">` flips with
-        // Light/Dark instead of staying opaque black on a dark surface.
-        return ::theme::Current().foreground1;
-    };
     D2D1_COLOR_F effFill = s.fill;
     D2D1_COLOR_F effStroke = s.stroke;
-    if (s.fillIsCurrentColor)   effFill   = inheritFg(owner);
-    if (s.strokeIsCurrentColor) effStroke = inheritFg(owner);
+    if (s.fillIsCurrentColor)   effFill   = ResolveCurrentColor(owner);
+    if (s.strokeIsCurrentColor) effStroke = ResolveCurrentColor(owner);
 
     ComPtr<ID2D1Brush> fillBrush, strokeBrush;
     if (s.hasFill)
@@ -613,6 +686,100 @@ void SvgWidget::ReapplyBoundAttrs(size_t shapeIdx, SvgShape& s) const {
     }
 }
 
+std::string SvgWidget::BuildDocumentXml() const {
+    std::ostringstream os;
+    os << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" << vpWidth
+       << "\" height=\"" << vpHeight << "\" viewBox=\"0 0 " << vpWidth
+       << ' ' << vpHeight << "\">";
+
+    if (!gradients_.empty()) {
+        os << "<defs>";
+        for (const auto& kv : gradients_) {
+            const SvgGradient& g = kv.second;
+            if (g.id.empty() || g.stops.empty()) continue;
+            if (g.kind == SvgGradient::Kind::Linear) {
+                os << "<linearGradient id=\"" << XmlEscape(g.id)
+                   << "\" gradientUnits=\"userSpaceOnUse\" x1=\"" << g.x1
+                   << "\" y1=\"" << g.y1 << "\" x2=\"" << g.x2
+                   << "\" y2=\"" << g.y2 << "\">";
+            } else {
+                os << "<radialGradient id=\"" << XmlEscape(g.id)
+                   << "\" gradientUnits=\"userSpaceOnUse\" cx=\"" << g.cx
+                   << "\" cy=\"" << g.cy << "\" r=\"" << g.radius
+                   << "\" fx=\"" << g.fx << "\" fy=\"" << g.fy << "\">";
+            }
+            for (const auto& st : g.stops) {
+                D2D1_COLOR_F c = st.color;
+                os << "<stop offset=\"" << std::clamp(st.offset, 0.0f, 1.0f) * 100.0f
+                   << "%\" stop-color=\"" << ColorHex(c)
+                   << "\" stop-opacity=\"" << std::clamp(c.a * st.opacity, 0.0f, 1.0f)
+                   << "\"/>";
+            }
+            os << (g.kind == SvgGradient::Kind::Linear ? "</linearGradient>" : "</radialGradient>");
+        }
+        os << "</defs>";
+    }
+
+    for (const auto& s : shapes_) {
+        switch (s.kind) {
+        case SvgShapeKind::Circle:
+            os << "<circle cx=\"" << s.cx << "\" cy=\"" << s.cy << "\" r=\"" << s.r << "\"";
+            break;
+        case SvgShapeKind::Ellipse:
+            os << "<ellipse cx=\"" << s.cx << "\" cy=\"" << s.cy
+               << "\" rx=\"" << s.rx << "\" ry=\"" << s.ry << "\"";
+            break;
+        case SvgShapeKind::Rect:
+            os << "<rect x=\"" << s.x << "\" y=\"" << s.y << "\" width=\"" << s.w
+               << "\" height=\"" << s.h << "\"";
+            if (s.rectRx > 0.0f) os << " rx=\"" << s.rectRx << "\"";
+            if (s.rectRy > 0.0f) os << " ry=\"" << s.rectRy << "\"";
+            break;
+        case SvgShapeKind::Line:
+            os << "<line x1=\"" << s.x1 << "\" y1=\"" << s.y1
+               << "\" x2=\"" << s.x2 << "\" y2=\"" << s.y2 << "\"";
+            break;
+        case SvgShapeKind::Polygon:
+        case SvgShapeKind::Polyline: {
+            os << (s.kind == SvgShapeKind::Polygon ? "<polygon points=\"" : "<polyline points=\"");
+            for (size_t i = 0; i < s.points.size(); ++i) {
+                if (i) os << ' ';
+                os << s.points[i].x << ',' << s.points[i].y;
+            }
+            os << "\"";
+            break;
+        }
+        case SvgShapeKind::Path:
+            os << "<path d=\"" << XmlEscape(s.pathData) << "\"";
+            break;
+        }
+
+        const bool recordFill = s.hasFill &&
+            s.kind != SvgShapeKind::Line &&
+            s.kind != SvgShapeKind::Polyline;
+        AppendPaintAttrs(os, "fill", recordFill, s.fillIsCurrentColor, s.fill,
+                         s.fillGradientId, s.fillOpacity, this);
+        AppendPaintAttrs(os, "stroke", s.hasStroke, s.strokeIsCurrentColor, s.stroke,
+                         s.strokeGradientId, s.strokeOpacity, this);
+        os << " stroke-width=\"" << s.strokeWidth << "\"";
+        os << " stroke-linecap=\"" << CapName(s.strokeLineCap) << "\"";
+        os << " stroke-linejoin=\"" << JoinName(s.strokeLineJoin) << "\"";
+        if (!s.strokeDashArray.empty()) {
+            os << " stroke-dasharray=\"";
+            AppendFloatList(os, s.strokeDashArray);
+            os << "\"";
+        }
+        os << " opacity=\"" << std::clamp(s.opacity, 0.0f, 1.0f) << "\"";
+        if (s.hasTransform && std::fabs(s.transformAngle) > 0.001f) {
+            os << " transform=\"rotate(" << s.transformAngle << ' '
+               << s.transformCx << ' ' << s.transformCy << ")\"";
+        }
+        os << "/>";
+    }
+    os << "</svg>";
+    return os.str();
+}
+
 void SvgWidget::OnDraw(Renderer& r) {
     Widget::OnDraw(r);
     if (!visible) return;
@@ -627,6 +794,12 @@ void SvgWidget::OnDraw(Renderer& r) {
     float drawnH = vpHeight * scale;
     float offX = rect.left + (rectW - drawnW) * 0.5f;
     float offY = rect.top  + (rectH - drawnH) * 0.5f;
+
+    D2D1_MATRIX_3X2_F xf =
+        D2D1::Matrix3x2F::Scale(scale, scale) *
+        D2D1::Matrix3x2F::Translation(offX, offY);
+    r.RecordSvgDocument(BuildDocumentXml(), vpWidth, vpHeight, xf);
+    if (!r.RT() && r.IsRecordingDisplayList()) return;
 
     for (const auto& s : shapes_) DrawShape(r, offX, offY, scale, s, this);
 }

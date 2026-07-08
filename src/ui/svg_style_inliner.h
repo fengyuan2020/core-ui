@@ -21,21 +21,23 @@ std::string LoadSvgWithInlinedStyles(const std::wstring& path);
  *     <path class="st0" d="..."/>
  * 这种 SVG 进 D2D 后所有 fill 解析失败, 默认 fill=black, 渲染全黑.
  *
- * 本预处理 pass 把 <style> 块里的 ".classname { props }" 规则展开
- * 到引用该 class 的元素的 inline style="props" 属性里. 改写后的 SVG
- * 文本喂给 D2D 即可正确出色.
+ * 本预处理 pass 把 <style> 块里 D2D 不会可靠应用的 CSS 规则展开到
+ * 匹配元素的 inline style="props" 属性里. 改写后的 SVG 文本喂给 D2D
+ * 即可正确出色.
  *
  * 行为约定:
  *   - 输入不含 "<style" 子串 → 零开销原样返回 (覆盖所有 inline-fill 图标 SVG).
- *   - 只支持 ".classname" 类选择器, 不支持 #id / tag / 复杂选择器
- *     (.a.b / .a > .b / 属性选择器), 不支持 @media / @import / hover / !important.
- *     这些遇到整段 skip 不破坏文本.
- *   - 多个 <style> 块累加; 同 class 多次定义后定义追加在前者后 (CSS 语义: 后者覆盖).
- *   - 元素原有 style="..." 跟 stylesheet 冲突时, 原 inline 优先级高于 stylesheet
- *     (符合 CSS spec) — 实现方式: 把 stylesheet 规则 *前* 置, 原 inline 在后.
+ *   - 支持 tag / .class / #id / 复合选择器 / 后代选择器 / 子选择器 / 属性选择器,
+ *     以及 selector list 的 specificity + source order.
+ *   - 支持 !important. 输出到 inline style 时剥掉 "!important" 文本, 保留其
+ *     优先级效果；stylesheet important 可覆盖普通 inline style.
+ *   - @media / @import / hover 等动态上下文不展开, 遇到时 skip 不破坏文本.
+ *   - 多个 <style> 块累加; stylesheet 与元素原有 style="..." 冲突时按 CSS
+ *     cascade 计算最终值.
  *   - 元素 class="..." 属性保留 (D2D 反正忽略), 不删省事.
  *
- * 复杂度: O(N), N = SVG 文本字节数. 单 pass scanner, 不引第三方依赖.
+ * 复杂度: O(N + R*M), N = SVG 文本字节数, R = CSS rule 数, M = 元素数.
+ * 单 pass SVG scanner, CSS 解析/匹配复用 core-ui 内建模块.
  */
 std::string InlineSvgStyleClasses(const std::string& svg_xml);
 

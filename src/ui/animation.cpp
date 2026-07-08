@@ -2,8 +2,71 @@
 #include "widget.h"
 #include <windows.h>
 #include <algorithm>
+#include <cmath>
 
 namespace ui {
+
+// ---- AnimatedFloat ----
+
+void AnimatedFloat::SetImmediate(float value) {
+    current_ = value;
+    target_ = value;
+    start_ = value;
+    startTick_ = 0;
+    active_ = false;
+}
+
+void AnimatedFloat::Retarget(float value) {
+    Retarget(value, spec_);
+}
+
+void AnimatedFloat::Retarget(float value, const AnimationSpec& spec) {
+    spec_ = spec;
+    if (target_ == value && active_) return;
+    if (target_ == value && !active_) {
+        current_ = value;
+        start_ = value;
+        startTick_ = 0;
+        return;
+    }
+    target_ = value;
+    start_ = current_;
+    startTick_ = 0;
+    active_ = true;
+}
+
+void AnimatedFloat::SetIdleTarget(float value) {
+    if (!active_) SetImmediate(value);
+}
+
+float AnimatedFloat::Sample(uint64_t now) {
+    if (!active_) {
+        current_ = target_;
+        start_ = target_;
+        startTick_ = 0;
+        return current_;
+    }
+
+    if (startTick_ == 0) {
+        startTick_ = now;
+        start_ = current_;
+    }
+
+    float u = spec_.durationMs > 0.0f
+        ? std::clamp((float)(now - startTick_) / spec_.durationMs, 0.0f, 1.0f)
+        : 1.0f;
+    float eased = ApplyEasing(spec_.easing, u);
+    current_ = start_ + (target_ - start_) * eased;
+
+    if (u >= 1.0f || std::abs(target_ - current_) < 0.001f) {
+        current_ = target_;
+        start_ = target_;
+        startTick_ = 0;
+        active_ = false;
+    }
+
+    return current_;
+}
 
 // ---- Animation ----
 
@@ -11,28 +74,52 @@ void Animation::Start() {
     active = true;
     finished = false;
     progress = 0;
-    startTick = GetTickCount64();
+    startTick = 0;
 }
 
 void Animation::Tick(uint64_t now) {
     if (!active || finished) return;
 
-    float elapsed = (float)(now - startTick);
-    progress = std::clamp(elapsed / durationMs, 0.0f, 1.0f);
+    if (startTick == 0) {
+        startTick = now;
+    }
 
-    float t = ToggleWidget::ApplyEasing(easing, progress);
+    float elapsed = now >= startTick ? (float)(now - startTick) : 0.0f;
+    progress = durationMs > 0.0f
+        ? std::clamp(elapsed / durationMs, 0.0f, 1.0f)
+        : 1.0f;
+
+    float t = ApplyEasing(easing, progress);
     Apply(t);
 
     if (progress >= 1.0f) {
+        ApplyValue(to);
         finished = true;
         active = false;
         if (onComplete) onComplete();
     }
 }
 
+float Animation::ValueAt(uint64_t now) const {
+    if (!active || finished) return to;
+
+    uint64_t effectiveStart = startTick != 0 ? startTick : now;
+    float elapsed = now >= effectiveStart ? (float)(now - effectiveStart) : 0.0f;
+    float u = durationMs > 0.0f
+        ? std::clamp(elapsed / durationMs, 0.0f, 1.0f)
+        : 1.0f;
+    float t = ApplyEasing(easing, u);
+    return from + (to - from) * t;
+}
+
 void Animation::Apply(float t) {
     if (!target) return;
     float val = from + (to - from) * t;
+    ApplyValue(val);
+}
+
+void Animation::ApplyValue(float val) {
+    if (!target) return;
 
     switch (property) {
         case AnimProperty::Opacity:  target->opacity = val; break;
@@ -40,12 +127,11 @@ void Animation::Apply(float t) {
         case AnimProperty::PosY:     target->rect.top = val; break;
         case AnimProperty::Width:
             target->fixedW = val;
-            // Width 变化必须触发布局重排，否则父 flex 容器/兄弟控件不会响应
-            ui::RequestLayout();
+            ui::LayoutDirtyFlag() = true;
             break;
         case AnimProperty::Height:
             target->fixedH = val;
-            ui::RequestLayout();
+            ui::LayoutDirtyFlag() = true;
             break;
         case AnimProperty::BgColorR: target->bgColor.r = val; break;
         case AnimProperty::BgColorG: target->bgColor.g = val; break;
@@ -59,15 +145,37 @@ void Animation::Apply(float t) {
 void AnimationManager::Animate(Widget* target, AnimProperty prop, float from, float to,
                                float durationMs, EasingFunction easing,
                                std::function<void()> onComplete) {
-    // Remove existing animation on same target+property
+    if (!target) return;
+
+    uint64_t now = GetTickCount64();
+    float startValue = from;
+    for (auto& a : anims_) {
+        if (a.target == target && a.property == prop) {
+            startValue = a.ValueAt(now);
+            a.ApplyValue(startValue);
+            break;
+        }
+    }
+
     anims_.erase(std::remove_if(anims_.begin(), anims_.end(), [&](const Animation& a) {
         return a.target == target && a.property == prop;
     }), anims_.end());
 
+    if (durationMs <= 0.0f || std::abs(startValue - to) <= 0.001f) {
+        Animation immediate;
+        immediate.target = target;
+        immediate.property = prop;
+        immediate.from = startValue;
+        immediate.to = to;
+        immediate.ApplyValue(to);
+        if (onComplete) onComplete();
+        return;
+    }
+
     Animation anim;
     anim.target = target;
     anim.property = prop;
-    anim.from = from;
+    anim.from = startValue;
     anim.to = to;
     anim.durationMs = durationMs;
     anim.easing = easing;
@@ -77,12 +185,14 @@ void AnimationManager::Animate(Widget* target, AnimProperty prop, float from, fl
 }
 
 void AnimationManager::FadeIn(Widget* target, float durationMs) {
+    if (!target) return;
     target->visible = true;
-    Animate(target, AnimProperty::Opacity, 0.0f, 1.0f, durationMs);
+    Animate(target, AnimProperty::Opacity, target->opacity, 1.0f, durationMs);
 }
 
 void AnimationManager::FadeOut(Widget* target, float durationMs) {
-    Animate(target, AnimProperty::Opacity, 1.0f, 0.0f, durationMs, EasingFunction::EaseOutCubic,
+    if (!target) return;
+    Animate(target, AnimProperty::Opacity, target->opacity, 0.0f, durationMs, EasingFunction::EaseOutCubic,
             [target]() { target->visible = false; target->opacity = 1.0f; });
 }
 
@@ -110,12 +220,6 @@ void AnimationManager::Cancel(Widget* target) {
 
 bool AnimationManager::HasActive() const {
     return !anims_.empty();
-}
-
-// Global instance
-AnimationManager& Animations() {
-    static AnimationManager mgr;
-    return mgr;
 }
 
 } // namespace ui

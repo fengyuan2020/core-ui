@@ -232,75 +232,79 @@ if(TARGET core-ui-static)
     target_compile_definitions(core-ui-static PUBLIC ${UI_CORE_VERSION_DEFS})
 endif()
 
-add_executable(svg_normalize_test EXCLUDE_FROM_ALL
-    test/src/svg_normalize_test.cpp
-    src/ui/svg_style_inliner.cpp
-    src/ui/css/css_parser.cpp
-    src/ui/css/selector.cpp
-)
-target_compile_definitions(svg_normalize_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_include_directories(svg_normalize_test PRIVATE src)
+option(UI_CORE_BUILD_INTERNAL_TESTS
+    "Build internal regression test targets when test/ is available" ON)
+if(UI_CORE_BUILD_INTERNAL_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/src/svg_normalize_test.cpp")
+    add_executable(svg_normalize_test EXCLUDE_FROM_ALL
+        test/src/svg_normalize_test.cpp
+        src/ui/svg_style_inliner.cpp
+        src/ui/css/css_parser.cpp
+        src/ui/css/selector.cpp
+    )
+    target_compile_definitions(svg_normalize_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_include_directories(svg_normalize_test PRIVATE src)
 
-add_executable(frame_scheduler_test EXCLUDE_FROM_ALL
-    test/src/frame_scheduler_test.cpp
-    src/ui/frame_scheduler.cpp
-)
-target_compile_definitions(frame_scheduler_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_include_directories(frame_scheduler_test PRIVATE src)
+    add_executable(frame_scheduler_test EXCLUDE_FROM_ALL
+        test/src/frame_scheduler_test.cpp
+        src/ui/frame_scheduler.cpp
+    )
+    target_compile_definitions(frame_scheduler_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_include_directories(frame_scheduler_test PRIVATE src)
 
-add_executable(image_cpu_backing_test EXCLUDE_FROM_ALL
-    test/src/image_cpu_backing_test.cpp
-)
-target_compile_definitions(image_cpu_backing_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_include_directories(image_cpu_backing_test PRIVATE src)
-if(TARGET core-ui-static)
-    target_link_libraries(image_cpu_backing_test PRIVATE core-ui-static)
-else()
-    target_link_libraries(image_cpu_backing_test PRIVATE core-ui)
-endif()
+    add_executable(image_cpu_backing_test EXCLUDE_FROM_ALL
+        test/src/image_cpu_backing_test.cpp
+    )
+    target_compile_definitions(image_cpu_backing_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_include_directories(image_cpu_backing_test PRIVATE src)
+    if(TARGET core-ui-static)
+        target_link_libraries(image_cpu_backing_test PRIVATE core-ui-static)
+    else()
+        target_link_libraries(image_cpu_backing_test PRIVATE core-ui)
+    endif()
 
-add_executable(render_recovery_test EXCLUDE_FROM_ALL
-    test/src/render_recovery_test.cpp
-)
-target_compile_definitions(render_recovery_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_include_directories(render_recovery_test PRIVATE src)
-if(TARGET core-ui-static)
-    target_link_libraries(render_recovery_test PRIVATE core-ui-static)
-else()
-    target_link_libraries(render_recovery_test PRIVATE core-ui)
-endif()
+    add_executable(render_recovery_test EXCLUDE_FROM_ALL
+        test/src/render_recovery_test.cpp
+    )
+    target_compile_definitions(render_recovery_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_include_directories(render_recovery_test PRIVATE src)
+    if(TARGET core-ui-static)
+        target_link_libraries(render_recovery_test PRIVATE core-ui-static)
+    else()
+        target_link_libraries(render_recovery_test PRIVATE core-ui)
+    endif()
 
-add_executable(resource_store_budget_test EXCLUDE_FROM_ALL
-    test/src/resource_store_budget_test.cpp
-)
-target_compile_definitions(resource_store_budget_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_include_directories(resource_store_budget_test PRIVATE src)
-if(TARGET core-ui-static)
-    target_link_libraries(resource_store_budget_test PRIVATE core-ui-static)
-else()
-    target_link_libraries(resource_store_budget_test PRIVATE core-ui)
-endif()
+    add_executable(resource_store_budget_test EXCLUDE_FROM_ALL
+        test/src/resource_store_budget_test.cpp
+    )
+    target_compile_definitions(resource_store_budget_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_include_directories(resource_store_budget_test PRIVATE src)
+    if(TARGET core-ui-static)
+        target_link_libraries(resource_store_budget_test PRIVATE core-ui-static)
+    else()
+        target_link_libraries(resource_store_budget_test PRIVATE core-ui)
+    endif()
 
-add_executable(svg_text_path_test EXCLUDE_FROM_ALL
-    test/src/svg_text_path_test.cpp
-)
-target_compile_definitions(svg_text_path_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_include_directories(svg_text_path_test PRIVATE src)
-if(TARGET core-ui-static)
-    target_link_libraries(svg_text_path_test PRIVATE core-ui-static)
-else()
-    target_link_libraries(svg_text_path_test PRIVATE core-ui)
-endif()
+    add_executable(svg_text_path_test EXCLUDE_FROM_ALL
+        test/src/svg_text_path_test.cpp
+    )
+    target_compile_definitions(svg_text_path_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_include_directories(svg_text_path_test PRIVATE src)
+    if(TARGET core-ui-static)
+        target_link_libraries(svg_text_path_test PRIVATE core-ui-static)
+    else()
+        target_link_libraries(svg_text_path_test PRIVATE core-ui)
+    endif()
 
-add_executable(svg_drop_shadow_layer_test EXCLUDE_FROM_ALL
-    test/src/svg_drop_shadow_layer_test.cpp
-)
-target_compile_definitions(svg_drop_shadow_layer_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_include_directories(svg_drop_shadow_layer_test PRIVATE src)
-if(TARGET core-ui-static)
-    target_link_libraries(svg_drop_shadow_layer_test PRIVATE core-ui-static)
-else()
-    target_link_libraries(svg_drop_shadow_layer_test PRIVATE core-ui)
+    add_executable(svg_drop_shadow_layer_test EXCLUDE_FROM_ALL
+        test/src/svg_drop_shadow_layer_test.cpp
+    )
+    target_compile_definitions(svg_drop_shadow_layer_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_include_directories(svg_drop_shadow_layer_test PRIVATE src)
+    if(TARGET core-ui-static)
+        target_link_libraries(svg_drop_shadow_layer_test PRIVATE core-ui-static)
+    else()
+        target_link_libraries(svg_drop_shadow_layer_test PRIVATE core-ui)
+    endif()
 endif()
 
 if(WIN32)
